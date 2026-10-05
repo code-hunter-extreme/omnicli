@@ -1,11 +1,12 @@
 # OmniCLI — Local Multi-Provider AI Terminal, Router & Red-Team Agent
 
 A fast, local CLI for querying, comparing, routing, and **orchestrating** across
-6 OpenAI-compatible AI providers — plus an autonomous agent with deterministic
+7 OpenAI-compatible AI providers — plus an autonomous agent with deterministic
 verification tools, cross-model consensus, per-API memory, and a heartbeat.
 
 Providers:
 
+- **Groq** (`https://api.groq.com/openai/v1`) — ultra-fast LPU inference (default: `llama-3.3-70b-versatile`)
 - **OpenRouter** (`https://openrouter.ai/api/v1`)
 - **NVIDIA Build / NIM** (`https://integrate.api.nvidia.com/v1`)
 - **Cloudflare Workers AI** (`https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1`)
@@ -21,10 +22,10 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 
 | Command | What it does | Single vs. multi-API |
 |---|---|---|
-| `omni` / `omni chat` | Interactive streaming REPL | **single** provider at a time |
+| `omni` / `omni chat` | Interactive streaming REPL with **live multi-model council orchestration** (`collaborate`, `builder`, `redteam`) or `single` | **multi** or single |
 | `omni ask "<prompt>"` | One-shot query (also `omni "<prompt>"`) | single |
 | `omni agent "<goal>"` | Autonomous tool-using agent | **multi** (delegates, auto-fallback, cross-provider rotate) |
-| `omni swarm "<task>"` | Many models, different families, **in parallel** → merged | **multi** |
+| `omni swarm "<task>"` | Many models, different families, **in parallel** → merged (`collaborate`, `builder`, `redteam`) | **multi** |
 | `omni verify consensus "<claim>"` | Blind vote across models/providers | **multi** |
 | `omni verify http\|code` | Deterministic HTTP / code verification | single |
 | `omni scan` | Discover `/models` per provider, build rosters | **multi** |
@@ -33,10 +34,6 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 | `omni models [provider]` | List/search a provider's live catalog | single |
 | `omni serve` | OpenAI-compatible proxy, route by prefix | **multi** |
 | `omni config ...` | Keys, account id, settings | — |
-
-> **Where's the orchestration?** The bare `omni` chat REPL talks to one provider.
-> Cross-API behavior lives in `agent`, `verify consensus`, `scan`, `heartbeat`,
-> and `serve`.
 
 ---
 
@@ -89,19 +86,25 @@ Interactive red-team is also available in chat: `omni chat --redteam
 ## Swarm — many models at once
 
 The headline orchestration: run several models from **different families across
-all providers in parallel**, then bring them together. This is the opposite of
-the one-model chat REPL.
+all providers in parallel**, then bring them together.
+
+Modes:
+- **`collaborate` (default)** — Models work together constructively. Parallel fanout + merged consensus.
+- **`builder` (`--builder`)** — Council split: Builders/Architects propose the design/implementation while Red-Team Breakers stress-test and attack in parallel. The synthesizer produces a hardened build fortifying against the attacks.
+- **`redteam` (`--redteam`)** — Adversarial audit council probing for vulnerabilities, consolidated by severity.
 
 ```bash
-omni swarm "design a token-bucket rate limiter"      # collaborate: parallel + synthesized answer
-omni swarm --redteam "audit ~/project for authz bugs" # multi-model red-team council, consolidated
-omni swarm -n 5 "..."                                 # 5 members
-omni swarm --raw "..."                                # show each member, skip synthesis
-omni swarm -p openrouter "..."                        # restrict to one provider's families
+omni swarm "design a token-bucket rate limiter"          # collaborate: parallel + synthesized answer
+omni swarm --builder "design an OAuth2 PKCE auth engine" # builder: architects propose, red-team attacks, synthesized into hardened build
+omni swarm --redteam "audit ~/project for authz bugs"    # red-team: multi-model audit council, consolidated
+omni swarm -n 5 "..."                                     # 5 members
+omni swarm --raw "..."                                    # show each member, skip synthesis
+omni swarm -p openrouter "..."                            # restrict to one provider's families
 ```
 
 Each member is a distinct family (e.g. google + meta + openai), queried
 concurrently; a synthesis pass merges agreements and flags disagreements.
+`--builder` couples constructive architects with breaker red-teamers into a fortified solution.
 `--redteam` fans an adversarial review across the families and consolidates the
 findings (proven vs. plausible, ranked by severity) — a red-team *team*, not one
 model.
@@ -171,6 +174,15 @@ recorded, never fatal.
 
 ## Chat REPL commands
 
+**Mode Switching (Live Orchestration):**
+- `/mode [collaborate|builder|redteam|single]` — change orchestration council mode
+- `/collaborate`, `/c` — all models reason together in parallel, synthesized consensus
+- `/builder`, `/b` — builders construct implementations, red-team attacks in parallel, hardened build
+- `/redteam`, `/rt` — adversarial audit council, ranked vulnerabilities
+- `/single` — direct 1-on-1 single-model chat
+- `/size <1-10>` — set council member count (e.g. `/size 4`)
+
+**Session & Providers:**
 `/provider` · `/model` · `/models [query]` · `/providers` · `/system` · `/temp` ·
 `/file <path>` · `/save` · `/clear` (session) · `/forget` (persisted history) ·
 `/ping` · `/help` · `/exit`
