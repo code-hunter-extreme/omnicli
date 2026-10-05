@@ -178,6 +178,15 @@ class AgentRunner:
                 "actively to gather truth."
             )
 
+        # Layer per-provider memory (context files) on top of the system prompt.
+        try:
+            from omnicli.memory import load_memory
+            mem = load_memory(self.cfg, self.provider)
+            if mem:
+                system_prompt = f"{system_prompt}\n\n{mem}"
+        except Exception:
+            pass
+
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": goal},

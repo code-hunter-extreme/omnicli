@@ -119,10 +119,14 @@ class ChatSession:
                 "system_prompt", "You are a helpful, brilliant, concise AI assistant."
             )
         self.temperature = temperature
+        # Keep the operator's prompt separate so per-provider memory can be
+        # re-layered on top whenever the active provider changes.
+        self.base_system_prompt = self.system_prompt
         self.messages: List[Dict[str, str]] = []
 
         if self.system_prompt:
             self.messages.append({"role": "system", "content": self.system_prompt})
+        self._apply_memory()
 
         completer = SlashCommandCompleter(self.cfg, self.client)
         self.prompt_session = PromptSession(
@@ -143,6 +147,13 @@ class ChatSession:
             modes.append("[bold magenta]ROTATE-FAMILIES[/bold magenta]")
         if modes:
             grid.add_row("[bold green]Modes:[/bold green] " + "  ".join(modes))
+        try:
+            from omnicli.memory import memory_file_count
+            mcount = memory_file_count(self.cfg, self.provider)
+        except Exception:
+            mcount = 0
+        if mcount:
+            grid.add_row(f"[bold green]Memory:[/bold green] {mcount} file(s) for {self.provider}")
         grid.add_row("[dim]Type /help for slash commands, /models to browse models, /clear to reset history.[/dim]\n")
         self.console.print(Panel(grid, border_style="cyan", padding=(0, 1)))
 
@@ -264,6 +275,7 @@ class ChatSession:
                 else:
                     self.provider = prov
                     self.model = self.cfg.get_default_model(prov)
+                    self._apply_memory()
                     self.console.print(f"[bold green]Switched to provider:[/bold green] {self.provider} (model: {self.model})")
 
         elif cmd in ("/model", "/m"):
@@ -281,11 +293,8 @@ class ChatSession:
                 self.console.print(Panel(self.system_prompt, title="System Prompt", border_style="cyan"))
             else:
                 self.system_prompt = arg
-                # Update first message if system role
-                if self.messages and self.messages[0]["role"] == "system":
-                    self.messages[0]["content"] = self.system_prompt
-                else:
-                    self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+                self.base_system_prompt = arg
+                self._apply_memory()
                 self.console.print("[bold green]System prompt updated.[/bold green]")
 
         elif cmd in ("/temp", "/temperature"):
@@ -374,6 +383,21 @@ class ChatSession:
         p.write_text("\n".join(lines), encoding="utf-8")
         self.console.print(f"[bold green]Transcript saved to:[/bold green] {p.resolve()}")
 
+    def _apply_memory(self) -> None:
+        """Set the system message to base prompt + current provider's memory."""
+        try:
+            from omnicli.memory import load_memory
+            mem = load_memory(self.cfg, self.provider)
+        except Exception:
+            mem = ""
+        content = self.base_system_prompt or ""
+        if mem:
+            content = f"{content}\n\n{mem}".strip()
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = content
+        elif content:
+            self.messages.insert(0, {"role": "system", "content": content})
+
     def _next_family_model(self) -> Optional[str]:
         """Next model in the scanned roster whose family differs from the current.
 
@@ -396,6 +420,7 @@ class ChatSession:
         return None
 
     def stream_turn(self, user_prompt: str) -> None:
+        self._apply_memory()  # refresh memory for the active provider
         self.messages.append({"role": "user", "content": user_prompt})
 
         full_content = ""

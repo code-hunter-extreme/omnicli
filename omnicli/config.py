@@ -101,6 +101,23 @@ DEFAULT_PROVIDERS = {
     },
 }
 
+# Per-provider memory (context injection + optional history). File entries are
+# relative to "dir" or absolute, so each API can layer several memory sources.
+DEFAULT_MEMORY = {
+    "enabled": True,
+    "dir": str(CONFIG_DIR / "memory"),
+    "global": [],
+    "providers": {},
+    "history": {"enabled": False, "max_turns": 40},
+}
+
+# Heartbeat: built-in health checks (status) + an optional user task file.
+DEFAULT_HEARTBEAT = {
+    "canary": False,
+    "status_file": str(CONFIG_DIR / "heartbeat.json"),
+    "tasks_file": str(CONFIG_DIR / "heartbeat_tasks.json"),
+}
+
 
 class ConfigManager:
     def __init__(self) -> None:
@@ -125,6 +142,8 @@ class ConfigManager:
                 "system_prompt": "You are a helpful, brilliant, concise AI assistant.",
                 "temperature": 0.7,
                 "timeout": 60,
+                "memory": dict(DEFAULT_MEMORY),
+                "heartbeat": dict(DEFAULT_HEARTBEAT),
             }
             # Auto-check aider oauth-keys if available
             aider_env = Path.home() / ".aider" / "oauth-keys.env"
@@ -153,6 +172,16 @@ class ConfigManager:
                     data["providers"][k] = dict(v)
             if "keys" not in data:
                 data["keys"] = {}
+            # Migrate older configs: add memory/heartbeat blocks if absent.
+            changed = False
+            if "memory" not in data:
+                data["memory"] = dict(DEFAULT_MEMORY)
+                changed = True
+            if "heartbeat" not in data:
+                data["heartbeat"] = dict(DEFAULT_HEARTBEAT)
+                changed = True
+            if changed:
+                self._save(data)
             return data
         except Exception:
             return {
@@ -286,6 +315,21 @@ class ConfigManager:
         """Ordered fallback model roster for a provider (populated by omni scan)."""
         prov = self.get_provider_info(provider_id)
         return list(prov.get("fallback_models") or [])
+
+    def get_memory_config(self) -> dict:
+        """Memory settings block (enabled, dir, global, providers, history)."""
+        return dict(self.data.get("memory") or {})
+
+    def get_memory_files(self, provider_id: str) -> list:
+        """Configured memory file names for a provider: global first, then its own."""
+        mem = self.data.get("memory") or {}
+        files = list(mem.get("global") or [])
+        files += list((mem.get("providers") or {}).get(provider_id.lower()) or [])
+        return files
+
+    def get_heartbeat_config(self) -> dict:
+        """Heartbeat settings block (canary, status_file, tasks_file)."""
+        return dict(self.data.get("heartbeat") or {})
 
     def get_verification_panel(self, provider_id: str) -> list:
         """Diverse-family verification panel (populated by omni scan).
