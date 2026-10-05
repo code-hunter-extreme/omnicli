@@ -11,6 +11,7 @@ Provides:
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import re
@@ -84,31 +85,42 @@ class ScopeGate:
         return host.strip().lower()
 
     def is_in_scope(self, target: str) -> Tuple[bool, str]:
-        """Check if target host is allowed and not blocked."""
+        """Check if target host is allowed and not blocked (verdict + reason)."""
+        ok, reason, _ = self.screen(target)
+        return ok, reason
+
+    def screen(self, target: str) -> Tuple[bool, str, Optional[str]]:
+        """Full scope decision plus the validated IP to pin the connection to.
+
+        Returns (ok, reason, pinned_ip). pinned_ip is the resolved, scope-checked
+        address the caller should connect to directly, so a second DNS lookup at
+        connect time cannot rebind to an internal host.
+        """
         host = self.extract_host(target)
         if not host:
-            return False, "Empty or invalid target host"
+            return False, "Empty or invalid target host", None
 
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
             if self.allow_localhost:
-                return True, "in_scope: localhost permitted"
-            return False, "out_of_scope: localhost access blocked"
+                pin = "::1" if host == "::1" else "127.0.0.1"
+                return True, "in_scope: localhost permitted", pin
+            return False, "out_of_scope: localhost access blocked", None
 
         if host in self.blocked_hosts or any(host.endswith("." + b) for b in self.blocked_hosts):
-            return False, f"EXPLICIT_BLOCKED: host '{host}' is in blacklisted/metadata domains"
+            return False, f"EXPLICIT_BLOCKED: host '{host}' is in blacklisted/metadata domains", None
 
         # Resolve the host and reject if ANY address is non-public. This catches
         # IP literals in odd encodings (decimal/hex), 127.0.0.0/8 beyond
         # 127.0.0.1, RFC1918, IPv4-mapped IPv6, and hostnames that resolve to
         # internal addresses. Runs before the whitelist so an explicit allow
         # still can't reach an internal IP without allow_private/allow_localhost.
-        ok_ip, ip_reason = self._check_resolved_ips(host)
+        ok_ip, ip_reason, pin_ip = self._check_resolved_ips(host)
         if not ok_ip:
-            return False, ip_reason
+            return False, ip_reason, None
 
         if not self.allowed_hosts:
             # If no explicit whitelist is defined, allow any valid public host not in blacklist
-            return True, "in_scope: general public target"
+            return True, "in_scope: general public target", pin_ip
 
         for pattern in self.allowed_hosts:
             if pattern.startswith("*."):
@@ -117,11 +129,11 @@ class ScopeGate:
                 suffix = re.escape(pattern[2:])
                 anchored = re.compile(rf"^(?:[a-zA-Z0-9_\-]+\.)*{suffix}$", re.IGNORECASE)
                 if anchored.match(host):
-                    return True, f"in_scope: matches wildcard rule '{pattern}'"
+                    return True, f"in_scope: matches wildcard rule '{pattern}'", pin_ip
             elif host == pattern:
-                return True, f"in_scope: matches explicit rule '{pattern}'"
+                return True, f"in_scope: matches explicit rule '{pattern}'", pin_ip
 
-        return False, f"out_of_scope: host '{host}' does not match permitted scopes"
+        return False, f"out_of_scope: host '{host}' does not match permitted scopes", None
 
     @staticmethod
     def _resolve_host(host: str) -> List[Any]:
@@ -177,16 +189,17 @@ class ScopeGate:
             return "private"
         return "global"
 
-    def _check_resolved_ips(self, host: str) -> Tuple[bool, str]:
+    def _check_resolved_ips(self, host: str) -> Tuple[bool, str, Optional[str]]:
         """Fail-closed SSRF check: every resolved IP must be public (or opted in).
 
         loopback requires allow_localhost; RFC1918/unique-local requires
         allow_private; link-local (incl. cloud metadata), reserved, multicast
-        and unspecified are always rejected.
+        and unspecified are always rejected. Returns the first validated address
+        as the third element so the caller can pin the connection to it.
         """
         ips = self._resolve_host(host)
         if not ips:
-            return False, f"out_of_scope: host '{host}' could not be resolved"
+            return False, f"out_of_scope: host '{host}' could not be resolved", None
         for ip in ips:
             cat = self._ip_category(ip)
             if cat == "global":
@@ -198,8 +211,8 @@ class ScopeGate:
             return False, (
                 f"SSRF_BLOCKED: host '{host}' resolves to {ip} ({cat}); "
                 "non-public address not permitted"
-            )
-        return True, f"in_scope: '{host}' resolves to public address(es)"
+            ), None
+        return True, f"in_scope: '{host}' resolves to public address(es)", str(ips[0])
 
 
 def parse_expected_predicates(expected_str: str) -> Dict[str, Any]:
@@ -252,6 +265,31 @@ def parse_expected_predicates(expected_str: str) -> Dict[str, Any]:
     return out
 
 
+@contextlib.contextmanager
+def _pin_getaddrinfo(hostname: str, ip: str):
+    """Force `hostname` to resolve to `ip` for the duration of the block.
+
+    The ScopeGate already resolved and validated the host; pinning the connection
+    to that exact IP means httpx cannot trigger a second DNS lookup that rebinds
+    to an internal address. Single-threaded use only (patches the global
+    resolver), which matches the agent's sequential request loop.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+
+    def patched(host, port, family=0, socktype=0, proto=0, flags=0):
+        if host == hostname:
+            if ":" in ip:
+                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, port or 0, 0, 0))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+        return real_getaddrinfo(host, port, family, socktype, proto, flags)
+
+    socket.getaddrinfo = patched
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+
+
 class HTTPVerifier:
     """Deterministic HTTP wire probe engine."""
 
@@ -266,8 +304,9 @@ class HTTPVerifier:
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """Perform request and verify response against expected predicates."""
+        pin_ip: Optional[str] = None
         if scope_gate:
-            ok, reason = scope_gate.is_in_scope(url)
+            ok, reason, pin_ip = scope_gate.screen(url)
             if not ok:
                 return {
                     "verdict": "REJECTED",
@@ -279,12 +318,16 @@ class HTTPVerifier:
         predicates = parse_expected_predicates(expected_str)
         req_headers = headers or {}
 
+        pin_host = ScopeGate.extract_host(url) if pin_ip else None
+        pin_ctx = _pin_getaddrinfo(pin_host, pin_ip) if (pin_host and pin_ip) else contextlib.nullcontext()
+
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-                res = client.request(method=method.upper(), url=url, headers=req_headers, content=body)
-                obs_status = res.status_code
-                obs_body = res.text
-                obs_headers = {k.lower(): v for k, v in res.headers.items()}
+            with pin_ctx:
+                with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+                    res = client.request(method=method.upper(), url=url, headers=req_headers, content=body)
+                    obs_status = res.status_code
+                    obs_body = res.text
+                    obs_headers = {k.lower(): v for k, v in res.headers.items()}
         except Exception as e:
             return {
                 "verdict": "REJECTED",
