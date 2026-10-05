@@ -100,6 +100,16 @@ class ScopeGate:
         if not host:
             return False, "Empty or invalid target host", None
 
+        # Parser-differential guard: an authority with backslash, whitespace,
+        # control chars, or multiple '@' can be parsed one way by extract_host and
+        # another by the HTTP client, letting the connection reach a different host
+        # than we validate. Reject it outright (fail closed).
+        authority = target.split("://", 1)[-1].split("/", 1)[0] if "://" in target else target.split("/", 1)[0]
+        if "\\" in authority or authority.count("@") > 1 or any(
+            c.isspace() or ord(c) < 0x20 for c in authority
+        ):
+            return False, "out_of_scope: ambiguous/unsafe URL authority", None
+
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
             if self.allow_localhost:
                 pin = "::1" if host == "::1" else "127.0.0.1"
@@ -394,11 +404,12 @@ class CodeVerifier:
     """Deterministic source code and AST seam verifier."""
 
     @staticmethod
-    def _extract_python_block(content: str, name: str) -> Optional[str]:
-        """Return the source of a Python def/method `name` by indentation, or None."""
+    def _extract_python_block(content: str, name: str, kind: str = "def") -> Optional[str]:
+        """Return the source of a Python `kind` (def/class) named `name`, or None."""
+        header = re.compile(r"^(\s*)" + re.escape(kind) + r"\s+" + re.escape(name) + r"\s*[\(:]")
         lines = content.splitlines()
         for i, line in enumerate(lines):
-            m = re.match(r"^(\s*)def\s+" + re.escape(name) + r"\s*\(", line)
+            m = header.match(line)
             if not m:
                 continue
             indent = len(m.group(1))
@@ -442,6 +453,14 @@ class CodeVerifier:
         if not p.is_file():
             return {"verdict": "REJECTED", "reason": f"Target is not a file: {file_path}", "file": str(p)}
 
+        # Fail closed on a vacuous request: nothing asserted means nothing proven.
+        if not (must_contain or must_not_contain or check_type or target_function):
+            return {
+                "verdict": "REJECTED",
+                "reason": "No verification constraints provided (must_contain / must_not_contain / check_type / target_function).",
+                "file": str(p),
+            }
+
         content = p.read_text(encoding="utf-8", errors="replace")
         failures = []
 
@@ -455,11 +474,18 @@ class CodeVerifier:
             if m:
                 inspect_text = m.group(1)          # JavaScript/TS function
             else:
-                py_block = CodeVerifier._extract_python_block(content, name)
-                if py_block is not None:
-                    inspect_text = py_block         # Python def/method
-                # else: not found in either language — fall back to whole-file
-                # search rather than hard-failing (non-fatal scoping).
+                block = (CodeVerifier._extract_python_block(content, name, "def")
+                         or CodeVerifier._extract_python_block(content, name, "class"))
+                if block is not None:
+                    inspect_text = block            # Python def/class
+                else:
+                    # Scope requested but not found: FAIL CLOSED. Verifying a
+                    # scoped claim against the whole file would be fail-open —
+                    # the pattern could match unrelated code elsewhere.
+                    failures.append(
+                        f"Scope '{target_function}' not found; cannot verify a scoped claim"
+                    )
+                    inspect_text = ""
 
         # Specific framework checks
         if check_type == "wp_auth_check":
