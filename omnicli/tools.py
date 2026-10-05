@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -83,8 +84,50 @@ def tool_verify_consensus(
     return json.dumps(res, indent=2)
 
 
-def tool_bash(command: str, timeout: int = 30) -> str:
-    """Execute a bash command in the local environment."""
+# Destructive / exfil-to-shell command patterns refused even when the shell is
+# enabled. This is a backstop against a prompt-injected model, not a full sandbox.
+_BASH_DENY_PATTERNS = [
+    r"\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+(/|~|\$HOME|\*)",  # rm -rf / ~ * $HOME
+    r"\brm\s+-[a-z]*f[a-z]*r[a-z]*\s+(/|~|\$HOME|\*)",  # rm -fr ...
+    r"\bmkfs\b",                                        # format a filesystem
+    r"\bdd\b[^\n]*\bof=/dev/",                          # overwrite a block device
+    r">\s*/dev/(sd|nvme|hd|vd)",                        # clobber a disk
+    r":\s*\(\s*\)\s*\{.*\}\s*;\s*:",                    # fork bomb :(){ :|:& };:
+    r"\b(shutdown|reboot|halt|poweroff|init\s+0)\b",   # host power control
+    r"\bchmod\s+-R\s+0*777\s+/",                        # chmod -R 777 /
+    r"\bchown\s+-R\b[^\n]*\s+/\s*$",                    # chown -R ... /
+    r"(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(ba)?sh",   # pipe a download into a shell
+    r">\s*/etc/",                                       # overwrite system config
+]
+
+
+def _bash_denied(command: str) -> Optional[str]:
+    """Return the matched deny-pattern if command is destructive, else None."""
+    for pat in _BASH_DENY_PATTERNS:
+        if re.search(pat, command, re.IGNORECASE):
+            return pat
+    return None
+
+
+def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str:
+    """Execute a bash command in the local environment.
+
+    Shell execution is OFF by default: the agent must be started with
+    --allow-shell (allow_shell=True) to enable it. Even when enabled, commands
+    matching _BASH_DENY_PATTERNS are refused as a backstop against a
+    prompt-injected model steering the agent into a destructive command.
+    """
+    if not allow_shell:
+        return (
+            "Error: shell execution is disabled. Re-run the agent with "
+            "--allow-shell to enable the bash tool."
+        )
+    denied = _bash_denied(command)
+    if denied:
+        return (
+            f"Error: command refused by safety policy (matched deny pattern: {denied}). "
+            "Destructive or download-to-shell commands are blocked."
+        )
     try:
         try:
             timeout = int(timeout) if timeout not in (None, "None", "") else 30
@@ -350,10 +393,15 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def execute_tool_call(tool_name: str, arguments: Dict[str, Any], client_ref: Any = None) -> str:
+def execute_tool_call(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    client_ref: Any = None,
+    allow_shell: bool = False,
+) -> str:
     """Execute a function call by name and arguments."""
     if tool_name == "bash":
-        return tool_bash(command=arguments.get("command", ""))
+        return tool_bash(command=arguments.get("command", ""), allow_shell=allow_shell)
     elif tool_name == "read_file":
         return tool_read_file(path=arguments.get("path", ""), max_lines=arguments.get("max_lines", 300))
     elif tool_name == "write_file":
