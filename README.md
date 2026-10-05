@@ -23,7 +23,8 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 |---|---|---|
 | `omni` / `omni chat` | Interactive streaming REPL | **single** provider at a time |
 | `omni ask "<prompt>"` | One-shot query (also `omni "<prompt>"`) | single |
-| `omni agent "<goal>"` | Autonomous tool-using agent | **multi** (delegates, auto-fallback) |
+| `omni agent "<goal>"` | Autonomous tool-using agent | **multi** (delegates, auto-fallback, cross-provider rotate) |
+| `omni swarm "<task>"` | Many models, different families, **in parallel** → merged | **multi** |
 | `omni verify consensus "<claim>"` | Blind vote across models/providers | **multi** |
 | `omni verify http\|code` | Deterministic HTTP / code verification | single |
 | `omni scan` | Discover `/models` per provider, build rosters | **multi** |
@@ -72,7 +73,8 @@ Flags:
   (`verify_http`, `verify_code`, `verify_consensus`, `bash`, `read_file`,
   `consult_provider`). The model must prove claims with tools, not assert them.
 - `--rotate-families` — after each turn, switch to the next distinct model family
-  from the scanned roster.
+  from a **cross-provider** roster, so consecutive turns use a different family
+  *and* a different API (e.g. openrouter → nvidia → cloudflare).
 - `--allow-shell` — enable the `bash` tool. **Off by default**; even when on,
   destructive/download-to-shell commands are blocked.
 - `--allow-local` — let `verify_http` reach localhost / RFC1918 targets.
@@ -83,6 +85,26 @@ Interactive red-team is also available in chat: `omni chat --redteam
 [--rotate-families]` (adversarial persona; chat has no tool execution).
 
 ---
+
+## Swarm — many models at once
+
+The headline orchestration: run several models from **different families across
+all providers in parallel**, then bring them together. This is the opposite of
+the one-model chat REPL.
+
+```bash
+omni swarm "design a token-bucket rate limiter"      # collaborate: parallel + synthesized answer
+omni swarm --redteam "audit ~/project for authz bugs" # multi-model red-team council, consolidated
+omni swarm -n 5 "..."                                 # 5 members
+omni swarm --raw "..."                                # show each member, skip synthesis
+omni swarm -p openrouter "..."                        # restrict to one provider's families
+```
+
+Each member is a distinct family (e.g. google + meta + openai), queried
+concurrently; a synthesis pass merges agreements and flags disagreements.
+`--redteam` fans an adversarial review across the families and consolidates the
+findings (proven vs. plausible, ranked by severity) — a red-team *team*, not one
+model.
 
 ## Deterministic verification
 
