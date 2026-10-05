@@ -210,9 +210,56 @@ def tool_read_file(path: str, max_lines: int = 300) -> str:
         return f"Error reading file: {e}"
 
 
+def net_open_brackets(text: str) -> int:
+    """Net count of unclosed (, [, and {."""
+    open_count = 0
+    for ch in text:
+        if ch in "([{":
+            open_count += 1
+        elif ch in ")]}":
+            open_count -= 1
+    return open_count
+
+
+def detect_truncated_rewrite(old_content: str, new_content: str) -> Optional[Dict[str, Any]]:
+    """Truncated write guard: refuses replacing a file with a much shorter copy
+    that stops mid-expression with unclosed syntax."""
+    old_lines = len(old_content.splitlines())
+    if old_lines < 30:
+        return None
+    if len(new_content) >= len(old_content) * 0.6:
+        return None
+    if net_open_brackets(old_content) != 0:
+        return None
+    open_brackets = net_open_brackets(new_content)
+    if open_brackets <= 0:
+        return None
+    trimmed = new_content.rstrip()
+    last_line = trimmed.splitlines()[-1].strip() if trimmed.splitlines() else ""
+    return {
+        "old_lines": old_lines,
+        "new_lines": len(new_content.splitlines()),
+        "open_brackets": open_brackets,
+        "last_line": last_line[-100:] if len(last_line) > 100 else last_line,
+    }
+
+
 def tool_write_file(path: str, content: str) -> str:
-    """Write or overwrite a local file."""
+    """Write or overwrite a local file with truncation protection."""
     p = Path(path).expanduser().resolve()
+    if p.exists() and p.is_file():
+        try:
+            old_c = p.read_text(encoding="utf-8", errors="replace")
+            trunc = detect_truncated_rewrite(old_c, content)
+            if trunc:
+                return (
+                    f"Error: Refused to write '{p}': The new content ({trunc['new_lines']} lines) "
+                    f"is far shorter than current file ({trunc['old_lines']} lines) and ends with "
+                    f"{trunc['open_brackets']} unclosed bracket(s) (last line: '{trunc['last_line']}'). "
+                    f"Truncated-write-guard prevented file corruption. Re-issue full content."
+                )
+        except Exception:
+            pass
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")

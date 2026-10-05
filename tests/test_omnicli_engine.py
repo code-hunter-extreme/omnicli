@@ -1050,6 +1050,30 @@ class TestScannerFilters(unittest.TestCase):
         self.assertFalse(is_text_or_chat_model("openai/gpt-oss-safeguard-20b"))
 
 
+class TestTruncatedWriteGuard(unittest.TestCase):
+    def test_guard_refuses_truncated_write(self):
+        from omnicli.tools import detect_truncated_rewrite, tool_write_file
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "code.py"
+            # 40-line original file with balanced brackets
+            lines = [f"def func_{i}():\n    return {i}\n" for i in range(20)]
+            orig_content = "".join(lines)
+            target.write_text(orig_content, encoding="utf-8")
+
+            # Cut off write ending in unclosed bracket
+            bad_content = "def func_0():\n    return [1, 2, "
+            trunc = detect_truncated_rewrite(orig_content, bad_content)
+            self.assertIsNotNone(trunc)
+            self.assertGreater(trunc["open_brackets"], 0)
+
+            # Test tool_write_file refuses it
+            msg = tool_write_file(str(target), bad_content)
+            self.assertIn("Refused to write", msg)
+            # Ensure file is unchanged
+            self.assertEqual(target.read_text(encoding="utf-8"), orig_content)
+
+
+
 
 # ── Cross-provider rotate-families roster (item 3/4) ────────────────────────────
 
