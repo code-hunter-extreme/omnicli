@@ -35,6 +35,14 @@ def classify_family(model_id: str) -> str:
     return "other"
 
 
+def is_text_or_chat_model(mid: str) -> bool:
+    """Filter out non-chat / special-purpose models like whisper, embeddings, guards."""
+    low = mid.lower()
+    return not any(
+        x in low for x in ("whisper", "guard", "safeguard", "embed", "tts", "moderation", "audio", "orpheus", "vision-guard")
+    )
+
+
 def build_roster_and_panel(
     models: List[Dict[str, Any]],
     max_per_family: int = 2,
@@ -51,7 +59,7 @@ def build_roster_and_panel(
     seen_families: Dict[str, List[str]] = {}
     for m in models:
         mid = m.get("id", "")
-        if not mid:
+        if not mid or not is_text_or_chat_model(mid):
             continue
         family = classify_family(mid)
         seen_families.setdefault(family, []).append(mid)
@@ -135,6 +143,13 @@ def scan_provider(
     )
     families = {classify_family(m.get("id", "")) for m in models if m.get("id")}
     families.discard("other")
+
+    text_models = [m.get("id") for m in models if m.get("id") and is_text_or_chat_model(m.get("id"))]
+    text_models.sort(key=lambda x: ("120b" not in x.lower(), "70b" not in x.lower(), "27b" not in x.lower()))
+    curr_def = cfg.get_default_model(provider_id)
+    all_ids = {m.get("id") for m in models if m.get("id")}
+    if (curr_def not in all_ids or not is_text_or_chat_model(curr_def)) and text_models:
+        cfg.set_default_model(provider_id, text_models[0])
 
     if save:
         cfg.save_scan_results(provider_id, roster, panel)

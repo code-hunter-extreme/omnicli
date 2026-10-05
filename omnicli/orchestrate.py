@@ -32,17 +32,26 @@ _SWARM_REDTEAM_SYSTEM = (
 
 def build_swarm(
     cfg: Any,
-    size: int = 3,
+    size: Optional[int] = None,
     provider: Optional[str] = None,
 ) -> List[Tuple[str, str]]:
     """Pick up to `size` (provider, model) pairs, family-diverse across providers.
 
-    Round-robins across every configured provider (or just `provider` if given),
-    choosing one model per not-yet-seen family first so the swarm spans both APIs
-    and architectures. Falls back to filling remaining slots if there aren't
-    enough distinct families.
+    If size is None, defaults to the number of configured providers with keys
+    so all active providers participate.
     """
-    providers = [provider.lower()] if provider else list(cfg.data.get("providers", {}).keys())
+    if provider:
+        providers = [provider.lower()]
+    else:
+        all_p = list(cfg.data.get("providers", {}).keys())
+        active_keys = [
+            p for p in all_p
+            if cfg.get_api_key(p) or not cfg.data.get("providers", {}).get(p, {}).get("requires_auth_for_models", True)
+        ]
+        providers = active_keys if active_keys else all_p
+
+    if size is None or size <= 0:
+        size = len(providers)
 
     per_provider: Dict[str, List[str]] = {}
     for pid in providers:
@@ -119,7 +128,7 @@ def run_swarm(
     prompt: str,
     system: Optional[str] = None,
     swarm: Optional[List[Tuple[str, str]]] = None,
-    size: int = 3,
+    size: Optional[int] = None,
     max_tokens: int = 512,
 ) -> List[Dict[str, Any]]:
     """Fan a prompt out to the swarm IN PARALLEL; one record per member, in swarm order."""
@@ -154,7 +163,14 @@ def synthesize(
     panel_text = "\n\n".join(
         f"[{r['family']} | {r['provider']}:{r['model']}]\n{r['answer']}" for r in good
     )
-    jp, jm = judge if judge else (good[0]["provider"], good[0]["model"])
+    candidates: List[Tuple[str, str]] = []
+    if judge:
+        candidates.append(judge)
+    for r in good:
+        pair = (r["provider"], r["model"])
+        if pair not in candidates:
+            candidates.append(pair)
+
     sys = (
         "You are the synthesizer for a multi-model swarm. Below are independent "
         "answers from different model families to the same task. Produce ONE best "
@@ -162,17 +178,24 @@ def synthesize(
         "and drop anything that looks like an error. Be concise."
     )
     user = f"### TASK:\n{prompt}\n\n### SWARM ANSWERS:\n{panel_text}\n\n### MERGED ANSWER:"
-    try:
-        res = client.chat_complete(
-            provider_id=jp,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-            model=jm,
-            max_tokens=1024,
-        )
-        out = ((res.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
-        return out.strip() or panel_text
-    except Exception as e:  # noqa: BLE001
-        return f"[synthesis failed: {e}]\n\n{panel_text}"
+
+    last_err = None
+    for jp, jm in candidates:
+        try:
+            res = client.chat_complete(
+                provider_id=jp,
+                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                model=jm,
+                max_tokens=1024,
+            )
+            out = ((res.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
+            if out.strip():
+                return out.strip()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+
+    return f"[synthesis failed: {last_err}]\n\n{panel_text}" if last_err else panel_text
 
 
 _SWARM_BUILDER_SYSTEM = (
@@ -190,7 +213,127 @@ _SWARM_BREAKER_SYSTEM = (
 )
 
 
-def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: int = 3,
+def enrich_prompt_with_files(prompt: str) -> str:
+    """Detect references to local files, folders, or projects in prompt and attach context."""
+    import re
+    from pathlib import Path
+
+    words = re.findall(r"[\w\./~_-]+", prompt)
+    candidate_paths: List[Path] = []
+
+    for w in words:
+        clean = w.strip("'\"")
+        if not clean or len(clean) < 2:
+            continue
+        p_cwd = Path.cwd() / clean
+        p_home = Path.home() / clean
+        p_abs = Path(clean).expanduser()
+
+        for cand in (p_cwd, p_home, p_abs):
+            if cand.exists() and cand not in candidate_paths:
+                if cand in (Path.home(), Path("/"), Path("/usr"), Path("/tmp"), Path("/etc")):
+                    continue
+                candidate_paths.append(cand)
+                break
+
+    # If no path matched by word, check if any word matches folder in home or cwd case-insensitively
+    if not candidate_paths:
+        for w in prompt.split():
+            clean = w.strip("'\".,;:!?()")
+            if clean and len(clean) > 2:
+                for base in (Path.cwd(), Path.home()):
+                    try:
+                        for child in base.iterdir():
+                            if child.is_dir() and child.name.lower() == clean.lower() and child not in candidate_paths:
+                                candidate_paths.append(child)
+                                break
+                    except Exception:
+                        pass
+
+    if not candidate_paths:
+        return prompt
+
+    attachments = []
+    for p in candidate_paths[:3]:
+        if p.is_file():
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")[:6000]
+                attachments.append(f"### [ATTACHED FILE: {p.name} ({p})]\n```\n{content}\n```")
+            except Exception:
+                pass
+        elif p.is_dir():
+            try:
+                items = sorted([x.name for x in p.iterdir() if not x.name.startswith(".")])[:40]
+                tree_str = ", ".join(items)
+                doc_excerpt = ""
+                for doc_name in ("ARCHITECTURE.md", "README.md", "docs/ARCHITECTURE.md"):
+                    doc_path = p / doc_name
+                    if doc_path.is_file():
+                        try:
+                            doc_excerpt = f"\n\n**Documentation Excerpt ({doc_name}):**\n```\n" + doc_path.read_text(encoding="utf-8", errors="replace")[:3000] + "\n```"
+                            break
+                        except Exception:
+                            pass
+                attachments.append(
+                    f"### [ATTACHED PROJECT DIRECTORY: {p.name} ({p})]\n"
+                    f"**Files & Subdirectories:**\n{tree_str}{doc_excerpt}"
+                )
+            except Exception:
+                pass
+
+    if attachments:
+        return f"{prompt}\n\n" + "\n\n".join(attachments)
+    return prompt
+
+
+def generate_redteam_report(task: str, final_findings: str, members: List[Dict[str, Any]]) -> Path:
+    """Generate a formal markdown report for red-team audits and write to reports/."""
+    from datetime import datetime
+    from pathlib import Path
+    reports_dir = Path.cwd() / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = reports_dir / f"redteam_audit_{ts}.md"
+
+    member_lines = "\n".join(
+        f"- **{r.get('family', 'other').upper()}** ({r.get('provider')}:{r.get('model')})"
+        for r in members if not r.get("error")
+    )
+
+    report_content = f"""# Red-Team Security Assessment & Audit Report
+
+**Date / Timestamp:** {datetime.now().isoformat()}  
+**Target / Scope:** {task}  
+**Audit Council Members:**  
+{member_lines}  
+
+---
+
+## 1. Executive Summary & Findings Analysis
+
+{final_findings}
+
+---
+
+## 2. Methodology & Multi-Model Corroboration
+
+This audit was conducted using an adversarial multi-model swarm spanning independent model architectures.
+Claims are categorized into **PROVEN** vulnerabilities (confirmed via code paths or deterministic evidence)
+and **PLAUSIBLE** attack vectors requiring further verification.
+
+---
+
+## 3. Recommended Remediation & Action Items
+
+1. Review and address each PROVEN vulnerability immediately.
+2. Implement defensive input sanitization, least-privilege access, and rate limiting.
+3. Validate fixes using deterministic verification (`omni verify http` / `omni verify code`).
+"""
+    report_file.write_text(report_content, encoding="utf-8")
+    return report_file
+
+
+def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = None,
                       max_tokens: int = 512, synth: bool = True,
                       judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + synthesis."""
@@ -199,7 +342,7 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: int = 3,
     return {"members": members, "final": final}
 
 
-def swarm_redteam(cfg: Any, client: Any, goal: str, size: int = 3,
+def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                   max_tokens: int = 512, synth: bool = True,
                   judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Multi-model red-team: different families review the target, then consolidate."""
@@ -222,14 +365,15 @@ def swarm_builder(
     cfg: Any,
     client: Any,
     prompt: str,
-    size: int = 3,
+    size: Optional[int] = None,
     max_tokens: int = 512,
     synth: bool = True,
     judge: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, Any]:
     """Builder mode: builders propose solutions while red-teamers stress-test in parallel,
     synthesized into a hardened, battle-tested solution."""
-    swarm = build_swarm(cfg, size=max(2, size))
+    effective_size = 4 if size is None else max(2, size)
+    swarm = build_swarm(cfg, size=effective_size)
     if not swarm:
         return {"members": [], "final": None}
 
@@ -270,16 +414,24 @@ def run_orchestration(
     cfg: Any,
     client: Any,
     prompt: str,
-    size: int = 3,
+    size: Optional[int] = None,
     max_tokens: int = 512,
     synth: bool = True,
     judge: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for swarm modes: 'collaborate', 'builder', 'redteam'."""
+    enriched = enrich_prompt_with_files(prompt)
     normalized = (mode or "collaborate").lower().strip()
     if normalized in ("builder", "build", "b"):
-        return swarm_builder(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+        res = swarm_builder(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
     elif normalized in ("redteam", "red", "rt"):
-        return swarm_redteam(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+        res = swarm_redteam(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+        if synth and res.get("final"):
+            try:
+                rep_path = generate_redteam_report(prompt, res["final"], res.get("members", []))
+                res["report_path"] = str(rep_path)
+            except Exception:
+                pass
     else:
-        return swarm_collaborate(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+        res = swarm_collaborate(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+    return res

@@ -1006,6 +1006,50 @@ class TestSwarm(unittest.TestCase):
             s.handle_slash_command("/size 5")
             self.assertEqual(s.council_size, 5)
 
+            s.last_report_path = "/tmp/test_report.md"
+            self.assertTrue(s.handle_slash_command("/accept"))
+
+
+class TestEnrichPromptAndReports(unittest.TestCase):
+    def test_enrich_prompt_with_files(self):
+        from omnicli.orchestrate import enrich_prompt_with_files
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "Oracle"
+            p.mkdir()
+            (p / "README.md").write_text("Oracle core documentation", encoding="utf-8")
+            (p / "main.py").write_text("print('hello')", encoding="utf-8")
+            
+            with unittest.mock.patch("pathlib.Path.home", return_value=Path(td)):
+                enriched = enrich_prompt_with_files("Please check project Oracle for issues")
+                self.assertIn("ATTACHED PROJECT DIRECTORY: Oracle", enriched)
+                self.assertIn("Oracle core documentation", enriched)
+
+    def test_generate_redteam_report(self):
+        from omnicli.orchestrate import generate_redteam_report
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch("pathlib.Path.cwd", return_value=Path(td)):
+                rep = generate_redteam_report(
+                    task="audit auth service",
+                    final_findings="PROVEN: Weak token validation",
+                    members=[{"family": "meta", "provider": "groq", "model": "openai/gpt-oss-120b"}]
+                )
+                self.assertTrue(rep.exists())
+                content = rep.read_text(encoding="utf-8")
+                self.assertIn("Red-Team Security Assessment", content)
+                self.assertIn("audit auth service", content)
+                self.assertIn("Weak token validation", content)
+
+
+class TestScannerFilters(unittest.TestCase):
+    def test_is_text_or_chat_model(self):
+        from omnicli.scanner import is_text_or_chat_model
+        self.assertTrue(is_text_or_chat_model("openai/gpt-oss-120b"))
+        self.assertTrue(is_text_or_chat_model("llama-3.3-70b-versatile"))
+        self.assertFalse(is_text_or_chat_model("whisper-large-v3"))
+        self.assertFalse(is_text_or_chat_model("meta-llama/llama-prompt-guard-2-22m"))
+        self.assertFalse(is_text_or_chat_model("openai/gpt-oss-safeguard-20b"))
+
+
 
 # ── Cross-provider rotate-families roster (item 3/4) ────────────────────────────
 

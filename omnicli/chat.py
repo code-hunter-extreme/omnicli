@@ -121,7 +121,7 @@ class ChatSession:
         redteam: bool = False,
         rotate_families: bool = False,
         mode: str = "collaborate",
-        council_size: int = 3,
+        council_size: Optional[int] = None,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -132,7 +132,7 @@ class ChatSession:
         self.redteam = redteam
         self.rotate_families = rotate_families
         self.mode = "redteam" if redteam else mode.lower().strip()
-        self.council_size = max(1, council_size)
+        self.council_size = council_size
         if system_prompt:
             self.system_prompt = system_prompt
         elif self.mode == "redteam":
@@ -146,6 +146,7 @@ class ChatSession:
         # re-layered on top whenever the active provider changes.
         self.base_system_prompt = self.system_prompt
         self.messages: List[Dict[str, str]] = []
+        self.last_report_path: Optional[str] = None
 
         if self.system_prompt:
             self.messages.append({"role": "system", "content": self.system_prompt})
@@ -173,7 +174,8 @@ class ChatSession:
         }.get(self.mode, f"[bold cyan]{self.mode.upper()}[/bold cyan]")
         mode_line = f"[bold green]Active Mode:[/bold green] {mode_style}"
         if self.mode != "single":
-            mode_line += f"  |  [bold green]Council Size:[/bold green] {self.council_size} models"
+            sz_str = str(self.council_size) if self.council_size else "all active providers"
+            mode_line += f"  |  [bold green]Council Size:[/bold green] {sz_str}"
         if getattr(self, "rotate_families", False):
             mode_line += "  |  [bold magenta]ROTATE-FAMILIES[/bold magenta]"
         grid.add_row(mode_line)
@@ -198,6 +200,7 @@ class ChatSession:
         table.add_row("/redteam, /rt", "Adversarial red-team council (vulnerability focus)")
         table.add_row("/single", "Direct 1-on-1 single-model chat")
         table.add_row("/size <1-10>", "Set council size for swarm orchestration")
+        table.add_row("/accept", "Accept audit recommendations / remediations")
         table.add_row("/provider, /p <name>", "Switch lead provider (groq, openrouter, nvidia, etc.)")
         table.add_row("/model, /m <name>", "Switch model on current provider")
         table.add_row("/models [query]", "List / search models available on active provider")
@@ -341,6 +344,13 @@ class ChatSession:
                         self.console.print("[red]Council size must be between 1 and 10[/red]")
                 except ValueError:
                     self.console.print("[red]Invalid integer for council size[/red]")
+
+        elif cmd in ("/accept", "/apply"):
+            if getattr(self, "last_report_path", None):
+                self.console.print(f"[bold green]✓ Remediations from {self.last_report_path} accepted.[/bold green]")
+                self.console.print("[dim]You can now use 'omni agent' or local editing tools to apply the changes.[/dim]")
+            else:
+                self.console.print("[yellow]No recent audit report or remediation to accept.[/yellow]")
 
         elif cmd in ("/provider", "/p"):
             if not arg:
@@ -561,6 +571,11 @@ class ChatSession:
                 "redteam": "[bold green]CONSOLIDATED RED-TEAM FINDINGS[/bold green]",
             }.get(self.mode, "[bold green]ORCHESTRATED CONSENSUS[/bold green]")
             self.console.print(Panel(Markdown(final_ans), title=title_mode, border_style="green"))
+
+            if out.get("report_path"):
+                self.last_report_path = out["report_path"]
+                self.console.print(f"[bold green]📄 Red-Team Audit Report saved to:[/bold green] [cyan]{out['report_path']}[/cyan]")
+                self.console.print("[dim]Type /accept to review and acknowledge remediations, or 'omni agent' to execute fixes.[/dim]\n")
 
             # Stats bar
             stats = Text()

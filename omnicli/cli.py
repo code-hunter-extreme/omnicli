@@ -194,12 +194,12 @@ def run_one_shot(
 @click.option("--redteam", is_flag=True, default=False,
               help="Adversarial security-analyst persona (no tools; proof-demanding)")
 @click.option("--single", "flag_single", is_flag=True, default=False, help="Set mode to single-model chat")
-@click.option("--size", type=int, default=3, help="Council size for multi-model orchestration (default 3)")
+@click.option("--size", type=int, default=None, help="Council size for multi-model orchestration (default: all active providers)")
 @click.option("--rotate-families", is_flag=True, default=False,
               help="Switch model family each turn from the scanned roster")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
              temperature: float, mode: str, flag_collaborate: bool, flag_builder: bool,
-             redteam: bool, flag_single: bool, size: int, rotate_families: bool) -> None:
+             redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool) -> None:
     """Start an interactive chat session with multi-model orchestration."""
     active_mode = mode
     if flag_single:
@@ -559,7 +559,7 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 
 
 @main.command("swarm")
-@click.option("-n", "--size", type=int, default=3, help="Number of swarm members (default 3)")
+@click.option("-n", "--size", type=int, default=None, help="Number of swarm members (default: all active providers)")
 @click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam"]), default="collaborate",
               help="Swarm mode: collaborate (consensus), builder (architects+redteam), or redteam (audit)")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Run collaborative swarm")
@@ -569,7 +569,7 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--raw", is_flag=True, default=False, help="Show each member's answer, skip synthesis")
 @click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
 @click.argument("prompt", nargs=-1, required=True)
-def cmd_swarm(size: int, mode: str, flag_collaborate: bool, flag_builder: bool,
+def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_builder: bool,
               redteam: bool, raw: bool, provider: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
@@ -608,6 +608,14 @@ def cmd_swarm(size: int, mode: str, flag_collaborate: bool, flag_builder: bool,
         console.print(Panel(escape(out["final"]),
                             title=title_mode,
                             border_style="green"))
+    if out.get("report_path"):
+        console.print(f"\n[bold green]📄 Red-Team Audit Report saved to:[/bold green] [cyan]{out['report_path']}[/cyan]")
+        try:
+            accept = click.confirm("\nWould you like to review and accept the proposed remediations/changes?", default=True)
+            if accept:
+                console.print("[bold green]✓ Remediations accepted. You can use 'omni agent' or local editing tools to apply the changes.[/bold green]")
+        except Exception:
+            pass
 
 
 @main.group("verify")

@@ -103,16 +103,16 @@ DEFAULT_PROVIDERS = {
         "name": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
         "env_key": "GROQ_API_KEY",
-        "default_model": "llama-3.3-70b-versatile",
+        "default_model": "openai/gpt-oss-120b",
         "description": "Groq ultra-fast LPU inference endpoints",
         "requires_auth_for_models": True,
         "fallback_models": [
-            "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b",
         ],
         "verification_panel": [
-            {"model": "llama-3.3-70b-versatile", "family": "meta"},
+            {"model": "openai/gpt-oss-120b", "family": "openai"},
+            {"model": "qwen/qwen3.8-27b", "family": "qwen"},
         ],
     },
 }
