@@ -73,30 +73,29 @@ def build_swarm(
     idx: Dict[str, int] = {pid: 0 for pid in providers}
     active = [pid for pid in providers if per_provider[pid]]
 
-    # Pass 1: round-robin, one new family per provider per lap.
-    while active and len(swarm) < size:
-        for pid in list(active):
-            ms = per_provider[pid]
-            picked: Optional[Tuple[str, str]] = None
-            while idx[pid] < len(ms):
-                m = ms[idx[pid]]
-                idx[pid] += 1
-                fam = classify_family(m)
-                if fam not in chosen_families:
-                    picked = (pid, m)
-                    chosen_families.add(fam)
-                    break
-            if picked:
-                swarm.append(picked)
-                if len(swarm) >= size:
-                    break
-            if idx[pid] >= len(ms):
-                active.remove(pid)
+    # Pass 1: Every active provider gets 1 slot (preferring unused families if available).
+    for pid in providers:
+        if len(swarm) >= size:
+            break
+        ms = per_provider.get(pid, [])
+        if not ms:
+            continue
+        picked = None
+        for m in ms:
+            fam = classify_family(m)
+            if fam not in chosen_families:
+                picked = (pid, m)
+                chosen_families.add(fam)
+                break
+        if not picked:
+            picked = (pid, ms[0])
+            chosen_families.add(classify_family(ms[0]))
+        swarm.append(picked)
 
-    # Pass 2: not enough distinct families — fill remaining slots with any models.
+    # Pass 2: If size > len(providers), round-robin fill remaining slots.
     if len(swarm) < size:
         for pid in providers:
-            for m in per_provider[pid]:
+            for m in per_provider.get(pid, []):
                 if (pid, m) not in swarm:
                     swarm.append((pid, m))
                     if len(swarm) >= size:
