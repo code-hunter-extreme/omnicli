@@ -56,6 +56,7 @@ class SlashCommandCompleter(Completer):
             ("/file", "Attach a file to chat context"),
             ("/save", "Save conversation to a Markdown file"),
             ("/clear", "Clear chat history"),
+            ("/forget", "Delete persisted history for the active provider"),
             ("/ping", "Test latency to all providers"),
             ("/help", "Show available commands"),
             ("/exit", "Exit the chat session"),
@@ -127,6 +128,7 @@ class ChatSession:
         if self.system_prompt:
             self.messages.append({"role": "system", "content": self.system_prompt})
         self._apply_memory()
+        self._load_history_into_context()
 
         completer = SlashCommandCompleter(self.cfg, self.client)
         self.prompt_session = PromptSession(
@@ -169,7 +171,8 @@ class ChatSession:
         table.add_row("/system, /s [prompt]", "Show or change the active system prompt")
         table.add_row("/temp <0.0-2.0>", "Adjust sampling temperature")
         table.add_row("/file <path>", "Attach file content to the next prompt")
-        table.add_row("/clear", "Clear chat message history")
+        table.add_row("/clear", "Clear chat message history (in-session only)")
+        table.add_row("/forget", "Delete persisted history file for the active provider")
         table.add_row("/save [path]", "Save conversation transcript to a markdown file")
         table.add_row("/ping", "Test latency and health across all endpoints")
         table.add_row("/help", "Display this help menu")
@@ -317,6 +320,16 @@ class ChatSession:
                 self.messages.append({"role": "system", "content": self.system_prompt})
             self.console.print("[bold yellow]Chat history cleared.[/bold yellow]")
 
+        elif cmd == "/forget":
+            from omnicli.memory import history_path
+            p = history_path(self.cfg, self.provider)
+            try:
+                if p.is_file():
+                    p.unlink()
+                self.console.print(f"[bold yellow]Forgot persisted history for {self.provider}.[/bold yellow]")
+            except Exception as e:
+                self.console.print(f"[red]Could not clear history: {e}[/red]")
+
         elif cmd == "/ping":
             self.run_ping_all()
 
@@ -382,6 +395,19 @@ class ChatSession:
 
         p.write_text("\n".join(lines), encoding="utf-8")
         self.console.print(f"[bold green]Transcript saved to:[/bold green] {p.resolve()}")
+
+    def _load_history_into_context(self) -> None:
+        """Resume persisted per-provider history (opt-in) after the system message."""
+        try:
+            from omnicli.memory import load_history
+            hist = load_history(self.cfg, self.provider)
+        except Exception:
+            hist = []
+        if hist:
+            self.messages.extend(hist)
+            self.console.print(
+                f"[dim]Resumed {len(hist)} message(s) of history for {self.provider}.[/dim]"
+            )
 
     def _apply_memory(self) -> None:
         """Set the system message to base prompt + current provider's memory."""
@@ -472,6 +498,14 @@ class ChatSession:
         self.console.print()
 
         self.messages.append({"role": "assistant", "content": full_content})
+
+        # Persist the completed turn to per-provider history (opt-in).
+        try:
+            from omnicli.memory import append_history
+            append_history(self.cfg, self.provider, "user", user_prompt)
+            append_history(self.cfg, self.provider, "assistant", full_content)
+        except Exception:
+            pass
 
         # Optionally switch model family for the next turn.
         if getattr(self, "rotate_families", False):
