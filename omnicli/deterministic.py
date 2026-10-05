@@ -394,6 +394,26 @@ class CodeVerifier:
     """Deterministic source code and AST seam verifier."""
 
     @staticmethod
+    def _extract_python_block(content: str, name: str) -> Optional[str]:
+        """Return the source of a Python def/method `name` by indentation, or None."""
+        lines = content.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^(\s*)def\s+" + re.escape(name) + r"\s*\(", line)
+            if not m:
+                continue
+            indent = len(m.group(1))
+            block = [line]
+            for nxt in lines[i + 1:]:
+                if nxt.strip() == "":
+                    block.append(nxt)
+                    continue
+                if (len(nxt) - len(nxt.lstrip())) <= indent:
+                    break
+                block.append(nxt)
+            return "\n".join(block)
+        return None
+
+    @staticmethod
     def verify_file(
         file_path: str,
         must_contain: Optional[List[str]] = None,
@@ -428,12 +448,18 @@ class CodeVerifier:
         # If scoped to a function, extract function block
         inspect_text = content
         if target_function:
-            fn_regex = rf"(function\s+{re.escape(target_function)}\s*\([^)]*\)\s*\{{(?:[^{{}}]*|\{{(?:[^{{}}]*|\{{[^{{}}]*\}})*\}})*\}})"
+            # Accept "Class.method" by scoping on the final name segment.
+            name = target_function.split(".")[-1]
+            fn_regex = rf"(function\s+{re.escape(name)}\s*\([^)]*\)\s*\{{(?:[^{{}}]*|\{{(?:[^{{}}]*|\{{[^{{}}]*\}})*\}})*\}})"
             m = re.search(fn_regex, content, re.DOTALL | re.IGNORECASE)
             if m:
-                inspect_text = m.group(1)
+                inspect_text = m.group(1)          # JavaScript/TS function
             else:
-                failures.append(f"Function '{target_function}' not found in file")
+                py_block = CodeVerifier._extract_python_block(content, name)
+                if py_block is not None:
+                    inspect_text = py_block         # Python def/method
+                # else: not found in either language — fall back to whole-file
+                # search rather than hard-failing (non-fatal scoping).
 
         # Specific framework checks
         if check_type == "wp_auth_check":

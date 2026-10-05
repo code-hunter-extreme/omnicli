@@ -53,6 +53,30 @@ def tool_verify_http(
     return json.dumps(res, indent=2)
 
 
+def _coerce_patterns(val: Any) -> Optional[List[str]]:
+    """Normalise a must_(not_)contain argument into a list of strings.
+
+    Models frequently pass a JSON-encoded list string (e.g. '["a","b"]') or a
+    single bare pattern instead of an array; both are coerced to a real list so
+    the verifier does not iterate a string character-by-character.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)):
+        return [str(x) for x in val]
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except json.JSONDecodeError:
+                pass
+        return [val]
+    return [str(val)]
+
+
 def tool_verify_code(
     path: str,
     must_contain: Optional[List[str]] = None,
@@ -63,8 +87,8 @@ def tool_verify_code(
     """Execute deterministic code pattern verification and return verdict."""
     res = CodeVerifier.verify_file(
         file_path=path,
-        must_contain=must_contain,
-        must_not_contain=must_not_contain,
+        must_contain=_coerce_patterns(must_contain),
+        must_not_contain=_coerce_patterns(must_not_contain),
         target_function=target_function,
         check_type=check_type,
     )
