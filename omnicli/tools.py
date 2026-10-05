@@ -32,14 +32,23 @@ def tool_verify_http(
     headers: Optional[Dict[str, str]] = None,
     body: Optional[str] = None,
     expected: str = "",
+    allow_local: bool = False,
 ) -> str:
-    """Execute deterministic HTTP verification and return verdict."""
+    """Execute deterministic HTTP verification and return verdict.
+
+    A ScopeGate is always applied so a model-chosen URL cannot reach internal
+    or cloud-metadata addresses (SSRF). allow_local (--allow-local) opts into
+    loopback + RFC1918 targets for deliberate local testing; link-local
+    (metadata) stays blocked regardless.
+    """
+    gate = ScopeGate(allow_localhost=allow_local, allow_private=allow_local)
     res = HTTPVerifier.verify(
         url=url,
         method=method,
         headers=headers,
         body=body,
         expected_str=expected,
+        scope_gate=gate,
     )
     return json.dumps(res, indent=2)
 
@@ -398,6 +407,7 @@ def execute_tool_call(
     arguments: Dict[str, Any],
     client_ref: Any = None,
     allow_shell: bool = False,
+    allow_local: bool = False,
 ) -> str:
     """Execute a function call by name and arguments."""
     if tool_name == "bash":
@@ -415,6 +425,7 @@ def execute_tool_call(
             headers=arguments.get("headers"),
             body=arguments.get("body"),
             expected=arguments.get("expected", ""),
+            allow_local=allow_local,
         )
     elif tool_name == "verify_code":
         return tool_verify_code(

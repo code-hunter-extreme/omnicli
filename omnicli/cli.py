@@ -435,9 +435,12 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
               help="Switch model family each turn from the scanned roster")
 @click.option("--allow-shell", is_flag=True, default=False,
               help="Enable the bash tool (OFF by default; destructive commands still blocked)")
+@click.option("--allow-local", is_flag=True, default=False,
+              help="Permit verify_http against localhost/RFC1918 (metadata IPs stay blocked)")
 @click.argument("goal", nargs=-1, required=True)
 def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
-              redteam: bool, rotate_families: bool, allow_shell: bool, goal: tuple) -> None:
+              redteam: bool, rotate_families: bool, allow_shell: bool,
+              allow_local: bool, goal: tuple) -> None:
     """Run an autonomous agent equipped with local tools and cross-provider delegation."""
     from omnicli.agent import AgentRunner
     task_goal = " ".join(goal).strip()
@@ -449,6 +452,7 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
         redteam=redteam,
         rotate_families=rotate_families,
         allow_shell=allow_shell,
+        allow_local=allow_local,
     )
     runner.run(task_goal)
 

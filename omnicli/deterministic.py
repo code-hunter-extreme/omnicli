@@ -11,9 +11,11 @@ Provides:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
+import socket
 import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,12 +50,17 @@ class ScopeGate:
         allowed_hosts: Optional[List[str]] = None,
         blocked_hosts: Optional[List[str]] = None,
         allow_localhost: bool = False,
+        allow_private: bool = False,
     ) -> None:
         self.allowed_hosts = [h.lower().strip() for h in (allowed_hosts or []) if h]
         self.blocked_hosts = set(GLOBAL_BLOCKED_HOSTS)
         if blocked_hosts:
             self.blocked_hosts.update(h.lower().strip() for h in blocked_hosts if h)
         self.allow_localhost = allow_localhost
+        # Permit RFC1918 / unique-local targets (e.g. testing a LAN instance).
+        # Link-local (169.254/16, fe80::/10 — cloud metadata) stays blocked
+        # regardless, as do reserved/multicast/unspecified ranges.
+        self.allow_private = allow_private
 
     @staticmethod
     def extract_host(target: str) -> str:
@@ -90,6 +97,15 @@ class ScopeGate:
         if host in self.blocked_hosts or any(host.endswith("." + b) for b in self.blocked_hosts):
             return False, f"EXPLICIT_BLOCKED: host '{host}' is in blacklisted/metadata domains"
 
+        # Resolve the host and reject if ANY address is non-public. This catches
+        # IP literals in odd encodings (decimal/hex), 127.0.0.0/8 beyond
+        # 127.0.0.1, RFC1918, IPv4-mapped IPv6, and hostnames that resolve to
+        # internal addresses. Runs before the whitelist so an explicit allow
+        # still can't reach an internal IP without allow_private/allow_localhost.
+        ok_ip, ip_reason = self._check_resolved_ips(host)
+        if not ok_ip:
+            return False, ip_reason
+
         if not self.allowed_hosts:
             # If no explicit whitelist is defined, allow any valid public host not in blacklist
             return True, "in_scope: general public target"
@@ -106,6 +122,84 @@ class ScopeGate:
                 return True, f"in_scope: matches explicit rule '{pattern}'"
 
         return False, f"out_of_scope: host '{host}' does not match permitted scopes"
+
+    @staticmethod
+    def _resolve_host(host: str) -> List[Any]:
+        """Resolve a host to a deduped list of ipaddress objects.
+
+        An IP literal is parsed directly; a hostname is resolved via
+        getaddrinfo (A + AAAA). Returns [] when resolution fails — the caller
+        treats that as out-of-scope (fail closed).
+        """
+        h = host.strip().strip("[]")
+        try:
+            return [ipaddress.ip_address(h)]
+        except ValueError:
+            pass
+        try:
+            infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+        except (socket.gaierror, UnicodeError, OSError):
+            return []
+        seen: set = set()
+        out: List[Any] = []
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+        return out
+
+    @staticmethod
+    def _ip_category(ip: Any) -> str:
+        """Classify an ip into loopback/linklocal/private/.../global.
+
+        Order matters: loopback/link-local/multicast/reserved are checked before
+        the broad is_private so 'private' means the RFC1918 / unique-local
+        remainder. IPv4-mapped IPv6 is unwrapped first.
+        """
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if ip.is_unspecified:
+            return "unspecified"
+        if ip.is_loopback:
+            return "loopback"
+        if ip.is_link_local:
+            return "linklocal"
+        if ip.is_multicast:
+            return "multicast"
+        if ip.is_reserved:
+            return "reserved"
+        if ip.is_private:
+            return "private"
+        return "global"
+
+    def _check_resolved_ips(self, host: str) -> Tuple[bool, str]:
+        """Fail-closed SSRF check: every resolved IP must be public (or opted in).
+
+        loopback requires allow_localhost; RFC1918/unique-local requires
+        allow_private; link-local (incl. cloud metadata), reserved, multicast
+        and unspecified are always rejected.
+        """
+        ips = self._resolve_host(host)
+        if not ips:
+            return False, f"out_of_scope: host '{host}' could not be resolved"
+        for ip in ips:
+            cat = self._ip_category(ip)
+            if cat == "global":
+                continue
+            if cat == "loopback" and self.allow_localhost:
+                continue
+            if cat == "private" and self.allow_private:
+                continue
+            return False, (
+                f"SSRF_BLOCKED: host '{host}' resolves to {ip} ({cat}); "
+                "non-public address not permitted"
+            )
+        return True, f"in_scope: '{host}' resolves to public address(es)"
 
 
 def parse_expected_predicates(expected_str: str) -> Dict[str, Any]:

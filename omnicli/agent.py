@@ -80,6 +80,7 @@ class AgentRunner:
         redteam: bool = False,
         rotate_families: bool = False,
         allow_shell: bool = False,
+        allow_local: bool = False,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -90,6 +91,7 @@ class AgentRunner:
         self.redteam = redteam
         self.rotate_families = rotate_families
         self.allow_shell = allow_shell
+        self.allow_local = allow_local
 
     def _model_roster(self) -> List[str]:
         """Return [primary] + fallback_models from config, deduped, primary first."""
@@ -257,6 +259,7 @@ class AgentRunner:
                     output = execute_tool_call(
                         name, args, client_ref=self.client,
                         allow_shell=getattr(self, "allow_shell", False),
+                        allow_local=getattr(self, "allow_local", False),
                     )
 
                     preview = output.strip().split("\n")[0][:120]
