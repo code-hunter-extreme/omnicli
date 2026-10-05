@@ -539,6 +539,43 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
     runner.run(task_goal)
 
 
+@main.command("swarm")
+@click.option("-n", "--size", type=int, default=3, help="Number of swarm members (default 3)")
+@click.option("--redteam", is_flag=True, default=False,
+              help="Multi-model adversarial red-team review (different families together)")
+@click.option("--raw", is_flag=True, default=False, help="Show each member's answer, skip synthesis")
+@click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
+@click.argument("prompt", nargs=-1, required=True)
+def cmd_swarm(size: int, redteam: bool, raw: bool, provider: Optional[str], prompt: tuple) -> None:
+    """Run MANY models (different families, across all providers) together on one task."""
+    from rich.panel import Panel
+    from omnicli import orchestrate as orch
+    task = " ".join(prompt).strip()
+    swarm = orch.build_swarm(cfg, size=size, provider=provider)
+    if not swarm:
+        console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
+        return
+    roster = ", ".join(f"{p}:{m.split('/')[-1]} ({orch.classify_family(m)})" for p, m in swarm)
+    console.print(Panel(
+        f"[bold cyan]Swarm {'RED-TEAM' if redteam else 'COLLABORATE'}[/bold cyan] — {len(swarm)} members\n"
+        f"[dim]{roster}[/dim]\n[bold green]Task:[/bold green] {task}",
+        title="Swarm Active", border_style="cyan",
+    ))
+    with console.status(f"[cyan]Querying {len(swarm)} models in parallel...[/cyan]", spinner="dots"):
+        out = (orch.swarm_redteam if redteam else orch.swarm_collaborate)(
+            cfg, client, task, size=size, synth=not raw
+        )
+    for r in out["members"]:
+        head = f"{r['family']} | {r['provider']}:{r['model']}"
+        if r["error"]:
+            console.print(Panel(f"[red]ERROR: {r['error']}[/red]", title=head, border_style="red"))
+        else:
+            console.print(Panel(r["answer"] or "[dim](empty)[/dim]", title=head, border_style="dim"))
+    if out.get("final"):
+        console.print(Panel(out["final"], title="[bold green]SYNTHESIZED (swarm consensus)[/bold green]",
+                            border_style="green"))
+
+
 @main.group("verify")
 def cmd_verify() -> None:
     """Deterministic verification and multi-model consensus testing."""
