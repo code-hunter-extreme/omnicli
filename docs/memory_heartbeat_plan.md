@@ -109,7 +109,7 @@ spec — confirm the task shapes before relying on them.
 ---
 
 ## Status checklist
-- [ ] A — memory inject
-- [ ] C — heartbeat status
-- [ ] B — memory history
-- [ ] D — heartbeat tasks
+- [x] A — memory inject
+- [x] C — heartbeat status
+- [x] B — memory history
+- [x] D — heartbeat tasks  (v1: ask/rescan/agent; task shapes may evolve)

@@ -241,9 +241,11 @@ def cmd_ping() -> None:
 @main.command("heartbeat")
 @click.option("--canary", is_flag=True, default=False,
               help="Also send a tiny canary prompt per healthy provider")
+@click.option("--run-tasks", is_flag=True, default=False,
+              help="Also run the user task file (heartbeat.tasks_file)")
 @click.option("--no-write", is_flag=True, default=False,
               help="Do not write the status file")
-def cmd_heartbeat(canary: bool, no_write: bool) -> None:
+def cmd_heartbeat(canary: bool, run_tasks: bool, no_write: bool) -> None:
     """Per-API heartbeat: health, latency, model count (built-in health checks)."""
     from omnicli import heartbeat as hb
     with console.status("[cyan]Heartbeat: checking all providers...[/cyan]", spinner="dots"):
@@ -283,8 +285,30 @@ def cmd_heartbeat(canary: bool, no_write: bool) -> None:
         table.add_row(*row)
 
     console.print(table)
+
+    task_results = None
+    if run_tasks:
+        tasks = hb.load_tasks(cfg)
+        if not tasks:
+            console.print("[dim]No heartbeat tasks configured (heartbeat.tasks_file).[/dim]")
+            task_results = []
+        else:
+            with console.status(f"[cyan]Running {len(tasks)} heartbeat task(s)...[/cyan]", spinner="dots"):
+                task_results = hb.run_tasks(cfg, client, tasks)
+            ttable = Table(title="Heartbeat Tasks", title_style="bold cyan", border_style="dim")
+            ttable.add_column("#", width=4)
+            ttable.add_column("Type", style="bold green", width=10)
+            ttable.add_column("OK", width=6)
+            ttable.add_column("Detail", style="dim")
+            for i, r in enumerate(task_results):
+                ok_str = "[green]OK[/green]" if r.get("ok") else "[red]FAIL[/red]"
+                detail = r.get("error") or r.get("reply") or r.get("answer") or \
+                    (f"{r.get('models', r.get('providers', ''))}")
+                ttable.add_row(str(i), str(r.get("type", "?")), ok_str, str(detail)[:50])
+            console.print(ttable)
+
     if not no_write:
-        path = hb.write_status(cfg, records)
+        path = hb.write_status(cfg, records, tasks=task_results)
         if path:
             console.print(f"[dim]Status written to {path}[/dim]")
 
