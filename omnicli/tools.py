@@ -338,7 +338,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Target provider: 'openrouter', 'nvidia', 'cloudflare', 'bynara', 'apinex', or 'xkiro'",
+                        "description": "Target provider: 'groq', 'openrouter', 'nvidia', 'cloudflare', 'bynara', 'apinex', or 'xkiro'",
                     },
                     "model": {
                         "type": "string",

@@ -175,16 +175,33 @@ def synthesize(
         return f"[synthesis failed: {e}]\n\n{panel_text}"
 
 
+_SWARM_BUILDER_SYSTEM = (
+    "You are the BUILDER / ARCHITECT in a multi-model engineering council. "
+    "Your objective is to produce the cleanest, most robust, production-grade "
+    "design, code, and implementation for the task. Focus on modularity, correct "
+    "architecture, and concrete executable steps."
+)
+
+_SWARM_BREAKER_SYSTEM = (
+    "You are the RED-TEAM / BREAKER in a multi-model engineering council. "
+    "Your objective is to stress-test and attack the proposed solutions for this task. "
+    "Identify edge cases, security vulnerabilities, race conditions, scaling bottlenecks, "
+    "and invalid assumptions. Be specific and rigorous."
+)
+
+
 def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: int = 3,
-                      max_tokens: int = 512, synth: bool = True) -> Dict[str, Any]:
+                      max_tokens: int = 512, synth: bool = True,
+                      judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + synthesis."""
     members = run_swarm(cfg, client, prompt, size=size, max_tokens=max_tokens)
-    final = synthesize(cfg, client, prompt, members) if synth else None
+    final = synthesize(cfg, client, prompt, members, judge=judge) if synth else None
     return {"members": members, "final": final}
 
 
 def swarm_redteam(cfg: Any, client: Any, goal: str, size: int = 3,
-                  max_tokens: int = 512, synth: bool = True) -> Dict[str, Any]:
+                  max_tokens: int = 512, synth: bool = True,
+                  judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
     """Multi-model red-team: different families review the target, then consolidate."""
     members = run_swarm(cfg, client, goal, system=_SWARM_REDTEAM_SYSTEM,
                         size=size, max_tokens=max_tokens)
@@ -196,5 +213,73 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: int = 3,
             "Merge overlapping findings, rank by severity, keep only proof-backed or "
             "clearly-plausible issues.",
             members,
+            judge=judge,
         )
     return {"members": members, "final": final}
+
+
+def swarm_builder(
+    cfg: Any,
+    client: Any,
+    prompt: str,
+    size: int = 3,
+    max_tokens: int = 512,
+    synth: bool = True,
+    judge: Optional[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """Builder mode: builders propose solutions while red-teamers stress-test in parallel,
+    synthesized into a hardened, battle-tested solution."""
+    swarm = build_swarm(cfg, size=max(2, size))
+    if not swarm:
+        return {"members": [], "final": None}
+
+    results: List[Dict[str, Any]] = []
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(swarm))) as ex:
+        futs = []
+        for i, (p, m) in enumerate(swarm):
+            role = "BUILDER" if (i % 2 == 0) else "REDTEAM"
+            sys_prompt = _SWARM_BUILDER_SYSTEM if role == "BUILDER" else _SWARM_BREAKER_SYSTEM
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            futs.append((role, ex.submit(_one_call, client, p, m, messages, max_tokens)))
+        for role, fut in futs:
+            res = fut.result()
+            res["role"] = role
+            results.append(res)
+
+    order = {(p, m): i for i, (p, m) in enumerate(swarm)}
+    results.sort(key=lambda r: order.get((r["provider"], r["model"]), 1_000_000))
+
+    final = None
+    if synth:
+        synth_prompt = (
+            f"You are the lead architect synthesizing a battle-hardened solution for:\n{prompt}\n\n"
+            "Below are independent proposals from BUILDER models and adversarial stress-tests from REDTEAM models.\n"
+            "Produce the final, hardened build: take the best architectural solutions from the Builders, "
+            "and directly fortify them against the vulnerabilities and failure modes identified by the Red Team. "
+            "Deliver the concrete, robust solution."
+        )
+        final = synthesize(cfg, client, synth_prompt, results, judge=judge)
+    return {"members": results, "final": final}
+
+
+def run_orchestration(
+    mode: str,
+    cfg: Any,
+    client: Any,
+    prompt: str,
+    size: int = 3,
+    max_tokens: int = 512,
+    synth: bool = True,
+    judge: Optional[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """Unified dispatcher for swarm modes: 'collaborate', 'builder', 'redteam'."""
+    normalized = (mode or "collaborate").lower().strip()
+    if normalized in ("builder", "build", "b"):
+        return swarm_builder(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+    elif normalized in ("redteam", "red", "rt"):
+        return swarm_redteam(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
+    else:
+        return swarm_collaborate(cfg, client, prompt, size=size, max_tokens=max_tokens, synth=synth, judge=judge)

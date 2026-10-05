@@ -952,6 +952,60 @@ class TestSwarm(unittest.TestCase):
         sys_msgs = [m["content"] for call in rec for m in call["messages"] if m["role"] == "system"]
         self.assertTrue(any("adversarial" in s.lower() for s in sys_msgs))
 
+    def test_builder_swarm_alternates_roles(self):
+        from omnicli.orchestrate import swarm_builder
+        rec = []
+        out = swarm_builder(self._cfg(), self.FakeClient(record=rec), "build X", size=4, synth=False)
+        roles = [r["role"] for r in out["members"]]
+        self.assertEqual(roles, ["BUILDER", "REDTEAM", "BUILDER", "REDTEAM"])
+        sys_msgs = [m["content"] for call in rec for m in call["messages"] if m["role"] == "system"]
+        self.assertTrue(any("builder" in s.lower() for s in sys_msgs))
+        self.assertTrue(any("breaker" in s.lower() or "red-team" in s.lower() for s in sys_msgs))
+
+    def test_run_orchestration_dispatcher(self):
+        from omnicli.orchestrate import run_orchestration
+        cfg = self._cfg()
+        client = self.FakeClient()
+        c = run_orchestration("collaborate", cfg, client, "task", size=2, synth=False)
+        self.assertEqual(len(c["members"]), 2)
+        b = run_orchestration("builder", cfg, client, "task", size=2, synth=False)
+        self.assertEqual(len(b["members"]), 2)
+        self.assertIn("role", b["members"][0])
+        r = run_orchestration("redteam", cfg, client, "task", size=2, synth=False)
+        self.assertEqual(len(r["members"]), 2)
+
+    def test_groq_provider_configured(self):
+        from omnicli.config import DEFAULT_PROVIDERS
+        self.assertIn("groq", DEFAULT_PROVIDERS)
+        self.assertEqual(DEFAULT_PROVIDERS["groq"]["base_url"], "https://api.groq.com/openai/v1")
+        self.assertEqual(DEFAULT_PROVIDERS["groq"]["env_key"], "GROQ_API_KEY")
+
+    def test_chat_session_mode_commands(self):
+        from omnicli.chat import ChatSession
+        with patch.object(ChatSession, "_apply_memory"), patch.object(ChatSession, "_load_history_into_context"):
+            s = ChatSession.__new__(ChatSession)
+            s.console = MagicMock()
+            s.cfg = MagicMock()
+            s.provider = "groq"
+            s.model = "llama-3.3-70b-versatile"
+            s.mode = "collaborate"
+            s.council_size = 3
+
+            s.handle_slash_command("/builder")
+            self.assertEqual(s.mode, "builder")
+
+            s.handle_slash_command("/redteam")
+            self.assertEqual(s.mode, "redteam")
+
+            s.handle_slash_command("/single")
+            self.assertEqual(s.mode, "single")
+
+            s.handle_slash_command("/mode collaborate")
+            self.assertEqual(s.mode, "collaborate")
+
+            s.handle_slash_command("/size 5")
+            self.assertEqual(s.council_size, 5)
+
 
 # ── Cross-provider rotate-families roster (item 3/4) ────────────────────────────
 

@@ -14,6 +14,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -23,6 +24,14 @@ from rich.text import Text
 
 from omnicli.client import OmniClient
 from omnicli.config import ConfigManager
+
+chat_style = Style.from_dict({
+    "provider": "ansicyan bold",
+    "colon": "ansigray",
+    "model": "ansigreen",
+    "mode": "ansimagenta bold",
+    "arrow": "ansicyan bold",
+})
 
 
 # Adversarial persona for `omni chat --redteam`. Chat has no tool execution, so
@@ -45,6 +54,12 @@ class SlashCommandCompleter(Completer):
         self.cfg = config_manager
         self.client = client
         self.commands = [
+            ("/mode", "Switch mode: collaborate, builder, redteam, single"),
+            ("/collaborate", "Collaborative council mode (all models reason together)"),
+            ("/builder", "Builder mode (constructive builders + redteam stress-test)"),
+            ("/redteam", "Adversarial red-team council mode"),
+            ("/single", "Single-model direct chat mode"),
+            ("/size", "Set council size for swarm orchestration"),
             ("/provider", "Switch active LLM provider"),
             ("/model", "Switch active model"),
             ("/models", "List or search models from active provider"),
@@ -77,7 +92,12 @@ class SlashCommandCompleter(Completer):
         cmd = words[0]
         arg = words[1] if len(words) > 1 else ""
 
-        if cmd in ("/provider", "/p"):
+        if cmd == "/mode":
+            for m in ("collaborate", "builder", "redteam", "single"):
+                if m.startswith(arg.lower()):
+                    yield Completion(m, start_position=-len(arg), display_meta=f"Set mode: {m}")
+
+        elif cmd in ("/provider", "/p"):
             providers = list(self.cfg.data.get("providers", {}).keys())
             for p in providers:
                 if p.startswith(arg):
@@ -100,6 +120,8 @@ class ChatSession:
         temperature: float = 0.7,
         redteam: bool = False,
         rotate_families: bool = False,
+        mode: str = "collaborate",
+        council_size: int = 3,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -109,9 +131,11 @@ class ChatSession:
         self.model = model or self.cfg.get_default_model(self.provider)
         self.redteam = redteam
         self.rotate_families = rotate_families
+        self.mode = "redteam" if redteam else mode.lower().strip()
+        self.council_size = max(1, council_size)
         if system_prompt:
             self.system_prompt = system_prompt
-        elif redteam:
+        elif self.mode == "redteam":
             self.system_prompt = _CHAT_REDTEAM_SYSTEM
         else:
             self.system_prompt = self.cfg.data.get(
@@ -133,20 +157,26 @@ class ChatSession:
             history=FileHistory(str(self.cfg.history_file)),
             auto_suggest=AutoSuggestFromHistory(),
             completer=completer,
+            style=chat_style,
         )
 
     def print_welcome(self) -> None:
         grid = Table.grid(expand=True)
         grid.add_column(justify="left", ratio=1)
-        grid.add_row("[bold cyan]OmniCLI — Local Multi-Provider AI Terminal[/bold cyan]")
-        grid.add_row(f"[bold green]Provider:[/bold green] {self.provider}  |  [bold green]Model:[/bold green] {self.model}  |  [bold green]Temp:[/bold green] {self.temperature}")
-        modes = []
-        if getattr(self, "redteam", False):
-            modes.append("[bold red]RED-TEAM[/bold red]")
+        grid.add_row("[bold cyan]OmniCLI — Local Multi-Provider AI Terminal & Council[/bold cyan]")
+        grid.add_row(f"[bold green]Lead Provider:[/bold green] {self.provider}  |  [bold green]Model:[/bold green] {self.model}  |  [bold green]Temp:[/bold green] {self.temperature}")
+        mode_style = {
+            "collaborate": "[bold cyan]COLLABORATE (Multi-Model Council)[/bold cyan]",
+            "builder": "[bold yellow]BUILDER (Architects + Red-Team Stress-Test)[/bold yellow]",
+            "redteam": "[bold red]RED-TEAM (Adversarial Audit)[/bold red]",
+            "single": "[dim]SINGLE-MODEL (Direct Chat)[/dim]",
+        }.get(self.mode, f"[bold cyan]{self.mode.upper()}[/bold cyan]")
+        mode_line = f"[bold green]Active Mode:[/bold green] {mode_style}"
+        if self.mode != "single":
+            mode_line += f"  |  [bold green]Council Size:[/bold green] {self.council_size} models"
         if getattr(self, "rotate_families", False):
-            modes.append("[bold magenta]ROTATE-FAMILIES[/bold magenta]")
-        if modes:
-            grid.add_row("[bold green]Modes:[/bold green] " + "  ".join(modes))
+            mode_line += "  |  [bold magenta]ROTATE-FAMILIES[/bold magenta]"
+        grid.add_row(mode_line)
         try:
             from omnicli.memory import memory_file_count
             mcount = memory_file_count(self.cfg, self.provider)
@@ -154,15 +184,21 @@ class ChatSession:
             mcount = 0
         if mcount:
             grid.add_row(f"[bold green]Memory:[/bold green] {mcount} file(s) for {self.provider}")
-        grid.add_row("[dim]Type /help for slash commands, /models to browse models, /clear to reset history.[/dim]\n")
+        grid.add_row("[dim]Type /mode, /collaborate, /builder, /redteam, /single to switch modes. Type /help for all commands.[/dim]\n")
         self.console.print(Panel(grid, border_style="cyan", padding=(0, 1)))
 
     def show_help(self) -> None:
         table = Table(title="OmniCLI Chat Commands", title_style="bold cyan", border_style="dim")
-        table.add_column("Command", style="bold green", width=22)
+        table.add_column("Command", style="bold green", width=24)
         table.add_column("Description", style="white")
 
-        table.add_row("/provider, /p <name>", "Switch provider (openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
+        table.add_row("/mode [mode]", "Switch mode (collaborate, builder, redteam, single)")
+        table.add_row("/collaborate, /c", "Collaborative council (all models reason together)")
+        table.add_row("/builder, /b", "Builder mode (constructive builders + red-team attack)")
+        table.add_row("/redteam, /rt", "Adversarial red-team council (vulnerability focus)")
+        table.add_row("/single", "Direct 1-on-1 single-model chat")
+        table.add_row("/size <1-10>", "Set council size for swarm orchestration")
+        table.add_row("/provider, /p <name>", "Switch lead provider (groq, openrouter, nvidia, etc.)")
         table.add_row("/model, /m <name>", "Switch model on current provider")
         table.add_row("/models [query]", "List / search models available on active provider")
         table.add_row("/providers", "List all configured providers and key statuses")
@@ -264,6 +300,47 @@ class ChatSession:
 
         elif cmd in ("/providers", "/p_list"):
             self.show_providers()
+
+        elif cmd in ("/mode",):
+            if not arg:
+                self.console.print(f"Current mode: [bold cyan]{self.mode}[/bold cyan] (options: collaborate, builder, redteam, single)")
+            else:
+                m = arg.lower()
+                if m in ("collaborate", "builder", "redteam", "single"):
+                    self.mode = m
+                    self.console.print(f"[bold green]Mode switched to:[/bold green] [bold cyan]{self.mode}[/bold cyan]")
+                else:
+                    self.console.print(f"[red]Unknown mode '{arg}'. Choose from: collaborate, builder, redteam, single[/red]")
+
+        elif cmd in ("/collaborate", "/collab", "/c"):
+            self.mode = "collaborate"
+            self.console.print("[bold green]Mode switched to:[/bold green] [bold cyan]collaborate[/bold cyan] (all models reason together)")
+
+        elif cmd in ("/builder", "/build", "/b"):
+            self.mode = "builder"
+            self.console.print("[bold green]Mode switched to:[/bold green] [bold yellow]builder[/bold yellow] (constructive builders + red-team attack)")
+
+        elif cmd in ("/redteam", "/rt"):
+            self.mode = "redteam"
+            self.console.print("[bold green]Mode switched to:[/bold green] [bold red]redteam[/bold red] (adversarial vulnerability review)")
+
+        elif cmd in ("/single",):
+            self.mode = "single"
+            self.console.print(f"[bold green]Mode switched to:[/bold green] [dim]single[/dim] (direct 1-on-1 with {self.provider}/{self.model})")
+
+        elif cmd in ("/size", "/council_size"):
+            if not arg:
+                self.console.print(f"Current council size: [bold cyan]{self.council_size}[/bold cyan]")
+            else:
+                try:
+                    sz = int(arg)
+                    if 1 <= sz <= 10:
+                        self.council_size = sz
+                        self.console.print(f"[bold green]Council size set to {self.council_size}[/bold green]")
+                    else:
+                        self.console.print("[red]Council size must be between 1 and 10[/red]")
+                except ValueError:
+                    self.console.print("[red]Invalid integer for council size[/red]")
 
         elif cmd in ("/provider", "/p"):
             if not arg:
@@ -447,6 +524,55 @@ class ChatSession:
         self._apply_memory()  # refresh memory for the active provider
         self.messages.append({"role": "user", "content": user_prompt})
 
+        if self.mode in ("collaborate", "builder", "redteam"):
+            from omnicli.orchestrate import run_orchestration
+            from rich.markup import escape
+            t0 = time.perf_counter()
+            with self.console.status(
+                f"[bold cyan]Council ({self.mode.upper()}) reasoning across {self.council_size} models in parallel...[/bold cyan]",
+                spinner="dots",
+            ):
+                out = run_orchestration(
+                    mode=self.mode,
+                    cfg=self.cfg,
+                    client=self.client,
+                    prompt=user_prompt,
+                    size=self.council_size,
+                    synth=True,
+                    judge=(self.provider, self.model),
+                )
+            total_time = time.perf_counter() - t0
+
+            # Display member perspectives in compact panels
+            for r in out.get("members", []):
+                role_tag = f" [{r['role']}]" if "role" in r else ""
+                head = escape(f"{r['family']}{role_tag} | {r['provider']}:{r['model']}")
+                if r.get("error"):
+                    self.console.print(Panel(f"[red]Error: {escape(r['error'])}[/red]", title=head, border_style="red"))
+                elif r.get("answer"):
+                    preview = escape(r["answer"][:300] + ("..." if len(r["answer"]) > 300 else ""))
+                    self.console.print(Panel(preview, title=head, border_style="dim"))
+
+            # Display final synthesized answer
+            final_ans = out.get("final") or "All swarm members failed to respond."
+            title_mode = {
+                "collaborate": "[bold green]SYNTHESIZED CONSENSUS (All Models Reasoning Together)[/bold green]",
+                "builder": "[bold green]HARDENED BUILD (Builders Fortified Against Red-Team)[/bold green]",
+                "redteam": "[bold green]CONSOLIDATED RED-TEAM FINDINGS[/bold green]",
+            }.get(self.mode, "[bold green]ORCHESTRATED CONSENSUS[/bold green]")
+            self.console.print(Panel(Markdown(final_ans), title=title_mode, border_style="green"))
+
+            # Stats bar
+            stats = Text()
+            stats.append(f"⚡ Swarm [{self.mode.upper()}] • {len(out.get('members', []))} models", style="bold cyan")
+            stats.append(f"  •  Synthesizer: {self.provider}/{self.model}", style="dim")
+            stats.append(f"  •  {round(total_time, 2)}s", style="dim green")
+            self.console.print(stats)
+            self.console.print()
+
+            self.messages.append({"role": "assistant", "content": final_ans})
+            return
+
         full_content = ""
         t0 = time.perf_counter()
         first_token_time = None
@@ -524,6 +650,7 @@ class ChatSession:
                     ("class:provider", f"{self.provider}"),
                     ("class:colon", ":"),
                     ("class:model", f"{self.model.split('/')[-1]}"),
+                    ("class:mode", f" [{self.mode}]"),
                     ("class:arrow", " ❯ "),
                 ]
                 text = self.prompt_session.prompt(prompt_label)

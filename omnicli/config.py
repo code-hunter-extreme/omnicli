@@ -99,6 +99,22 @@ DEFAULT_PROVIDERS = {
         "fallback_models": [],
         "verification_panel": [],
     },
+    "groq": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "env_key": "GROQ_API_KEY",
+        "default_model": "llama-3.3-70b-versatile",
+        "description": "Groq ultra-fast LPU inference endpoints",
+        "requires_auth_for_models": True,
+        "fallback_models": [
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ],
+        "verification_panel": [
+            {"model": "llama-3.3-70b-versatile", "family": "meta"},
+        ],
+    },
 }
 
 # Per-provider memory (context injection + optional history). File entries are
@@ -135,7 +151,7 @@ class ConfigManager:
     def _load(self) -> Dict[str, Any]:
         if not self.config_file.exists():
             initial_data = {
-                "default_provider": "openrouter",
+                "default_provider": "groq",
                 "providers": dict(DEFAULT_PROVIDERS),
                 "keys": {},
                 "cloudflare_account_id": "",

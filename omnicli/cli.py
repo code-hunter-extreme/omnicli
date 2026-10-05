@@ -42,6 +42,7 @@ def main() -> None:
     """OmniCLI — Local Multi-Provider AI Terminal & Router Client.
 
     Supported Providers:
+      • groq       (https://api.groq.com/openai/v1)
       • openrouter (OpenRouter API)
       • nvidia     (NVIDIA Build / NIM)
       • cloudflare (Cloudflare Workers AI)
@@ -53,7 +54,7 @@ def main() -> None:
 
 
 @main.command("ask")
-@click.option("-p", "--provider", help="Provider ID (openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
+@click.option("-p", "--provider", help="Provider ID (groq, openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
 @click.option("-m", "--model", help="Model identifier")
 @click.option("-s", "--system", help="System prompt")
 @click.option("-t", "--temperature", type=float, default=0.7, help="Sampling temperature (0.0 - 2.0)")
@@ -186,13 +187,30 @@ def run_one_shot(
 @click.option("-m", "--model", help="Model name")
 @click.option("-s", "--system", help="System prompt")
 @click.option("-t", "--temperature", type=float, default=0.7, help="Temperature")
+@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam", "single"]), default="collaborate",
+              help="Council mode: collaborate (all models), builder (architects+redteam), redteam (adversarial), or single")
+@click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Set mode to collaborate")
+@click.option("--builder", "flag_builder", is_flag=True, default=False, help="Set mode to builder")
 @click.option("--redteam", is_flag=True, default=False,
               help="Adversarial security-analyst persona (no tools; proof-demanding)")
+@click.option("--single", "flag_single", is_flag=True, default=False, help="Set mode to single-model chat")
+@click.option("--size", type=int, default=3, help="Council size for multi-model orchestration (default 3)")
 @click.option("--rotate-families", is_flag=True, default=False,
               help="Switch model family each turn from the scanned roster")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
-             temperature: float, redteam: bool, rotate_families: bool) -> None:
-    """Start an interactive chat session."""
+             temperature: float, mode: str, flag_collaborate: bool, flag_builder: bool,
+             redteam: bool, flag_single: bool, size: int, rotate_families: bool) -> None:
+    """Start an interactive chat session with multi-model orchestration."""
+    active_mode = mode
+    if flag_single:
+        active_mode = "single"
+    elif redteam:
+        active_mode = "redteam"
+    elif flag_builder:
+        active_mode = "builder"
+    elif flag_collaborate:
+        active_mode = "collaborate"
+
     session = ChatSession(
         provider=provider,
         model=model,
@@ -200,6 +218,8 @@ def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str
         temperature=temperature,
         redteam=redteam,
         rotate_families=rotate_families,
+        mode=active_mode,
+        council_size=size,
     )
     session.run()
 
@@ -540,12 +560,17 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 
 @main.command("swarm")
 @click.option("-n", "--size", type=int, default=3, help="Number of swarm members (default 3)")
+@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam"]), default="collaborate",
+              help="Swarm mode: collaborate (consensus), builder (architects+redteam), or redteam (audit)")
+@click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Run collaborative swarm")
+@click.option("--builder", "flag_builder", is_flag=True, default=False, help="Run builder swarm (architects vs redteam)")
 @click.option("--redteam", is_flag=True, default=False,
               help="Multi-model adversarial red-team review (different families together)")
 @click.option("--raw", is_flag=True, default=False, help="Show each member's answer, skip synthesis")
 @click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
 @click.argument("prompt", nargs=-1, required=True)
-def cmd_swarm(size: int, redteam: bool, raw: bool, provider: Optional[str], prompt: tuple) -> None:
+def cmd_swarm(size: int, mode: str, flag_collaborate: bool, flag_builder: bool,
+              redteam: bool, raw: bool, provider: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
@@ -555,27 +580,33 @@ def cmd_swarm(size: int, redteam: bool, raw: bool, provider: Optional[str], prom
     if not swarm:
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
         return
+
+    active_mode = "redteam" if redteam else ("builder" if flag_builder else ("collaborate" if flag_collaborate else mode))
     roster = ", ".join(f"{p}:{m.split('/')[-1]} ({orch.classify_family(m)})" for p, m in swarm)
     console.print(Panel(
-        f"[bold cyan]Swarm {'RED-TEAM' if redteam else 'COLLABORATE'}[/bold cyan] — {len(swarm)} members\n"
+        f"[bold cyan]Swarm {active_mode.upper()}[/bold cyan] — {len(swarm)} members\n"
         f"[dim]{escape(roster)}[/dim]\n[bold green]Task:[/bold green] {escape(task)}",
         title="Swarm Active", border_style="cyan",
     ))
-    with console.status(f"[cyan]Querying {len(swarm)} models in parallel...[/cyan]", spinner="dots"):
-        out = (orch.swarm_redteam if redteam else orch.swarm_collaborate)(
-            cfg, client, task, size=size, synth=not raw
-        )
+    with console.status(f"[cyan]Querying {len(swarm)} models in parallel ({active_mode})...[/cyan]", spinner="dots"):
+        out = orch.run_orchestration(active_mode, cfg, client, task, size=size, synth=not raw)
     # Model/tool output is untrusted — escape it so it cannot inject Rich markup.
     for r in out["members"]:
-        head = escape(f"{r['family']} | {r['provider']}:{r['model']}")
+        role_tag = f" [{r['role']}]" if "role" in r else ""
+        head = escape(f"{r['family']}{role_tag} | {r['provider']}:{r['model']}")
         if r["error"]:
             console.print(Panel(f"[red]ERROR: {escape(r['error'])}[/red]", title=head, border_style="red"))
         else:
             body = escape(r["answer"]) if r["answer"] else "[dim](empty)[/dim]"
             console.print(Panel(body, title=head, border_style="dim"))
     if out.get("final"):
+        title_mode = {
+            "collaborate": "[bold green]SYNTHESIZED (swarm consensus)[/bold green]",
+            "builder": "[bold green]HARDENED BUILD (synthesized against red-team)[/bold green]",
+            "redteam": "[bold green]CONSOLIDATED (red-team findings)[/bold green]",
+        }.get(active_mode, "[bold green]SYNTHESIZED[/bold green]")
         console.print(Panel(escape(out["final"]),
-                            title="[bold green]SYNTHESIZED (swarm consensus)[/bold green]",
+                            title=title_mode,
                             border_style="green"))
 
 
