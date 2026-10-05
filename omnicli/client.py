@@ -187,10 +187,43 @@ class OmniClient:
                 "error": "Set account ID: omni config set-account <ID>",
             }
 
+        t0 = time.perf_counter()
+        if provider_id in ("cloudflare", "monkeycode"):
+            try:
+                models = self.list_models(provider_id, timeout=5.0)
+                latency = round((time.perf_counter() - t0) * 1000, 1)
+                return {
+                    "status": "healthy",
+                    "code": 200,
+                    "latency_ms": latency,
+                    "model_count": len(models),
+                    "has_key": has_key,
+                    "error": None,
+                }
+            except ProviderError as pe:
+                latency = round((time.perf_counter() - t0) * 1000, 1)
+                return {
+                    "status": f"http_{pe.status_code}" if pe.status_code else "unreachable",
+                    "code": pe.status_code,
+                    "latency_ms": latency,
+                    "model_count": 0,
+                    "has_key": has_key,
+                    "error": pe.message[:120],
+                }
+            except Exception as e:
+                latency = round((time.perf_counter() - t0) * 1000, 1)
+                return {
+                    "status": "unreachable",
+                    "code": None,
+                    "latency_ms": latency,
+                    "model_count": 0,
+                    "has_key": has_key,
+                    "error": str(e),
+                }
+
         url = self.get_endpoint_url(provider_id, "models")
         headers = self.get_headers(provider_id)
 
-        t0 = time.perf_counter()
         try:
             with httpx.Client(timeout=5.0) as client:
                 res = client.get(url, headers=headers)
