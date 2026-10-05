@@ -44,7 +44,7 @@ Fix:
 - rotate-families: roster is cross-provider; _call_model uses the pair's provider.
 
 ## Status
-- [ ] 1 engine (build_swarm / run_swarm / synthesize)
-- [ ] 2 `omni swarm` collaborate + redteam
-- [ ] 3 rotate-families cross-provider fix
-- [ ] 4 verified cross-provider throughout
+- [x] 1 engine (build_swarm / run_swarm / synthesize)
+- [x] 2 `omni swarm` collaborate + redteam
+- [x] 3 rotate-families cross-provider fix (roster is (provider, model) pairs; _call_model uses the pair's provider)
+- [x] 4 cross-provider throughout (build_swarm round-robins all providers; rotate roster spans APIs)

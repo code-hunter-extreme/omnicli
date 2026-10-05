@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
 from omnicli.client import OmniClient, ProviderError
@@ -121,17 +122,42 @@ class AgentRunner:
                 return cand
         return current_idx
 
+    def _build_roster(self) -> List[Tuple[str, str]]:
+        """Roster of (provider, model) pairs the run walks for rotation/fallback.
+
+        Default: the supervisor provider's own models. With rotate_families, a
+        cross-provider, family-diverse roster spanning ALL configured providers,
+        so rotation truly switches both family and API each turn.
+        """
+        if getattr(self, "rotate_families", False):
+            try:
+                from omnicli.orchestrate import build_swarm
+                primary = (self.provider, self.model)
+                pairs = [primary] + [p for p in build_swarm(self.cfg, size=12) if p != primary]
+                seen: set = set()
+                out: List[Tuple[str, str]] = []
+                for pr in pairs:
+                    if pr[1] and pr not in seen:
+                        seen.add(pr)
+                        out.append(pr)
+                if out:
+                    return out
+            except Exception:
+                pass
+        return [(self.provider, m) for m in self._model_roster()]
+
     def _call_model(
         self,
+        provider: str,
         model: str,
         messages: List[Dict[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Single model call. Returns (data, None) on success or (None, error_msg).
+        """Single model call on a specific provider. Returns (data, None) or (None, error).
 
         Caller decides whether error warrants a roster retry.
         """
-        url = self.client.get_endpoint_url(self.provider, "chat/completions")
-        headers = self.client.get_headers(self.provider)
+        url = self.client.get_endpoint_url(provider, "chat/completions")
+        headers = self.client.get_headers(provider)
         # In red-team mode expose only the verify_* set (+bash/read_file/consult)
         # so the model stays on proving findings, not writing files.
         tools = _REDTEAM_TOOLS if getattr(self, "redteam", False) else TOOL_DEFINITIONS
@@ -192,15 +218,17 @@ class AgentRunner:
             {"role": "user", "content": goal},
         ]
 
-        roster = self._model_roster()
-        active_model = roster[0]
+        roster = self._build_roster()                  # list of (provider, model)
+        models_only = [m for (_p, m) in roster]
+        active_provider, active_model = roster[0]
         roster_idx = 0
+        span = "cross-provider" if len({p for p, _ in roster}) > 1 else self.provider
 
         self.console.print(
             Panel(
                 f"[bold cyan]OmniCLI Agent Goal:[/bold cyan] {goal}\n"
-                f"[bold green]Supervisor:[/bold green] {self.provider} ({active_model})  |  "
-                f"[dim]Roster: {len(roster)} model(s) available  |  "
+                f"[bold green]Supervisor:[/bold green] {active_provider} ({active_model})  |  "
+                f"[dim]Roster: {len(roster)} model(s) across {span}  |  "
                 f"Tools: bash, file_ops, registry_search (6.4k tools), cross-provider[/dim]",
                 title="Agent Active",
                 border_style="cyan",
@@ -212,21 +240,21 @@ class AgentRunner:
             turn += 1
 
             with self.console.status(
-                f"[cyan]Turn {turn}: {self.provider}/{active_model}...[/cyan]",
+                f"[cyan]Turn {turn}: {active_provider}/{active_model}...[/cyan]",
                 spinner="dots",
             ):
-                data, err = self._call_model(active_model, messages)
+                data, err = self._call_model(active_provider, active_model, messages)
 
             if err:
                 is_retryable = err.startswith("retry:")
                 self.console.print(
-                    f"  [yellow]⚠ {self.provider}/{active_model}: {err}[/yellow]"
+                    f"  [yellow]⚠ {active_provider}/{active_model}: {err}[/yellow]"
                 )
                 if is_retryable and roster_idx + 1 < len(roster):
                     roster_idx += 1
-                    active_model = roster[roster_idx]
+                    active_provider, active_model = roster[roster_idx]
                     self.console.print(
-                        f"  [cyan]↻ Falling back to {self.provider}/{active_model} "
+                        f"  [cyan]↻ Falling back to {active_provider}/{active_model} "
                         f"(family: {_family_label(active_model)})[/cyan]"
                     )
                     turn -= 1  # don't burn a turn on a model swap
@@ -245,7 +273,7 @@ class AgentRunner:
 
             if content and not tool_calls:
                 self.console.print("\n[bold green]Final Answer:[/bold green]")
-                self.console.print(content)
+                self.console.print(escape(content))
                 return content
 
             if tool_calls:
@@ -259,10 +287,10 @@ class AgentRunner:
                     except Exception:
                         args = {}
 
-                    arg_summary = ", ".join(f"{k}='{v}'" for k, v in list(args.items())[:3])
+                    arg_summary = escape(", ".join(f"{k}='{v}'" for k, v in list(args.items())[:3]))
                     self.console.print(
                         f"  [bold yellow]⚡ Tool Call:[/bold yellow] "
-                        f"[bold white]{name}[/bold white]({arg_summary})"
+                        f"[bold white]{escape(name)}[/bold white]({arg_summary})"
                     )
 
                     output = execute_tool_call(
@@ -271,7 +299,7 @@ class AgentRunner:
                         allow_local=getattr(self, "allow_local", False),
                     )
 
-                    preview = output.strip().split("\n")[0][:120]
+                    preview = escape(output.strip().split("\n")[0][:120])
                     self.console.print(f"    [dim]↳ {preview}... ({len(output)} chars)[/dim]")
 
                     messages.append({
@@ -284,17 +312,17 @@ class AgentRunner:
                 # After a completed turn, optionally switch to the next model
                 # family so consecutive turns use different architectures.
                 if getattr(self, "rotate_families", False):
-                    new_idx = self._next_family_index(roster_idx, roster)
+                    new_idx = self._next_family_index(roster_idx, models_only)
                     if new_idx != roster_idx:
                         roster_idx = new_idx
-                        active_model = roster[roster_idx]
+                        active_provider, active_model = roster[roster_idx]
                         self.console.print(
-                            f"  [magenta]⟳ Rotating family → {self.provider}/{active_model} "
+                            f"  [magenta]⟳ Rotating family → {active_provider}/{active_model} "
                             f"(family: {_family_label(active_model)})[/magenta]"
                         )
             else:
                 if content:
-                    self.console.print(content)
+                    self.console.print(escape(content))
                     return content
                 break
 
