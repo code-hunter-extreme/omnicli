@@ -49,15 +49,23 @@ class OmniClient:
         path = path.lstrip("/")
         return f"{base}/{path}"
 
-    def list_models(self, provider_id: str, timeout: float = 6.0) -> List[Dict[str, Any]]:
-        """Fetch available models from the provider's /models endpoint."""
+    def list_models(self, provider_id: str, timeout: float = 10.0) -> List[Dict[str, Any]]:
+        """Fetch available models from the provider.
+
+        Cloudflare uses a different endpoint than the OpenAI-compatible /models:
+          GET /accounts/{id}/ai/models/search?task=Text+Generation&per_page=100
+        All other providers use the standard /v1/models path.
+        """
         provider_id = provider_id.lower()
-        if provider_id == "cloudflare" and not self.cfg.get_cloudflare_account_id():
-            raise ProviderError(
-                provider_id,
-                None,
-                "Cloudflare Account ID not set. Run: omni config set-account <ACCOUNT_ID>",
-            )
+
+        if provider_id == "cloudflare":
+            account_id = self.cfg.get_cloudflare_account_id()
+            if not account_id:
+                raise ProviderError(
+                    provider_id, None,
+                    "Cloudflare Account ID not set. Run: omni config set-account <ACCOUNT_ID>",
+                )
+            return self._list_cloudflare_models(account_id, timeout=timeout)
 
         url = self.get_endpoint_url(provider_id, "models")
         headers = self.get_headers(provider_id)
@@ -67,9 +75,9 @@ class OmniClient:
                 res = client.get(url, headers=headers)
                 if res.status_code in (401, 403):
                     raise ProviderError(
-                        provider_id,
-                        res.status_code,
-                        f"Authentication required for {provider_id}. Set key via: omni config set-key {provider_id} <KEY>",
+                        provider_id, res.status_code,
+                        f"Authentication required for {provider_id}. "
+                        f"Set key via: omni config set-key {provider_id} <KEY>",
                     )
                 if res.status_code != 200:
                     raise ProviderError(provider_id, res.status_code, res.text[:300])
@@ -86,6 +94,40 @@ class OmniClient:
                 return []
         except httpx.RequestError as e:
             raise ProviderError(provider_id, None, f"Network connection failed: {e}")
+
+    def _list_cloudflare_models(self, account_id: str, timeout: float = 10.0) -> List[Dict[str, Any]]:
+        """Cloudflare model listing via /ai/models/search — returns text-generation models only.
+
+        The standard /ai/v1/models returns 405. Cloudflare's actual catalog endpoint is:
+          GET /accounts/{id}/ai/models/search?task=Text+Generation&per_page=100
+        Returns OpenAI-compatible dicts: {"id": model_name, ...}
+        """
+        base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+        url = f"{base}/ai/models/search"
+        headers = self.get_headers("cloudflare")
+        params = {"task": "Text Generation", "per_page": "100"}
+
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                res = client.get(url, headers=headers, params=params)
+                if res.status_code in (401, 403):
+                    raise ProviderError("cloudflare", res.status_code, "Authentication failed")
+                if res.status_code != 200:
+                    raise ProviderError("cloudflare", res.status_code, res.text[:300])
+                data = res.json()
+                raw = data.get("result", []) if isinstance(data, dict) else []
+                # Normalise to OpenAI-compatible shape: {"id": name, "name": name, ...}
+                return [
+                    {
+                        "id":   m.get("name", ""),
+                        "name": m.get("name", ""),
+                        "description": m.get("description", ""),
+                    }
+                    for m in raw
+                    if m.get("name")
+                ]
+        except httpx.RequestError as e:
+            raise ProviderError("cloudflare", None, f"Network connection failed: {e}")
 
     def ping(self, provider_id: str) -> Dict[str, Any]:
         """Test provider connectivity, measure latency, and count models."""
@@ -240,8 +282,8 @@ class OmniClient:
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     content = delta.get("content", "")
-                                    if content:
-                                        yield {"type": "content", "delta": content, "raw": parsed}
+                                    if content is not None and content != "":
+                                        yield {"type": "content", "delta": str(content), "raw": parsed}
                                 if "usage" in parsed and parsed["usage"]:
                                     yield {"type": "usage", "usage": parsed["usage"]}
                             except json.JSONDecodeError:

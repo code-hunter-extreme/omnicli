@@ -1,0 +1,177 @@
+"""
+OmniCLI Model Scanner — live discovery and roster builder.
+
+Hits every provider's /models endpoint, classifies each model into a family
+using MODEL_FAMILY_KEYWORDS, then writes two things to config per provider:
+
+  fallback_models   — ordered list of model IDs, one per family, for auto-retry
+  verification_panel — [{model, family}, ...], one per family, for consensus checks
+
+Usage:
+    from omnicli.scanner import scan_all_providers, scan_provider
+    results = scan_all_providers()          # all providers
+    result  = scan_provider("openrouter")  # single provider
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from omnicli.config import ConfigManager, MODEL_FAMILY_KEYWORDS
+from omnicli.client import OmniClient
+
+
+def classify_family(model_id: str) -> str:
+    """Return the family name for a model ID using MODEL_FAMILY_KEYWORDS.
+
+    Matches on lowercase model_id substrings in keyword order — first match wins.
+    Returns "other" when no keyword matches.
+    """
+    mid = model_id.lower()
+    for family, keywords in MODEL_FAMILY_KEYWORDS:
+        if any(kw in mid for kw in keywords):
+            return family
+    return "other"
+
+
+def build_roster_and_panel(
+    models: List[Dict[str, Any]],
+    max_per_family: int = 2,
+    panel_size: int = 3,
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """From a raw /models list build fallback_models and verification_panel.
+
+    fallback_models: up to max_per_family models per family, ordered by family
+    diversity so the first retries are genuinely different from each other.
+
+    verification_panel: exactly one model per family (the first seen), capped at
+    panel_size entries — used by CrossModelConsensusVerifier for blind voting.
+    """
+    seen_families: Dict[str, List[str]] = {}
+    for m in models:
+        mid = m.get("id", "")
+        if not mid:
+            continue
+        family = classify_family(mid)
+        seen_families.setdefault(family, []).append(mid)
+
+    # Build fallback roster: round-robin across families so family diversity is
+    # maximised across the first N retries, not bunched by family.
+    family_iters = {f: iter(ids) for f, ids in seen_families.items() if f != "other"}
+    roster: List[str] = []
+    active = list(family_iters.keys())
+    counts: Dict[str, int] = {f: 0 for f in active}
+    while active:
+        next_active = []
+        for family in active:
+            try:
+                mid = next(family_iters[family])
+                roster.append(mid)
+                counts[family] += 1
+                if counts[family] < max_per_family:
+                    next_active.append(family)
+            except StopIteration:
+                pass
+        active = next_active
+
+    # Build verification panel: one per family, up to panel_size
+    panel: List[Dict[str, str]] = []
+    used_families: set = set()
+    for mid in roster:
+        family = classify_family(mid)
+        if family not in used_families and family != "other":
+            panel.append({"model": mid, "family": family})
+            used_families.add(family)
+        if len(panel) >= panel_size:
+            break
+
+    return roster, panel
+
+
+def scan_provider(
+    provider_id: str,
+    cfg: Optional[ConfigManager] = None,
+    client: Optional[OmniClient] = None,
+    save: bool = True,
+    panel_size: int = 3,
+    max_per_family: int = 2,
+) -> Dict[str, Any]:
+    """Scan a single provider: fetch /models, classify, build roster + panel.
+
+    Returns:
+        {
+          "provider": str,
+          "ok": bool,
+          "model_count": int,
+          "families_found": int,
+          "fallback_models": [...],
+          "verification_panel": [...],
+          "error": str | None,
+          "latency_ms": float,
+        }
+    """
+    cfg = cfg or ConfigManager()
+    client = client or OmniClient(cfg)
+
+    t0 = time.perf_counter()
+    try:
+        models = client.list_models(provider_id, timeout=10.0)
+    except Exception as e:
+        return {
+            "provider": provider_id,
+            "ok": False,
+            "model_count": 0,
+            "families_found": 0,
+            "fallback_models": [],
+            "verification_panel": [],
+            "error": str(e),
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    latency = round((time.perf_counter() - t0) * 1000, 1)
+    roster, panel = build_roster_and_panel(
+        models, max_per_family=max_per_family, panel_size=panel_size
+    )
+    families = {classify_family(m.get("id", "")) for m in models if m.get("id")}
+    families.discard("other")
+
+    if save:
+        cfg.save_scan_results(provider_id, roster, panel)
+
+    return {
+        "provider": provider_id,
+        "ok": True,
+        "model_count": len(models),
+        "families_found": len(families),
+        "fallback_models": roster,
+        "verification_panel": panel,
+        "error": None,
+        "latency_ms": latency,
+    }
+
+
+def scan_all_providers(
+    cfg: Optional[ConfigManager] = None,
+    panel_size: int = 3,
+    max_per_family: int = 2,
+) -> List[Dict[str, Any]]:
+    """Scan every configured provider and persist results.
+
+    Providers that error (no key, unreachable) are reported but don't abort
+    the scan — you get results for every provider that answered.
+    """
+    cfg = cfg or ConfigManager()
+    client = OmniClient(cfg)
+    results = []
+    for provider_id in cfg.data.get("providers", {}):
+        result = scan_provider(
+            provider_id,
+            cfg=cfg,
+            client=client,
+            save=True,
+            panel_size=panel_size,
+            max_per_family=max_per_family,
+        )
+        results.append(result)
+    return results

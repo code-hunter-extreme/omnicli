@@ -14,6 +14,25 @@ CONFIG_DIR = Path.home() / ".config" / "omnicli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history"
 
+# Model family keywords used by `omni scan` to classify discovered models.
+# Order matters: first match wins. Extend here to recognise new families.
+MODEL_FAMILY_KEYWORDS: list = [
+    ("anthropic",  ["claude"]),
+    ("openai",     ["gpt-", "o1-", "o3-", "o4-"]),
+    ("meta",       ["llama"]),
+    ("google",     ["gemini", "gemma"]),
+    ("mistral",    ["mistral", "mixtral"]),
+    ("qwen",       ["qwen"]),
+    ("deepseek",   ["deepseek"]),
+    ("xai",        ["grok"]),
+    ("minimax",    ["minimax"]),
+    ("nvidia",     ["nemotron", "nv-"]),
+    ("cohere",     ["command"]),
+    ("databricks", ["dbrx"]),
+    ("microsoft",  ["phi-", "phi3", "wizardlm"]),
+    ("01ai",       ["yi-"]),
+]
+
 DEFAULT_PROVIDERS = {
     "openrouter": {
         "name": "OpenRouter",
@@ -22,15 +41,20 @@ DEFAULT_PROVIDERS = {
         "default_model": "google/gemini-2.5-flash",
         "description": "Multi-model router with 300+ models",
         "requires_auth_for_models": False,
+        # Populated by `omni scan` — not hardcoded.
+        "fallback_models": [],
+        "verification_panel": [],
     },
     "nvidia": {
         "name": "NVIDIA Build / NIM",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "env_key": "NVIDIA_API_KEY",
         "alt_env_keys": ["NVAPI_KEY"],
-        "default_model": "meta/llama-3.3-70b-instruct",
+        "default_model": "meta/llama-3.2-11b-vision-instruct",
         "description": "NVIDIA NIM high-throughput inference endpoints",
         "requires_auth_for_models": False,
+        "fallback_models": [],
+        "verification_panel": [],
     },
     "cloudflare": {
         "name": "Cloudflare Workers AI",
@@ -42,6 +66,8 @@ DEFAULT_PROVIDERS = {
         "default_model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         "description": "Cloudflare Workers AI serverless inference",
         "requires_auth_for_models": True,
+        "fallback_models": [],
+        "verification_panel": [],
     },
     "bynara": {
         "name": "Bynara Router",
@@ -50,6 +76,8 @@ DEFAULT_PROVIDERS = {
         "default_model": "openai/gpt-4o",
         "description": "Bynara AI Gateway & Router",
         "requires_auth_for_models": True,
+        "fallback_models": [],
+        "verification_panel": [],
     },
     "apinex": {
         "name": "Apinex Router",
@@ -58,6 +86,8 @@ DEFAULT_PROVIDERS = {
         "default_model": "openai/gpt-4o",
         "description": "Apinex AI Model Proxy",
         "requires_auth_for_models": True,
+        "fallback_models": [],
+        "verification_panel": [],
     },
     "xkiro": {
         "name": "XKiro Router",
@@ -66,6 +96,8 @@ DEFAULT_PROVIDERS = {
         "default_model": "minimax/minimax-m3",
         "description": "XKiro Model Router & Gateway",
         "requires_auth_for_models": False,
+        "fallback_models": [],
+        "verification_panel": [],
     },
 }
 
@@ -249,6 +281,31 @@ class ConfigManager:
     def get_default_model(self, provider_id: str) -> str:
         prov = self.get_provider_info(provider_id)
         return prov.get("default_model", "")
+
+    def get_fallback_models(self, provider_id: str) -> list:
+        """Ordered fallback model roster for a provider (populated by omni scan)."""
+        prov = self.get_provider_info(provider_id)
+        return list(prov.get("fallback_models") or [])
+
+    def get_verification_panel(self, provider_id: str) -> list:
+        """Diverse-family verification panel (populated by omni scan).
+
+        Each entry is {"model": str, "family": str}.
+        """
+        prov = self.get_provider_info(provider_id)
+        return list(prov.get("verification_panel") or [])
+
+    def save_scan_results(self, provider_id: str,
+                          fallback_models: list,
+                          verification_panel: list) -> None:
+        """Persist live scan results (roster + panel) for a provider."""
+        provider_id = provider_id.lower()
+        prov = self.data["providers"].get(provider_id)
+        if prov is None:
+            return
+        prov["fallback_models"] = fallback_models
+        prov["verification_panel"] = verification_panel
+        self.save()
 
     def set_default_model(self, provider_id: str, model_id: str) -> None:
         provider_id = provider_id.lower()

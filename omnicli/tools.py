@@ -17,14 +17,79 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 
+from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier, ScopeGate
+
+
 REGISTRY_DB_PATH = Path("/home/phantomcore/program_registry/core/program_registry.db")
 if not REGISTRY_DB_PATH.exists():
     REGISTRY_DB_PATH = Path("/home/phantomcore/program_registry.db")
 
 
+def tool_verify_http(
+    url: str,
+    method: str = "GET",
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[str] = None,
+    expected: str = "",
+) -> str:
+    """Execute deterministic HTTP verification and return verdict."""
+    res = HTTPVerifier.verify(
+        url=url,
+        method=method,
+        headers=headers,
+        body=body,
+        expected_str=expected,
+    )
+    return json.dumps(res, indent=2)
+
+
+def tool_verify_code(
+    path: str,
+    must_contain: Optional[List[str]] = None,
+    must_not_contain: Optional[List[str]] = None,
+    target_function: Optional[str] = None,
+    check_type: Optional[str] = None,
+) -> str:
+    """Execute deterministic code pattern verification and return verdict."""
+    res = CodeVerifier.verify_file(
+        file_path=path,
+        must_contain=must_contain,
+        must_not_contain=must_not_contain,
+        target_function=target_function,
+        check_type=check_type,
+    )
+    return json.dumps(res, indent=2)
+
+
+def tool_verify_consensus(
+    claim: str,
+    evidence: str,
+    models: Optional[List[str]] = None,
+    client_ref: Any = None,
+) -> str:
+    """Run cross-model / cross-provider verification consensus."""
+    if client_ref is None:
+        return "Error: Client reference required for consensus verification."
+    model_specs = []
+    if models:
+        for m in models:
+            if ":" in m:
+                p, mod = m.split(":", 1)
+                model_specs.append((p.strip(), mod.strip()))
+            else:
+                model_specs.append((m.strip(), None))
+    verifier = CrossModelConsensusVerifier(client_ref)
+    res = verifier.verify_finding(claim, evidence, models=model_specs or None)
+    return json.dumps(res, indent=2)
+
+
 def tool_bash(command: str, timeout: int = 30) -> str:
     """Execute a bash command in the local environment."""
     try:
+        try:
+            timeout = int(timeout) if timeout not in (None, "None", "") else 30
+        except (ValueError, TypeError):
+            timeout = 30
         res = subprocess.run(
             command,
             shell=True,
@@ -57,6 +122,10 @@ def tool_read_file(path: str, max_lines: int = 300) -> str:
     if not p.is_file():
         return f"Error: '{path}' is not a file."
     try:
+        try:
+            max_lines = int(max_lines) if max_lines not in (None, "None", "") else 300
+        except (ValueError, TypeError):
+            max_lines = 300
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             lines = [f.readline() for _ in range(max_lines)]
         total_chars = sum(len(l) for l in lines)
@@ -83,6 +152,10 @@ def tool_registry_search(query: str, limit: int = 10) -> str:
         return f"Program registry database not found at {REGISTRY_DB_PATH}"
 
     try:
+        try:
+            limit = int(limit) if limit not in (None, "None", "") else 10
+        except (ValueError, TypeError):
+            limit = 10
         conn = sqlite3.connect(str(REGISTRY_DB_PATH))
         c = conn.cursor()
         # Query programs table
@@ -205,6 +278,75 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_http",
+            "description": "Deterministically verify an HTTP endpoint behavior against an Expected prediction string (status code, body predicates, header requirements). Returns strict binary CONFIRMED or REJECTED verdict.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Target HTTP/HTTPS URL"},
+                    "method": {"type": "string", "description": "HTTP method (GET, POST, etc.)", "default": "GET"},
+                    "expected": {
+                        "type": "string",
+                        "description": "Prediction string, e.g.: 'status 200, body contains \"user_id\", header x-frame-options absent'",
+                    },
+                    "body": {"type": "string", "description": "Optional request body"},
+                },
+                "required": ["url", "expected"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_code",
+            "description": "Deterministically verify source code patterns or security guards in local files. Inspects AST/code for required authorization checks or forbidden sinks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to local code file to inspect"},
+                    "must_contain": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of string patterns that MUST be present in the target code",
+                    },
+                    "must_not_contain": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of string patterns that MUST NOT be present",
+                    },
+                    "target_function": {"type": "string", "description": "Optional function name to scope inspection"},
+                    "check_type": {
+                        "type": "string",
+                        "description": "Optional built-in check type (e.g. 'wp_auth_check')",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_consensus",
+            "description": "Run blind verification consensus across multiple AI models / model families (same API key or cross-provider) to corroboratively validate or reject a security hypothesis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string", "description": "The specific vulnerability or behavior claim to evaluate"},
+                    "evidence": {"type": "string", "description": "Code snippet, HTTP trace, or execution evidence"},
+                    "models": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of provider:model specs (e.g. ['cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'cloudflare:@cf/qwen/qwen2.5-coder-32b-instruct', 'nvidia:meta/llama-3.2-11b-vision-instruct'])",
+                    },
+                },
+                "required": ["claim", "evidence"],
+            },
+        },
+    },
 ]
 
 
@@ -218,6 +360,29 @@ def execute_tool_call(tool_name: str, arguments: Dict[str, Any], client_ref: Any
         return tool_write_file(path=arguments.get("path", ""), content=arguments.get("content", ""))
     elif tool_name == "registry_search":
         return tool_registry_search(query=arguments.get("query", ""), limit=arguments.get("limit", 10))
+    elif tool_name == "verify_http":
+        return tool_verify_http(
+            url=arguments.get("url", ""),
+            method=arguments.get("method", "GET"),
+            headers=arguments.get("headers"),
+            body=arguments.get("body"),
+            expected=arguments.get("expected", ""),
+        )
+    elif tool_name == "verify_code":
+        return tool_verify_code(
+            path=arguments.get("path", ""),
+            must_contain=arguments.get("must_contain"),
+            must_not_contain=arguments.get("must_not_contain"),
+            target_function=arguments.get("target_function"),
+            check_type=arguments.get("check_type"),
+        )
+    elif tool_name == "verify_consensus":
+        return tool_verify_consensus(
+            claim=arguments.get("claim", ""),
+            evidence=arguments.get("evidence", ""),
+            models=arguments.get("models"),
+            client_ref=client_ref,
+        )
     elif tool_name == "consult_provider":
         if client_ref is None:
             return "Error: Client reference not provided to execute cross-provider consultation."
@@ -242,3 +407,4 @@ def execute_tool_call(tool_name: str, arguments: Dict[str, Any], client_ref: Any
             return f"Error consulting {provider}: {e}"
     else:
         return f"Unknown tool: '{tool_name}'"
+

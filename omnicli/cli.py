@@ -169,7 +169,7 @@ def run_one_shot(
             max_tokens=max_tokens,
         ):
             if chunk["type"] == "content":
-                delta = chunk["delta"]
+                delta = str(chunk.get("delta", ""))
                 full_text += delta
                 sys.stdout.write(delta)
                 sys.stdout.flush()
@@ -369,19 +369,299 @@ def config_add_provider(name: str, base_url: str, key: Optional[str], model: str
     console.print(f"[bold green]Added custom provider '{name}' ({base_url}).[/bold green]")
 
 
+@main.command("scan")
+@click.option("-p", "--provider", help="Scan a single provider (default: all)")
+@click.option("--panel-size", type=int, default=3, show_default=True,
+              help="Max models in verification panel per provider")
+@click.option("--max-per-family", type=int, default=2, show_default=True,
+              help="Max fallback models per family per provider")
+def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> None:
+    """Scan provider /models endpoints, classify by family, write fallback rosters to config.
+
+    Run this once after setup (or whenever you want to refresh available models).
+    Rosters built here are used by the agent for auto-fallback and by the
+    consensus verifier for diverse-family red-team panels.
+    """
+    from omnicli.scanner import scan_all_providers, scan_provider as scan_one
+
+    table = Table(title="Model Scan Results", title_style="bold cyan", border_style="dim")
+    table.add_column("Provider",    style="bold green", width=14)
+    table.add_column("Status",      width=10)
+    table.add_column("Models",      justify="right", width=8)
+    table.add_column("Families",    justify="right", width=10)
+    table.add_column("Fallback roster (first 3)", style="dim")
+    table.add_column("Verification panel",         style="cyan")
+
+    with console.status("[cyan]Scanning providers for available models...[/cyan]", spinner="dots"):
+        if provider:
+            results = [scan_one(provider.lower(), panel_size=panel_size, max_per_family=max_per_family)]
+        else:
+            results = scan_all_providers(panel_size=panel_size, max_per_family=max_per_family)
+
+    for r in results:
+        ok = r["ok"]
+        status_str = "[bold green]OK[/bold green]" if ok else "[bold red]FAIL[/bold red]"
+        roster_preview = ", ".join(r["fallback_models"][:3]) if r["fallback_models"] else "[dim]run omni scan[/dim]"
+        panel_preview  = ", ".join(
+            f"{e['family']}:{e['model'].split('/')[-1][:18]}"
+            for e in r["verification_panel"]
+        ) if r["verification_panel"] else "[dim]none[/dim]"
+        err = f"  [red]{r['error'][:50]}[/red]" if r.get("error") else ""
+        table.add_row(
+            r["provider"],
+            status_str,
+            str(r["model_count"]) if ok else "-",
+            str(r["families_found"]) if ok else "-",
+            roster_preview + err,
+            panel_preview,
+        )
+
+    console.print(table)
+    if not provider:
+        total_ok = sum(1 for r in results if r["ok"])
+        console.print(
+            f"\n[bold green]✓[/bold green] Scanned {len(results)} providers, "
+            f"{total_ok} OK — rosters written to config."
+        )
+
+
 @main.command("agent")
 @click.option("-p", "--provider", help="Supervisor provider (default: openrouter or nvidia)")
 @click.option("-m", "--model", help="Supervisor model")
 @click.option("--max-turns", type=int, default=10, help="Max tool call turns (default 10)")
+@click.option("--redteam", is_flag=True, default=False,
+              help="Adversarial system prompt + verify_* tools as the primary toolset")
+@click.option("--rotate-families", is_flag=True, default=False,
+              help="Switch model family each turn from the scanned roster")
 @click.argument("goal", nargs=-1, required=True)
-def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int, goal: tuple) -> None:
+def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
+              redteam: bool, rotate_families: bool, goal: tuple) -> None:
     """Run an autonomous agent equipped with local tools and cross-provider delegation."""
     from omnicli.agent import AgentRunner
     task_goal = " ".join(goal).strip()
-    runner = AgentRunner(provider=provider, model=model, max_turns=max_turns, console=console)
+    runner = AgentRunner(
+        provider=provider,
+        model=model,
+        max_turns=max_turns,
+        console=console,
+        redteam=redteam,
+        rotate_families=rotate_families,
+    )
     runner.run(task_goal)
+
+
+@main.group("verify")
+def cmd_verify() -> None:
+    """Deterministic verification and multi-model consensus testing."""
+    pass
+
+
+@cmd_verify.command("http")
+@click.argument("url")
+@click.option("-m", "--method", default="GET", help="HTTP method (GET, POST, etc.)")
+@click.option("-e", "--expected", required=True, help="Expected prediction string (e.g. 'status 200, body contains \"admin\"')")
+@click.option("-b", "--body", help="Request body content")
+def verify_http_cmd(url: str, method: str, expected: str, body: Optional[str]) -> None:
+    """Verify HTTP wire behavior deterministically."""
+    from rich.panel import Panel
+    from omnicli.deterministic import HTTPVerifier
+    with console.status(f"[cyan]Executing deterministic HTTP probe against {url}...[/cyan]"):
+        res = HTTPVerifier.verify(url=url, method=method, expected_str=expected, body=body)
+    verdict = res["verdict"]
+    color = "green" if verdict == "CONFIRMED" else "red"
+    console.print(Panel(
+        f"[bold {color}]VERDICT: {verdict}[/bold {color}]\n"
+        f"[bold white]Reason:[/bold white] {res.get('reason')}\n"
+        f"[dim white]Observed Status:[/dim white] {res.get('observed', {}).get('status') if res.get('observed') else 'None'}",
+        title="Deterministic HTTP Verification",
+        border_style=color,
+    ))
+
+
+@cmd_verify.command("code")
+@click.argument("path")
+@click.option("--must-contain", multiple=True, help="Patterns that MUST exist in code")
+@click.option("--must-not-contain", multiple=True, help="Patterns that MUST NOT exist")
+@click.option("--function", help="Function name to scope check")
+@click.option("--check-type", help="Built-in check (e.g. 'wp_auth_check')")
+def verify_code_cmd(path: str, must_contain: tuple, must_not_contain: tuple, function: Optional[str], check_type: Optional[str]) -> None:
+    """Verify local source code patterns and security guards deterministically."""
+    from rich.panel import Panel
+    from omnicli.deterministic import CodeVerifier
+    res = CodeVerifier.verify_file(
+        file_path=path,
+        must_contain=list(must_contain) if must_contain else None,
+        must_not_contain=list(must_not_contain) if must_not_contain else None,
+        target_function=function,
+        check_type=check_type,
+    )
+    verdict = res["verdict"]
+    color = "green" if verdict == "CONFIRMED" else "red"
+    console.print(Panel(
+        f"[bold {color}]VERDICT: {verdict}[/bold {color}]\n"
+        f"[bold white]Reason:[/bold white] {res.get('reason')}\n"
+        f"[dim white]Target File:[/dim white] {res.get('file')}",
+        title="Deterministic Code Pattern Verification",
+        border_style=color,
+    ))
+
+
+@cmd_verify.command("consensus")
+@click.argument("claim")
+@click.option("-f", "--file", "filepath", help="File containing code/evidence to evaluate")
+@click.option("-e", "--evidence", help="Raw inline evidence text")
+@click.option("-m", "--model", "models", multiple=True, help="Model spec in provider:model format")
+def verify_consensus_cmd(claim: str, filepath: Optional[str], evidence: Optional[str], models: tuple) -> None:
+    """Run blind multi-model / multi-provider consensus verification."""
+    from rich.panel import Panel
+    from omnicli.deterministic import CrossModelConsensusVerifier
+    ev_text = evidence or ""
+    if filepath:
+        p = Path(filepath).expanduser().resolve()
+        if p.exists() and p.is_file():
+            ev_text = p.read_text(encoding="utf-8", errors="replace")
+        else:
+            console.print(f"[bold red]Evidence file not found:[/bold red] {filepath}")
+            return
+
+    model_specs = []
+    if models:
+        for m in models:
+            if ":" in m:
+                p, mod = m.split(":", 1)
+                model_specs.append((p.strip(), mod.strip()))
+            else:
+                model_specs.append((m.strip(), None))
+
+    with console.status("[cyan]Querying model panel for blind verification consensus...[/cyan]"):
+        verifier = CrossModelConsensusVerifier(client)
+        res = verifier.verify_finding(claim, ev_text, models=model_specs or None)
+
+    verdict = res["verdict"]
+    color = "green" if verdict == "CONSENSUS_CONFIRMED" else ("red" if verdict == "CONSENSUS_REJECTED" else "yellow")
+
+    table = Table(title="Cross-Model Verification Votes", border_style="dim")
+    table.add_column("Model / Endpoint", style="bold cyan")
+    table.add_column("Vote", style="bold")
+    for mod_name, vote in res["votes"].items():
+        v_col = "green" if vote == "TRUE_POSITIVE" else ("red" if vote == "FALSE_POSITIVE" else "yellow")
+        table.add_row(mod_name, f"[{v_col}]{vote}[/{v_col}]")
+
+    console.print(Panel(
+        f"[bold {color}]CONSENSUS VERDICT: {verdict}[/bold {color}]\n"
+        f"Corroboration: [green]{res['true_positives']} True Positives[/green] / [red]{res['false_positives']} False Positives[/red] (Ratio: {res['consensus_ratio']})",
+        title="Blind Multi-Model Verification Consensus",
+        border_style=color,
+    ))
+    console.print(table)
+
+
+@main.command("check")
+@click.argument("target")
+@click.option("-f", "--file", "filepath", help="Local code or evidence file to inspect")
+@click.option("-e", "--expected", help="Expected deterministic condition (e.g. 'status 200' or pattern)")
+@click.option("-m", "--model", "models", multiple=True, help="Specific provider:model panels to query")
+def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], models: tuple) -> None:
+    """Unified check: tests target deterministically and across multiple API keys/models."""
+    from rich.panel import Panel
+    from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier, ScopeGate
+
+    target_str = target.strip()
+    is_url = target_str.startswith("http://") or target_str.startswith("https://")
+    is_local_file = False
+
+    evidence_file = filepath
+    if not is_url:
+        p = Path(target_str).expanduser()
+        if p.exists() and p.is_file():
+            is_local_file = True
+            evidence_file = str(p.resolve())
+
+    console.print(Panel(
+        f"[bold cyan]OmniCLI Check Target:[/bold cyan] {target_str}\n"
+        f"[dim]Mode: {'HTTP Wire + Multi-API Verification' if is_url else ('Code AST + Multi-API Verification' if is_local_file else 'Adversarial Claim + Multi-API Consensus')}[/dim]",
+        title="Omni System Check",
+        border_style="cyan",
+    ))
+
+    # Phase 1: Deterministic Engine Execution
+    deterministic_result = None
+    if is_url:
+        with console.status(f"[cyan]Phase 1: Running deterministic HTTP wire probe against {target_str}...[/cyan]"):
+            exp = expected or "status 200"
+            deterministic_result = HTTPVerifier.verify(url=target_str, expected_str=exp)
+        d_verdict = deterministic_result["verdict"]
+        d_col = "green" if d_verdict == "CONFIRMED" else "red"
+        console.print(Panel(
+            f"[bold {d_col}]GATE VERDICT: {d_verdict}[/bold {d_col}]\n"
+            f"[bold white]Observation:[/bold white] {deterministic_result.get('reason')}\n"
+            f"[dim white]Observed Status:[/dim white] {deterministic_result.get('observed', {}).get('status') if deterministic_result.get('observed') else 'None'}",
+            title="Phase 1: Pure Deterministic Wire Verification (Zero LLM)",
+            border_style=d_col,
+        ))
+    elif is_local_file:
+        with console.status(f"[cyan]Phase 1: Running deterministic code AST checks on {target_str}...[/cyan]"):
+            must_c = [expected] if expected else None
+            deterministic_result = CodeVerifier.verify_file(
+                file_path=evidence_file,
+                must_contain=must_c,
+                check_type="wp_auth_check" if target_str.endswith(".php") else None,
+            )
+        d_verdict = deterministic_result["verdict"]
+        d_col = "green" if d_verdict == "CONFIRMED" else "yellow"
+        console.print(Panel(
+            f"[bold {d_col}]GATE VERDICT: {d_verdict}[/bold {d_col}]\n"
+            f"[bold white]Observation:[/bold white] {deterministic_result.get('reason')}",
+            title="Phase 1: Pure Deterministic AST Code Verification (Zero LLM)",
+            border_style=d_col,
+        ))
+
+    # Phase 2: Multi-Model & Cross-Provider Consensus Verification
+    code_context = ""
+    if evidence_file:
+        ep = Path(evidence_file).expanduser().resolve()
+        if ep.exists() and ep.is_file():
+            code_context = ep.read_text(encoding="utf-8", errors="replace")
+
+    claim_text = (
+        f"Verify security implications and vulnerabilities in endpoint: {target_str}"
+        if is_url else
+        (f"Analyze security posture and check for missing auth/sanitization in: {target_str}" if is_local_file else target_str)
+    )
+
+    model_specs = []
+    if models:
+        for m in models:
+            if ":" in m:
+                p, mod = m.split(":", 1)
+                model_specs.append((p.strip(), mod.strip()))
+            else:
+                model_specs.append((m.strip(), None))
+
+    with console.status("[cyan]Phase 2: Querying multiple API keys & model families for blind consensus...[/cyan]"):
+        verifier = CrossModelConsensusVerifier(client)
+        consensus_res = verifier.verify_finding(claim_text, code_context or target_str, models=model_specs or None)
+
+    c_verdict = consensus_res["verdict"]
+    c_col = "green" if c_verdict == "CONSENSUS_CONFIRMED" else ("red" if c_verdict == "CONSENSUS_REJECTED" else "yellow")
+
+    table = Table(title="Multi-Provider / Multi-Family Vote Matrix", border_style="dim")
+    table.add_column("Provider & Model", style="bold cyan")
+    table.add_column("Independent Verdict", style="bold")
+    for mod_name, vote in consensus_res["votes"].items():
+        v_col = "green" if vote == "TRUE_POSITIVE" else ("red" if vote == "FALSE_POSITIVE" else "yellow")
+        table.add_row(mod_name, f"[{v_col}]{vote}[/{v_col}]")
+
+    console.print(Panel(
+        f"[bold {c_col}]CROSS-MODEL CONSENSUS: {c_verdict}[/bold {c_col}]\n"
+        f"Agreement: [green]{consensus_res['true_positives']} Confirming[/green] / [red]{consensus_res['false_positives']} Refuting[/red] (Consensus Ratio: {consensus_res['consensus_ratio']})",
+        title="Phase 2: Multi-Provider AI Consensus",
+        border_style=c_col,
+    ))
+    console.print(table)
 
 
 if __name__ == "__main__":
     main()
+
 
