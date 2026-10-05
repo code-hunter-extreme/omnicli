@@ -38,6 +38,9 @@ class OmniClient:
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
+        if provider_id == "monkeycode" and key:
+            headers["Cookie"] = f"monkeycode_ai_session={key}"
+
         if provider_id == "openrouter":
             headers["HTTP-Referer"] = "https://github.com/phantomcore/omnicli"
             headers["X-Title"] = "OmniCLI Local Assistant"
