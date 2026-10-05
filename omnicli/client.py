@@ -38,8 +38,11 @@ class OmniClient:
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
-        if provider_id == "monkeycode" and key:
-            headers["Cookie"] = f"monkeycode_ai_session={key}"
+        if provider_id == "monkeycode":
+            headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            cookie = self.cfg.get_monkeycode_session_cookie() or key
+            if cookie:
+                headers["Cookie"] = f"monkeycode_ai_session={cookie}"
 
         if provider_id == "openrouter":
             headers["HTTP-Referer"] = "https://github.com/phantomcore/omnicli"
@@ -57,6 +60,8 @@ class OmniClient:
 
         Cloudflare uses a different endpoint than the OpenAI-compatible /models:
           GET /accounts/{id}/ai/models/search?task=Text+Generation&per_page=100
+        MonkeyCode uses the user models endpoint:
+          GET https://monkeycode-ai.net/api/v1/users/models
         All other providers use the standard /v1/models path.
         """
         provider_id = provider_id.lower()
@@ -69,6 +74,9 @@ class OmniClient:
                     "Cloudflare Account ID not set. Run: omni config set-account <ACCOUNT_ID>",
                 )
             return self._list_cloudflare_models(account_id, timeout=timeout)
+
+        if provider_id == "monkeycode":
+            return self._list_monkeycode_models(timeout=timeout)
 
         url = self.get_endpoint_url(provider_id, "models")
         headers = self.get_headers(provider_id)
@@ -131,6 +139,38 @@ class OmniClient:
                 ]
         except httpx.RequestError as e:
             raise ProviderError("cloudflare", None, f"Network connection failed: {e}")
+
+    def _list_monkeycode_models(self, timeout: float = 10.0) -> List[Dict[str, Any]]:
+        """MonkeyCode model listing via /api/v1/users/models using session cookie."""
+        url = "https://monkeycode-ai.net/api/v1/users/models"
+        cookie = self.cfg.get_monkeycode_session_cookie() or self.cfg.get_api_key("monkeycode")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        }
+        if cookie:
+            headers["Cookie"] = f"monkeycode_ai_session={cookie}"
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                res = client.get(url, headers=headers)
+                if res.status_code == 200:
+                    data = res.json()
+                    models = data.get("data", {}).get("models", [])
+                    return [
+                        {
+                            "id": m.get("model", ""),
+                            "name": m.get("model", ""),
+                            "access_level": m.get("access_level", ""),
+                            "is_free": m.get("is_free", False),
+                            "interface_type": m.get("interface_type", ""),
+                        }
+                        for m in models
+                        if m.get("model")
+                    ]
+                if res.status_code in (401, 403):
+                    raise ProviderError("monkeycode", res.status_code, "Authentication failed for MonkeyCode")
+                raise ProviderError("monkeycode", res.status_code, res.text[:300])
+        except httpx.RequestError as e:
+            raise ProviderError("monkeycode", None, f"Network connection failed: {e}")
 
     def ping(self, provider_id: str) -> Dict[str, Any]:
         """Test provider connectivity, measure latency, and count models."""
@@ -214,9 +254,21 @@ class OmniClient:
         url = self.get_endpoint_url(provider_id, "chat/completions")
         headers = self.get_headers(provider_id)
 
+        msgs = list(messages)
+        if provider_id == "monkeycode":
+            secret = self.cfg.get_monkeycode_signing_secret()
+            if secret:
+                import hmac, hashlib
+                sys_prompt = next((m.get("content", "") for m in msgs if m.get("role") in ("system", "developer")), "")
+                if not sys_prompt:
+                    sys_prompt = "You are a helpful assistant."
+                    msgs = [{"role": "system", "content": sys_prompt}] + msgs
+                sig = "v1=" + hmac.new(secret.encode("utf-8"), sys_prompt.encode("utf-8"), hashlib.sha256).hexdigest()
+                headers["X-OhMyAgent-Signature"] = sig
+
         payload: Dict[str, Any] = {
             "model": model_name,
-            "messages": messages,
+            "messages": msgs,
             "temperature": temperature,
             "stream": False,
         }
@@ -264,9 +316,21 @@ class OmniClient:
         url = self.get_endpoint_url(provider_id, "chat/completions")
         headers = self.get_headers(provider_id)
 
+        msgs = list(messages)
+        if provider_id == "monkeycode":
+            secret = self.cfg.get_monkeycode_signing_secret()
+            if secret:
+                import hmac, hashlib
+                sys_prompt = next((m.get("content", "") for m in msgs if m.get("role") in ("system", "developer")), "")
+                if not sys_prompt:
+                    sys_prompt = "You are a helpful assistant."
+                    msgs = [{"role": "system", "content": sys_prompt}] + msgs
+                sig = "v1=" + hmac.new(secret.encode("utf-8"), sys_prompt.encode("utf-8"), hashlib.sha256).hexdigest()
+                headers["X-OhMyAgent-Signature"] = sig
+
         payload: Dict[str, Any] = {
             "model": model_name,
-            "messages": messages,
+            "messages": msgs,
             "temperature": temperature,
             "stream": True,
         }

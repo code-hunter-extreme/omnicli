@@ -144,17 +144,19 @@ DEFAULT_PROVIDERS = {
     },
     "monkeycode": {
         "name": "MonkeyCode AI",
-        "base_url": "https://api.monkeycode-ai.net/api/v1",
+        "base_url": "https://api.monkeycode-ai.net/v1",
         "env_key": "MONKEYCODE_API_KEY",
-        "default_model": "deepseek-chat",
-        "description": "Chaitin MonkeyCode AI Platform (30M tokens/day)",
+        "default_model": "monkeycode-basic/qwen3.8-flash",
+        "description": "Chaitin MonkeyCode AI Platform (10M daily tokens, Google OAuth alexander.sorrell.it)",
         "requires_auth_for_models": True,
         "fallback_models": [
-            "qwen-plus",
-            "glm-4",
+            "monkeycode-basic/qwen3.8-flash",
+            "monkeycode-basic/deepseek-flash",
+            "monkeycode-pro/glm-5.2",
         ],
         "verification_panel": [
-            {"model": "deepseek-chat", "family": "deepseek"},
+            {"model": "monkeycode-basic/qwen3.8-flash", "family": "qwen"},
+            {"model": "monkeycode-basic/deepseek-flash", "family": "deepseek"},
         ],
     },
 }
@@ -353,6 +355,18 @@ class ConfigManager:
     def set_cloudflare_account_id(self, account_id: str) -> None:
         self.data["cloudflare_account_id"] = account_id.strip()
         self.save()
+
+    def get_monkeycode_signing_secret(self) -> str:
+        if os.getenv("MONKEYCODE_SIGNING_SECRET"):
+            return os.getenv("MONKEYCODE_SIGNING_SECRET", "").strip()
+        env_dict = self._read_env_files()
+        return env_dict.get("MONKEYCODE_SIGNING_SECRET", "")
+
+    def get_monkeycode_session_cookie(self) -> str:
+        if os.getenv("MONKEYCODE_SESSION_COOKIE"):
+            return os.getenv("MONKEYCODE_SESSION_COOKIE", "").strip()
+        env_dict = self._read_env_files()
+        return env_dict.get("MONKEYCODE_SESSION_COOKIE", "")
 
     def get_base_url(self, provider_id: str) -> str:
         provider_id = provider_id.lower()
