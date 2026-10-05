@@ -155,6 +155,13 @@ class OmniClient:
                 if res.status_code == 200:
                     data = res.json()
                     models = data.get("data", {}).get("models", [])
+                    # Tier-aware filter: prioritize basic/free tier models with OpenAI-compatible interface
+                    accessible = [
+                        m for m in models
+                        if (m.get("is_free") or m.get("access_level") in ("basic", "free", ""))
+                        and m.get("interface_type") in ("openai_responses", "openai", "")
+                    ]
+                    chosen = accessible if accessible else models
                     return [
                         {
                             "id": m.get("model", ""),
@@ -163,7 +170,7 @@ class OmniClient:
                             "is_free": m.get("is_free", False),
                             "interface_type": m.get("interface_type", ""),
                         }
-                        for m in models
+                        for m in chosen
                         if m.get("model")
                     ]
                 if res.status_code in (401, 403):
@@ -310,7 +317,20 @@ class OmniClient:
 
         try:
             with httpx.Client(timeout=timeout) as client:
-                res = client.post(url, headers=headers, json=payload)
+                res = None
+                for attempt in range(3):
+                    res = client.post(url, headers=headers, json=payload)
+                    if res.status_code == 429 and attempt < 2:
+                        retry_after = res.headers.get("Retry-After")
+                        if retry_after and retry_after.isdigit():
+                            wait_sec = min(float(retry_after), 10.0)
+                        else:
+                            import random
+                            wait_sec = (1.5 ** attempt) + random.uniform(0.1, 0.4)
+                        time.sleep(wait_sec)
+                        continue
+                    break
+
                 if res.status_code != 200:
                     if res.status_code in (400, 404) and any(
                         x in res.text.lower() for x in ("model_not_found", "does not exist", "not have access", "invalid_model")

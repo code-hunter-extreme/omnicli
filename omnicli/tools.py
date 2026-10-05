@@ -189,13 +189,46 @@ def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str
         return f"Error executing bash: {e}"
 
 
-def tool_read_file(path: str, max_lines: int = 300) -> str:
-    """Read the contents of a local file."""
+def check_workspace_jail(path: str | Path) -> Path:
+    """Validate path and prevent access to sensitive host directories."""
     p = Path(path).expanduser().resolve()
+    blocked_prefixes = [
+        Path("/etc"), Path("/proc"), Path("/sys"), Path("/dev"),
+        Path.home() / ".ssh", Path.home() / ".gnupg", Path.home() / ".aws"
+    ]
+    for bp in blocked_prefixes:
+        try:
+            if p == bp or p.is_relative_to(bp):
+                raise PermissionError(f"Security Policy: path '{path}' resolves inside protected directory '{bp}'")
+        except AttributeError:
+            if str(p).startswith(str(bp)):
+                raise PermissionError(f"Security Policy: path '{path}' resolves inside protected directory '{bp}'")
+    return p
+
+
+def format_tool_error(code: str, message: str, remedy: str = "") -> str:
+    """Standardized tool error envelope for immediate agent comprehension."""
+    err = {
+        "status": "error",
+        "code": code,
+        "message": message,
+    }
+    if remedy:
+        err["remedy"] = remedy
+    return f"Error: {message}\n" + json.dumps(err, indent=2)
+
+
+def tool_read_file(path: str, max_lines: int = 300) -> str:
+    """Read the contents of a local file with path jail verification."""
+    try:
+        p = check_workspace_jail(path)
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+
     if not p.exists():
-        return f"Error: File '{path}' does not exist."
+        return format_tool_error("E_NOT_FOUND", f"File '{path}' does not exist.", "Check file path spelling and location.")
     if not p.is_file():
-        return f"Error: '{path}' is not a file."
+        return format_tool_error("E_NOT_FILE", f"'{path}' is not a regular file.", "Specify a file path, not a directory.")
     try:
         try:
             max_lines = int(max_lines) if max_lines not in (None, "None", "") else 300
@@ -207,7 +240,7 @@ def tool_read_file(path: str, max_lines: int = 300) -> str:
         header = f"--- {p} (showing first {len(lines)} lines, {total_chars} chars) ---\n"
         return header + "".join(lines)
     except Exception as e:
-        return f"Error reading file: {e}"
+        return format_tool_error("E_IO", f"Error reading file: {e}")
 
 
 def net_open_brackets(text: str) -> int:
@@ -245,8 +278,12 @@ def detect_truncated_rewrite(old_content: str, new_content: str) -> Optional[Dic
 
 
 def tool_write_file(path: str, content: str) -> str:
-    """Write or overwrite a local file with truncation protection."""
-    p = Path(path).expanduser().resolve()
+    """Write or overwrite a local file with truncation and jail protection."""
+    try:
+        p = check_workspace_jail(path)
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+
     if p.exists() and p.is_file():
         try:
             old_c = p.read_text(encoding="utf-8", errors="replace")
@@ -265,7 +302,7 @@ def tool_write_file(path: str, content: str) -> str:
         p.write_text(content, encoding="utf-8")
         return f"Successfully wrote {len(content)} characters to {p}"
     except Exception as e:
-        return f"Error writing file: {e}"
+        return format_tool_error("E_IO", f"Error writing file: {e}")
 
 
 def tool_registry_search(query: str, limit: int = 10) -> str:

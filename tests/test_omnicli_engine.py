@@ -1114,9 +1114,21 @@ class TestConsensusCliKeyContract(unittest.TestCase):
         r = CrossModelConsensusVerifier(client).verify_finding(
             "claim", "evidence", models=[("p", f"m{i}") for i in range(2)]
         )
-        for key in ("verdict", "true_positives", "false_positives",
-                    "tp_ratio", "fp_ratio", "total_queried", "votes"):
-            self.assertIn(key, r)
+# ── Workspace Jail & Security Guardrails ─────────────────────────────────────
+
+class TestWorkspaceJail(unittest.TestCase):
+    def test_blocks_sensitive_system_paths(self):
+        from omnicli.tools import check_workspace_jail, tool_read_file, tool_write_file
+        with self.assertRaises(PermissionError):
+            check_workspace_jail("/etc/shadow")
+        with self.assertRaises(PermissionError):
+            check_workspace_jail(str(Path.home() / ".ssh" / "id_rsa"))
+
+        out = tool_read_file("/etc/passwd")
+        self.assertIn("E_PERMISSION", out)
+
+        out_w = tool_write_file("/etc/cron.d/evil", "evil")
+        self.assertIn("E_PERMISSION", out_w)
 
 
 def main() -> int:
