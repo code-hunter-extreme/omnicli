@@ -238,6 +238,57 @@ def cmd_ping() -> None:
     console.print(table)
 
 
+@main.command("heartbeat")
+@click.option("--canary", is_flag=True, default=False,
+              help="Also send a tiny canary prompt per healthy provider")
+@click.option("--no-write", is_flag=True, default=False,
+              help="Do not write the status file")
+def cmd_heartbeat(canary: bool, no_write: bool) -> None:
+    """Per-API heartbeat: health, latency, model count (built-in health checks)."""
+    from omnicli import heartbeat as hb
+    with console.status("[cyan]Heartbeat: checking all providers...[/cyan]", spinner="dots"):
+        records = hb.run_heartbeat(cfg, client, canary=canary)
+
+    table = Table(title="OmniCLI Heartbeat", title_style="bold cyan", border_style="dim")
+    table.add_column("Provider", style="bold green", width=14)
+    table.add_column("Status", width=16)
+    table.add_column("Latency", justify="right", width=12)
+    table.add_column("Models", justify="right", width=10)
+    if canary:
+        table.add_column("Canary", width=10)
+    table.add_column("Details", style="dim")
+
+    for rec in records:
+        st = rec.get("status")
+        if st == "healthy":
+            status_str = "[bold green]ONLINE[/bold green]"
+        elif st in ("unauthorized", "missing_key"):
+            status_str = "[yellow]AUTH NEEDED[/yellow]"
+        elif st == "config_needed":
+            status_str = "[yellow]CONFIG[/yellow]"
+        else:
+            status_str = f"[red]{str(st).upper()}[/red]"
+        latency_str = f"{rec['latency_ms']} ms" if rec.get("latency_ms") else "-"
+        model_str = str(rec["model_count"]) if rec.get("model_count") else "-"
+        row = [rec.get("provider", "?"), status_str, latency_str, model_str]
+        if canary:
+            can = rec.get("canary")
+            if can is None:
+                row.append("-")
+            elif can.get("ok"):
+                row.append("[green]OK[/green]")
+            else:
+                row.append("[red]FAIL[/red]")
+        row.append((rec.get("error") or "OK")[:35])
+        table.add_row(*row)
+
+    console.print(table)
+    if not no_write:
+        path = hb.write_status(cfg, records)
+        if path:
+            console.print(f"[dim]Status written to {path}[/dim]")
+
+
 @main.command("models")
 @click.argument("provider", required=False)
 @click.option("-s", "--search", help="Filter models by search substring")
