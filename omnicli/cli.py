@@ -187,13 +187,20 @@ def run_one_shot(
 @click.option("-m", "--model", help="Model name")
 @click.option("-s", "--system", help="System prompt")
 @click.option("-t", "--temperature", type=float, default=0.7, help="Temperature")
-def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str], temperature: float) -> None:
+@click.option("--redteam", is_flag=True, default=False,
+              help="Adversarial security-analyst persona (no tools; proof-demanding)")
+@click.option("--rotate-families", is_flag=True, default=False,
+              help="Switch model family each turn from the scanned roster")
+def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
+             temperature: float, redteam: bool, rotate_families: bool) -> None:
     """Start an interactive chat session."""
     session = ChatSession(
         provider=provider,
         model=model,
         system_prompt=system,
         temperature=temperature,
+        redteam=redteam,
+        rotate_families=rotate_families,
     )
     session.run()
 

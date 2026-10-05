@@ -27,6 +27,19 @@ from omnicli.client import OmniClient, ProviderError
 from omnicli.config import ConfigManager
 
 
+# Adversarial persona for `omni chat --redteam`. Chat has no tool execution, so
+# unlike the agent's red-team prompt this does NOT promise verify_* tools — it
+# just makes the model a rigorous, proof-demanding security analyst.
+_CHAT_REDTEAM_SYSTEM = (
+    "You are an adversarial security analyst in an interactive session. "
+    "Be rigorous and skeptical: challenge assumptions and probe for auth, "
+    "access-control, injection, SSRF, and information-disclosure issues. For "
+    "every claim, separate what is PROVEN from what is merely plausible and "
+    "state exactly what evidence (a request, a code path, a response) would "
+    "confirm or refute it. Never fabricate results."
+)
+
+
 class SlashCommandCompleter(Completer):
     """Auto-completion for slash commands, providers, and models."""
 
@@ -86,6 +99,8 @@ class ChatSession:
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
+        redteam: bool = False,
+        rotate_families: bool = False,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -93,9 +108,16 @@ class ChatSession:
 
         self.provider = (provider or self.cfg.get_default_provider()).lower()
         self.model = model or self.cfg.get_default_model(self.provider)
-        self.system_prompt = system_prompt or self.cfg.data.get(
-            "system_prompt", "You are a helpful, brilliant, concise AI assistant."
-        )
+        self.redteam = redteam
+        self.rotate_families = rotate_families
+        if system_prompt:
+            self.system_prompt = system_prompt
+        elif redteam:
+            self.system_prompt = _CHAT_REDTEAM_SYSTEM
+        else:
+            self.system_prompt = self.cfg.data.get(
+                "system_prompt", "You are a helpful, brilliant, concise AI assistant."
+            )
         self.temperature = temperature
         self.messages: List[Dict[str, str]] = []
 
@@ -114,6 +136,13 @@ class ChatSession:
         grid.add_column(justify="left", ratio=1)
         grid.add_row("[bold cyan]OmniCLI — Local Multi-Provider AI Terminal[/bold cyan]")
         grid.add_row(f"[bold green]Provider:[/bold green] {self.provider}  |  [bold green]Model:[/bold green] {self.model}  |  [bold green]Temp:[/bold green] {self.temperature}")
+        modes = []
+        if getattr(self, "redteam", False):
+            modes.append("[bold red]RED-TEAM[/bold red]")
+        if getattr(self, "rotate_families", False):
+            modes.append("[bold magenta]ROTATE-FAMILIES[/bold magenta]")
+        if modes:
+            grid.add_row("[bold green]Modes:[/bold green] " + "  ".join(modes))
         grid.add_row("[dim]Type /help for slash commands, /models to browse models, /clear to reset history.[/dim]\n")
         self.console.print(Panel(grid, border_style="cyan", padding=(0, 1)))
 
@@ -345,6 +374,27 @@ class ChatSession:
         p.write_text("\n".join(lines), encoding="utf-8")
         self.console.print(f"[bold green]Transcript saved to:[/bold green] {p.resolve()}")
 
+    def _next_family_model(self) -> Optional[str]:
+        """Next model in the scanned roster whose family differs from the current.
+
+        Returns None when the roster holds only one family (nothing to rotate to).
+        """
+        from omnicli.scanner import classify_family
+        roster = [self.model] + list(self.cfg.get_fallback_models(self.provider))
+        seen: set = set()
+        deduped = []
+        for m in roster:
+            if m and m not in seen:
+                seen.add(m)
+                deduped.append(m)
+        if len(deduped) < 2:
+            return None
+        current_family = classify_family(self.model)
+        for m in deduped[1:]:
+            if classify_family(m) != current_family:
+                return m
+        return None
+
     def stream_turn(self, user_prompt: str) -> None:
         self.messages.append({"role": "user", "content": user_prompt})
 
@@ -397,6 +447,17 @@ class ChatSession:
         self.console.print()
 
         self.messages.append({"role": "assistant", "content": full_content})
+
+        # Optionally switch model family for the next turn.
+        if getattr(self, "rotate_families", False):
+            nxt = self._next_family_model()
+            if nxt and nxt != self.model:
+                from omnicli.scanner import classify_family
+                self.model = nxt
+                self.console.print(
+                    f"[magenta]⟳ Rotating family → {self.provider}/{self.model} "
+                    f"(family: {classify_family(self.model)})[/magenta]"
+                )
 
     def run(self) -> None:
         self.print_welcome()
