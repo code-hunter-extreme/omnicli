@@ -142,6 +142,21 @@ DEFAULT_PROVIDERS = {
             {"model": "qwen/qwen3.8-27b", "family": "qwen"},
         ],
     },
+    "monkeycode": {
+        "name": "MonkeyCode AI",
+        "base_url": "https://api.monkeycode-ai.net/api/v1",
+        "env_key": "MONKEYCODE_API_KEY",
+        "default_model": "deepseek-chat",
+        "description": "Chaitin MonkeyCode AI Platform (30M tokens/day)",
+        "requires_auth_for_models": True,
+        "fallback_models": [
+            "qwen-plus",
+            "glm-4",
+        ],
+        "verification_panel": [
+            {"model": "deepseek-chat", "family": "deepseek"},
+        ],
+    },
 }
 
 # Per-provider memory (context injection + optional history). File entries are
