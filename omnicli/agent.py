@@ -18,7 +18,6 @@ Auto-fallback: on API error / timeout the agent walks the roster regardless of f
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,7 +26,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from omnicli.client import OmniClient, ProviderError
+from omnicli.client import OmniClient
 from omnicli.config import ConfigManager
 from omnicli.tools import TOOL_DEFINITIONS, execute_tool_call
 

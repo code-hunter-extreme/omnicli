@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import ipaddress
-import json
 import re
-import shlex
 import socket
 import urllib.parse
 from pathlib import Path

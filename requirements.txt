@@ -1,0 +1,4 @@
+click
+httpx
+prompt_toolkit
+rich

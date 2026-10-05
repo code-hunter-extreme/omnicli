@@ -10,12 +10,11 @@ Provides standard OpenAI function schemas and local execution for:
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier, ScopeGate

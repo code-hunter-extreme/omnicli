@@ -6,11 +6,9 @@ and multi-turn memory.
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -23,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from omnicli.client import OmniClient, ProviderError
+from omnicli.client import OmniClient
 from omnicli.config import ConfigManager
 
 

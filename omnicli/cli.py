@@ -4,7 +4,6 @@ Command-line interface entry point for OmniCLI.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -679,7 +678,8 @@ def verify_consensus_cmd(claim: str, filepath: Optional[str], evidence: Optional
 
     console.print(Panel(
         f"[bold {color}]CONSENSUS VERDICT: {verdict}[/bold {color}]\n"
-        f"Corroboration: [green]{res['true_positives']} True Positives[/green] / [red]{res['false_positives']} False Positives[/red] (Ratio: {res['consensus_ratio']})",
+        f"Corroboration: [green]{res['true_positives']} True Positives[/green] / [red]{res['false_positives']} False Positives[/red] "
+        f"(TP {res['tp_ratio']} / FP {res['fp_ratio']} of {res['total_queried']})",
         title="Blind Multi-Model Verification Consensus",
         border_style=color,
     ))
@@ -694,7 +694,7 @@ def verify_consensus_cmd(claim: str, filepath: Optional[str], evidence: Optional
 def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], models: tuple) -> None:
     """Unified check: tests target deterministically and across multiple API keys/models."""
     from rich.panel import Panel
-    from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier, ScopeGate
+    from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier
 
     target_str = target.strip()
     is_url = target_str.startswith("http://") or target_str.startswith("https://")
@@ -733,7 +733,7 @@ def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], mod
         with console.status(f"[cyan]Phase 1: Running deterministic code AST checks on {target_str}...[/cyan]"):
             must_c = [expected] if expected else None
             deterministic_result = CodeVerifier.verify_file(
-                file_path=evidence_file,
+                file_path=evidence_file or target_str,
                 must_contain=must_c,
                 check_type="wp_auth_check" if target_str.endswith(".php") else None,
             )
@@ -784,7 +784,8 @@ def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], mod
 
     console.print(Panel(
         f"[bold {c_col}]CROSS-MODEL CONSENSUS: {c_verdict}[/bold {c_col}]\n"
-        f"Agreement: [green]{consensus_res['true_positives']} Confirming[/green] / [red]{consensus_res['false_positives']} Refuting[/red] (Consensus Ratio: {consensus_res['consensus_ratio']})",
+        f"Agreement: [green]{consensus_res['true_positives']} Confirming[/green] / [red]{consensus_res['false_positives']} Refuting[/red] "
+        f"(TP {consensus_res['tp_ratio']} / FP {consensus_res['fp_ratio']} of {consensus_res['total_queried']})",
         title="Phase 2: Multi-Provider AI Consensus",
         border_style=c_col,
     ))
