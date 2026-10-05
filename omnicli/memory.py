@@ -14,6 +14,7 @@ opt-in via config and used by the chat REPL.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -85,8 +86,14 @@ def append_history(cfg: Any, provider: str, role: str, content: str) -> None:
         return
     path = history_path(cfg, provider)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
+        # History can contain sensitive transcript content — keep it owner-only.
+        os.makedirs(path.parent, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)  # tighten even if the dir pre-existed
+        except OSError:
+            pass
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps({"role": role, "content": content}) + "\n")
     except Exception as e:  # noqa: BLE001 - history is best-effort, never fatal
         print(f"[memory] WARNING: could not write history {path}: {e}", file=sys.stderr)
