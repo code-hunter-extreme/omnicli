@@ -354,23 +354,68 @@ omni evaluate-security \
   --dataset security-cases.jsonl \
   --model openrouter:provider/model-a \
   --model nvidia:provider/model-b \
+  --static-baseline \
+  --staged-redteam \
   --minimum-cases 20 \
+  --repetitions 2 \
   --output evaluation-results.json
 ```
 
 Each non-empty line is one case. The dataset must include both positive and clean
-cases. Expected evidence must occur in the source; a true positive requires an
-exact category, file, line, and quoted evidence match:
+cases. Optional `split` metadata must be `development` or `held_out`; cases using
+it also require a category, positive severity and preconditions, or a clean-case
+rationale. Expected evidence must match the labeled source line; a true positive
+requires an exact category, file, line, and quoted evidence match:
 
 ```json
 {"id":"sqli-01","file":"app/query.py","prompt":"Review this function for SQL injection.","source":"def find(value):\n    cursor.execute(f\"SELECT {value}\")\n","expected_findings":[{"category":"sql_injection","file":"app/query.py","line":2,"evidence":"cursor.execute(f\"SELECT {value}\")"}]}
 {"id":"clean-01","file":"app/safe.py","prompt":"Review this function for SQL injection.","source":"def find(value):\n    cursor.execute(\"SELECT * FROM t WHERE id = %s\", (value,))\n","expected_findings":[]}
 ```
 
-The command reports precision, recall, F1, request errors, p50 latency, and cost
-only when an optional `--pricing` JSON file supplies per-model
-`input_per_million` / `output_per_million` rates and provider responses include
-token usage. Its recommendation is advisory, requires the configured minimum
-number of error-free cases and at least one exact match, and does not change
-normal model routing. A benchmark is only as reliable as its independently
-reviewed labels and representative cases.
+The command reports precision, recall, F1, clean-case specificity, exact
+source-line quote accuracy, per-category scores, 95% Wilson intervals, request
+errors, p50 latency, and cost only when an optional `--pricing` JSON file
+supplies per-model `input_per_million` / `output_per_million` rates and provider
+responses include token usage. The JSON report preserves each case's
+normalized predicted findings and citation quotes for adjudication.
+`--staged-redteam` adds the actual four-focus attack plus challenge pipeline for
+every case and model, reported beside the single-pass and optional static
+results. This uses at least five model calls per case per repetition; request
+it deliberately and include its latency/cost in comparisons. Stage or
+evidence-gate failures count as failed trials and expected findings are scored
+as missed. Staged results are not eligible for the single-pass model
+recommendation.
+`--static-baseline` adds a local deterministic pattern baseline using the same
+cases; its candidates are heuristics, not security verdicts or model
+recommendations. `--repetitions` repeats every model/case pair (default 1);
+errors remain explicit and block recommendations. Recommendations are
+advisory, require the configured minimum number of error-free cases and at
+least one exact match, and do not change normal model routing. The evaluator
+can compare staged versus single-pass behavior but has not yet established
+whether orchestration improves quality on representative or held-out cases. A
+benchmark is only as reliable as its independently reviewed labels and
+representative cases. The self-authored development fixtures at
+`tests/fixtures/redteam/cases.dev.jsonl` are for tuning, not a held-out quality
+claim. See `docs/REDTEAM_QUALITY_PLAN.md` for
+the bounded transition gate and current limitations.
+
+To run the transition check after assembling a held-out JSONL set:
+
+```bash
+omni evaluate-security \
+  --dataset security-held-out.jsonl \
+  --split held_out \
+  --model openrouter:provider/model-a \
+  --model nvidia:provider/model-b \
+  --model openrouter:provider/model-c \
+  --staged-redteam \
+  --quality-gate \
+  --repetitions 2 \
+  --output quality-gate-results.json
+```
+
+The gate requires at least 30 positive and 30 benign held-out cases, paired
+single-pass/staged results from at least three healthy model families, and two
+or more repetitions. It exits with status 2 on failure. A pass is bounded to
+those labels, models, and settings; it does not establish universal audit
+quality.

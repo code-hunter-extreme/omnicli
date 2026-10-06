@@ -470,15 +470,31 @@ def swarm_deliberate(
     ]
     if synthesis_telemetry.get("usage"):
         usage_records.append(synthesis_telemetry["usage"])
-    input_tokens = sum(
-        usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    token_pairs = [
+        (
+            usage.get("prompt_tokens", usage.get("input_tokens")),
+            usage.get("completion_tokens", usage.get("output_tokens")),
+        )
         for usage in usage_records
-        if isinstance(usage.get("prompt_tokens", usage.get("input_tokens", 0)), int)
+    ]
+    usage_complete = (
+        len(usage_records)
+        == len(contributions) + int(bool(synthesis_telemetry.get("usage")))
+        and all(
+            isinstance(input_count, int)
+            and not isinstance(input_count, bool)
+            and input_count >= 0
+            and isinstance(output_count, int)
+            and not isinstance(output_count, bool)
+            and output_count >= 0
+            for input_count, output_count in token_pairs
+        )
     )
-    output_tokens = sum(
-        usage.get("completion_tokens", usage.get("output_tokens", 0))
-        for usage in usage_records
-        if isinstance(usage.get("completion_tokens", usage.get("output_tokens", 0)), int)
+    input_tokens = (
+        sum(pair[0] for pair in token_pairs) if usage_complete else None
+    )
+    output_tokens = (
+        sum(pair[1] for pair in token_pairs) if usage_complete else None
     )
     costs = [
         item.get("reported_cost_usd")
@@ -753,7 +769,8 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         f"{source_facts_text}\n\n"
         "### REQUIRED REVIEW OUTPUT\n"
         "For each candidate provide a separate block using:\n"
-        "FINDING: short title\nFILE: exact supplied path\nLINE: N or N-M\n"
+        "FINDING: short title\nCATEGORY: short_snake_case\n"
+        "FILE: exact supplied path\nLINE: N or N-M\n"
         "QUOTE: `verbatim source excerpt`\n"
         "ATTACK PATH: attacker-controlled input -> operation -> security impact\n"
         "PRECONDITIONS: what must be true for the path to be exploitable\n"
@@ -959,6 +976,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                 "security_conclusion": "not_assessed",
             },
             "challenge_evidence_validation": checks["challenge"],
+            "attack_validations": attack_checks,
         })
 
     attack_validations = [
@@ -1039,16 +1057,28 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     ]
     if synthesis_telemetry.get("usage"):
         usage_records.append(synthesis_telemetry["usage"])
-    input_tokens = sum(
-        usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    token_pairs = [
+        (
+            usage.get("prompt_tokens", usage.get("input_tokens")),
+            usage.get("completion_tokens", usage.get("output_tokens")),
+        )
         for usage in usage_records
-        if isinstance(usage.get("prompt_tokens", usage.get("input_tokens", 0)), int)
+    ]
+    usage_complete = (
+        len(usage_records)
+        == len(call_records) + int(bool(synthesis_telemetry.get("usage")))
+        and all(
+            isinstance(input_count, int)
+            and not isinstance(input_count, bool)
+            and input_count >= 0
+            and isinstance(output_count, int)
+            and not isinstance(output_count, bool)
+            and output_count >= 0
+            for input_count, output_count in token_pairs
+        )
     )
-    output_tokens = sum(
-        usage.get("completion_tokens", usage.get("output_tokens", 0))
-        for usage in usage_records
-        if isinstance(usage.get("completion_tokens", usage.get("output_tokens", 0)), int)
-    )
+    input_tokens = sum(pair[0] for pair in token_pairs) if usage_complete else None
+    output_tokens = sum(pair[1] for pair in token_pairs) if usage_complete else None
     reported_costs = [
         result.get("reported_cost_usd") for result in call_records
     ]
@@ -1081,6 +1111,8 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         "metrics": metrics,
         "source_facts": source_facts,
         "candidate_triage": candidate_triage,
+        "attack_validations": attack_validations,
+        "challenge_validations": challenge_validations,
         "evidence_gate": evidence_gate,
     }
 

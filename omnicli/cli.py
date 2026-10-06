@@ -542,6 +542,27 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
     help="Minimum labeled cases before a model recommendation is shown",
 )
 @click.option(
+    "--repetitions", type=click.IntRange(min=1), default=1, show_default=True,
+    help="Repeat each case to measure run-to-run variability",
+)
+@click.option(
+    "--static-baseline", is_flag=True,
+    help="Include the local deterministic source-pattern baseline on the same cases",
+)
+@click.option(
+    "--staged-redteam", is_flag=True,
+    help="Also run the staged attack/challenge pipeline on the same cases and models",
+)
+@click.option(
+    "--split", type=click.Choice(["all", "development", "held_out"]),
+    default="all", show_default=True,
+    help="Select a labeled dataset split before running evaluations",
+)
+@click.option(
+    "--quality-gate", is_flag=True,
+    help="Assess the bounded held-out transition gate (requires --split held_out and --staged-redteam)",
+)
+@click.option(
     "--pricing", type=click.Path(exists=True, dir_okay=False),
     help="Optional JSON price map keyed by provider:model",
 )
@@ -553,6 +574,11 @@ def cmd_evaluate_security(
     dataset_path: str,
     model_specs: tuple,
     minimum_cases: int,
+    repetitions: int,
+    static_baseline: bool,
+    staged_redteam: bool,
+    split: str,
+    quality_gate: bool,
     pricing: Optional[str],
     output: Optional[str],
 ) -> None:
@@ -561,6 +587,9 @@ def cmd_evaluate_security(
     import math
     from omnicli.evaluation import (
         evaluate_security_models,
+        evaluate_deterministic_security,
+        evaluate_staged_security,
+        assess_redteam_quality_gate,
         load_security_dataset,
         recommend_model,
     )
@@ -605,19 +634,60 @@ def cmd_evaluate_security(
         cases = load_security_dataset(dataset_path)
     except (OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    if quality_gate and (split != "held_out" or not staged_redteam):
+        raise click.UsageError(
+            "--quality-gate requires --split held_out and --staged-redteam."
+        )
+    if split != "all":
+        cases = [case for case in cases if case.get("split") == split]
+        if not cases:
+            raise click.ClickException(f"Dataset contains no cases in the {split!r} split.")
+    staged_results = []
     try:
         with console.status(
-            f"[cyan]Evaluating {len(models)} model(s) on {len(cases)} labeled security case(s)...[/cyan]"
+            f"[cyan]Evaluating {len(models)} model(s) on "
+            f"{len(cases) * repetitions} case trial(s)...[/cyan]"
         ):
-            report = evaluate_security_models(client, cases, models, pricing=price_data)
+            report = evaluate_security_models(
+                client,
+                cases,
+                models,
+                pricing=price_data,
+                repetitions=repetitions,
+            )
+            if static_baseline:
+                report["models"].append(
+                    evaluate_deterministic_security(cases, repetitions=repetitions)
+                )
+            if staged_redteam:
+                staged_report = evaluate_staged_security(
+                    cfg,
+                    client,
+                    cases,
+                    models,
+                    repetitions=repetitions,
+                    pricing=price_data,
+                )
+                staged_results = staged_report["models"]
+                report["models"].extend(staged_results)
+                report["limitations"].extend(staged_report["limitations"])
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    if quality_gate:
+        report["quality_gate"] = assess_redteam_quality_gate(
+            cases,
+            [item for item in report["models"] if item.get("method") == "single_pass_model"],
+            staged_results,
+        )
     report["recommendation"] = recommend_model(report, minimum_cases=minimum_cases)
 
     table = Table(title="Security Model Evaluation", border_style="dim")
     table.add_column("Provider / Model", style="cyan")
+    table.add_column("Method", style="magenta")
     table.add_column("Cases", justify="right")
     table.add_column("P / R / F1", justify="right")
+    table.add_column("Specificity", justify="right")
+    table.add_column("Quote accuracy", justify="right")
     table.add_column("Errors", justify="right")
     table.add_column("P50 ms", justify="right")
     table.add_column("Est. cost", justify="right")
@@ -625,8 +695,11 @@ def cmd_evaluate_security(
         cost = f"${result['estimated_cost_usd']:.6f}" if result["estimated_cost_usd"] is not None else "n/a"
         table.add_row(
             f"{result['provider']}:{result['model']}",
+            result.get("method", "single_pass_model"),
             str(result["cases"]),
             f"{result['precision']:.3f} / {result['recall']:.3f} / {result['f1']:.3f}",
+            f"{result['specificity']:.3f}" if result["specificity"] is not None else "n/a",
+            f"{result['citation_accuracy']:.3f}" if result["citation_accuracy"] is not None else "n/a",
             str(result["errors"]),
             str(result["p50_latency_ms"]),
             cost,
@@ -645,11 +718,19 @@ def cmd_evaluate_security(
             f"{minimum_cases} error-free labeled cases."
         )
     console.print("[dim]This score measures only the supplied labels; it is not exploitability proof.[/dim]")
+    if quality_gate:
+        gate = report["quality_gate"]
+        style = "green" if gate["status"] == "PASS_BOUNDED_GATE" else "red"
+        console.print(f"[{style}]QUALITY GATE: {gate['status']}[/{style}]")
+        for failure in gate["failures"]:
+            console.print(f"- {failure}")
     if output:
         output_path = Path(output).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         console.print(f"Full report saved to {output_path}")
+    if quality_gate and report["quality_gate"]["status"] != "PASS_BOUNDED_GATE":
+        raise click.exceptions.Exit(2)
 
 
 @main.group("workflow")

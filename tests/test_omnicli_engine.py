@@ -1339,6 +1339,7 @@ class TestRedteamGroundingIntegration(unittest.TestCase):
         self.assertEqual(mutating["request_input_accesses"], ["request.get_json"])
         self.assertIn("delete_user_by_id", mutating["mutating_calls"])
         self.assertFalse(mutating["local_auth_guards"])
+        self.assertEqual(mutating["same_module_request_hooks"], [])
         health = by_file["public_health.py"]["routes"][0]
         self.assertEqual(health["methods"], ["GET"])
         self.assertTrue(health["returns_only_literals"])
@@ -1383,6 +1384,86 @@ class TestRedteamGroundingIntegration(unittest.TestCase):
         )
         self.assertEqual(triaged[0]["status"], "unverified_authorization_gap")
         self.assertIn("middleware", triaged[0]["reason"])
+
+    def test_python_facts_link_request_values_to_security_sinks(self):
+        from omnicli.evidence import analyze_python_security_facts
+
+        source = (
+            "from flask import request\n"
+            "import subprocess\n"
+            "@app.post('/run')\n"
+            "def run():\n"
+            "    command = request.json['command']\n"
+            "    subprocess.run(command, shell=True)\n"
+        )
+        route = analyze_python_security_facts({"run.py": source})[0]["routes"][0]
+        self.assertEqual(route["request_derived_variables"], ["command"])
+        self.assertEqual(len(route["request_derived_sinks"]), 1)
+        self.assertEqual(route["request_derived_sinks"][0]["category"], "command_execution")
+        self.assertEqual(
+            route["request_derived_sinks"][0]["request_derived_arguments"],
+            ["command"],
+        )
+
+    def test_same_module_auth_hook_is_context_not_proof_or_absence(self):
+        from omnicli.evidence import analyze_python_security_facts, triage_grounded_findings
+
+        source = (
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "@app.before_request\n"
+            "def enforce_policy():\n"
+            "    check_policy()\n"
+            "@app.post('/admin/delete')\n"
+            "def delete_user():\n"
+            "    delete_user_by_id(1)\n"
+            "    return {'ok': True}\n"
+        )
+        facts = analyze_python_security_facts({"app.py": source})
+        route = facts[0]["routes"][0]
+        self.assertEqual(route["same_module_request_hooks"][0]["handler"], "enforce_policy")
+        triaged = triage_grounded_findings(
+            [{
+                "findings_checked": [{
+                    "finding": "Unauthenticated privileged deletion",
+                    "file": "app.py",
+                    "start_line": 8,
+                    "end_line": 9,
+                    "grounded": True,
+                }]
+            }],
+            facts,
+        )
+        self.assertEqual(triaged[0]["status"], "unverified_authorization_gap")
+        self.assertIn("enforce_policy", triaged[0]["reason"])
+
+    def test_health_handler_with_module_hook_is_not_screened_as_public(self):
+        from omnicli.evidence import analyze_python_security_facts, triage_grounded_findings
+
+        source = (
+            "from flask import Flask\n"
+            "app = Flask(__name__)\n"
+            "@app.before_request\n"
+            "def check_auth():\n"
+            "    verify_token()\n"
+            "@app.get('/health')\n"
+            "def health():\n"
+            "    return {'status': 'ok'}\n"
+        )
+        facts = analyze_python_security_facts({"app.py": source})
+        triaged = triage_grounded_findings(
+            [{
+                "findings_checked": [{
+                    "finding": "Missing authentication",
+                    "file": "app.py",
+                    "start_line": 8,
+                    "end_line": 9,
+                    "grounded": True,
+                }]
+            }],
+            facts,
+        )
+        self.assertEqual(triaged[0]["status"], "unverified_authorization_gap")
 
     def test_redteam_marks_exact_quote_grounded_without_claiming_proof(self):
         from omnicli.orchestrate import run_orchestration
@@ -2065,6 +2146,30 @@ class TestSecurityEvaluation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "clean case"):
                 load_security_dataset(str(path))
 
+    def test_development_benchmark_has_adjudication_metadata_and_exact_lines(self):
+        from omnicli.evaluation import load_security_dataset
+
+        path = Path(__file__).parent / "fixtures" / "redteam" / "cases.dev.jsonl"
+        cases = load_security_dataset(str(path))
+        self.assertEqual(len(cases), 12)
+        self.assertTrue(all(case["split"] == "development" for case in cases))
+        self.assertEqual(sum(bool(case["expected_findings"]) for case in cases), 6)
+
+    def test_gold_evidence_must_match_its_labeled_line(self):
+        from omnicli.evaluation import load_security_dataset
+        import json
+
+        with tempfile.TemporaryDirectory() as td:
+            path = self._dataset(td)
+            cases = [json.loads(line) for line in path.read_text().splitlines()]
+            cases[0]["expected_findings"][0]["line"] = 1
+            path.write_text(
+                "\n".join(json.dumps(case) for case in cases) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "labeled source line"):
+                load_security_dataset(str(path))
+
     def test_scores_exact_source_evidence_and_clean_case(self):
         from omnicli.evaluation import evaluate_security_models, load_security_dataset, recommend_model
         import json
@@ -2103,13 +2208,158 @@ class TestSecurityEvaluation(unittest.TestCase):
         result = report["models"][0]
         self.assertEqual((result["true_positives"], result["false_positives"], result["false_negatives"]), (1, 0, 0))
         self.assertEqual(result["f1"], 1.0)
+        self.assertEqual(result["citation_accuracy"], 1.0)
+        self.assertEqual(result["grounded_citations"], 1)
         self.assertEqual(result["estimated_cost_usd"], 0.00028)
+        self.assertEqual((result["input_tokens"], result["output_tokens"]), (200, 40))
         self.assertIn("1: def find(value):", client.prompts[0])
         self.assertIsNone(recommend_model(report, minimum_cases=3))
         self.assertEqual(
             recommend_model(report, minimum_cases=2)["model"],
             "model-a",
         )
+
+    def test_staged_evaluator_scores_pipeline_outputs_and_retains_raw_review(self):
+        from omnicli.evaluation import (
+            evaluate_staged_security,
+            load_security_dataset,
+            recommend_model,
+        )
+
+        class StagedClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                prompt = messages[-1]["content"]
+                if (
+                    "YOUR ASSIGNED THREAT CATEGORY" in prompt
+                    and 'cursor.execute(f"SELECT {value}")' in prompt
+                ):
+                    answer = (
+                        "FINDING: Missing authentication before privileged deletion\n"
+                        "CATEGORY: sql_injection\n"
+                        "FILE: app/query.py\nLINE: 2\nQUOTE:\n"
+                        '`cursor.execute(f"SELECT {value}")`\n'
+                        "ATTACK PATH: request-controlled query reaches execution\n"
+                        "PRECONDITIONS: An unauthenticated caller reaches this route.\n"
+                        "UNVERIFIED: Confirm deployment reachability."
+                    )
+                elif "INDEPENDENT CANDIDATES TO CHALLENGE" in prompt:
+                    answer = "No actionable candidate."
+                else:
+                    answer = "NO ACTIONABLE CANDIDATE"
+                return {
+                    "choices": [{"message": {"content": answer}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            result = evaluate_staged_security(
+                MagicMock(),
+                StagedClient(),
+                load_security_dataset(str(self._dataset(td))),
+                [("provider", "model-a")],
+                repetitions=1,
+                pricing={"provider:model-a": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 2.0,
+                }},
+            )["models"][0]
+        self.assertEqual(result["method"], "staged_redteam")
+        self.assertEqual((result["true_positives"], result["false_positives"], result["false_negatives"]), (1, 0, 0))
+        self.assertEqual(result["specificity"], 1.0)
+        self.assertEqual(result["citation_accuracy"], 1.0)
+        self.assertEqual(result["member_calls"], 10)
+        self.assertEqual((result["input_tokens"], result["output_tokens"]), (100, 50))
+        self.assertEqual(result["estimated_cost_usd"], 0.0002)
+        self.assertIsNone(recommend_model({"models": [result]}, minimum_cases=1))
+        self.assertEqual(result["case_results"][0]["predicted_findings"][0]["category"], "sql_injection")
+        self.assertIn("attack_validations", result["case_results"][0]["raw_outputs"][0])
+
+    def test_staged_evidence_gate_failure_fails_trial_not_partial_credit(self):
+        from omnicli.evaluation import evaluate_staged_security, load_security_dataset
+
+        class FailedStageClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                if "YOUR ASSIGNED THREAT CATEGORY" in messages[-1]["content"]:
+                    return {"choices": [{"message": {"content": "NO ACTIONABLE CANDIDATE"}}]}
+                raise RuntimeError("challenge provider unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            result = evaluate_staged_security(
+                MagicMock(),
+                FailedStageClient(),
+                load_security_dataset(str(self._dataset(td))),
+                [("provider", "model-a")],
+                repetitions=1,
+            )["models"][0]
+        self.assertEqual(result["errors"], 2)
+        self.assertEqual(result["evidence_gate_failures"], 2)
+        self.assertEqual(result["true_positives"], 0)
+        self.assertEqual(result["false_negatives"], 1)
+        self.assertEqual(result["false_positive_clean_cases"], 1)
+
+    def test_quality_gate_requires_heldout_repeats_healthy_families_and_no_regression(self):
+        from omnicli.evaluation import assess_redteam_quality_gate
+
+        cases = []
+        for index in range(30):
+            cases.append({
+                "id": f"positive-{index}",
+                "split": "held_out",
+                "expected_findings": [{"category": "sql_injection"}],
+            })
+            cases.append({
+                "id": f"benign-{index}",
+                "split": "held_out",
+                "expected_findings": [],
+            })
+        model_pairs = [
+            ("p1", "openai/gpt-4o"),
+            ("p2", "meta/llama-3.3"),
+            ("p3", "anthropic/claude-3.7"),
+        ]
+
+        def result_rows(method):
+            rows = []
+            for provider, model in model_pairs:
+                rows.append({
+                    "provider": provider,
+                    "model": model,
+                    "method": method,
+                    "repetitions": 2,
+                    "errors": 0,
+                    "evidence_gate_failures": 0,
+                    "true_positives": 60,
+                    "false_positives": 0,
+                    "false_negatives": 0,
+                    "true_negative_cases": 60,
+                    "false_positive_clean_cases": 0,
+                    "grounded_citations": 60,
+                    "citations": 60,
+                    "per_category": {
+                        "sql_injection": {
+                            "true_positives": 60,
+                            "false_positives": 0,
+                            "false_negatives": 0,
+                        }
+                    },
+                })
+            return rows
+
+        direct = result_rows("single_pass_model")
+        staged = result_rows("staged_redteam")
+        passing = assess_redteam_quality_gate(cases, direct, staged)
+        self.assertEqual(passing["status"], "PASS_BOUNDED_GATE")
+        self.assertEqual(passing["healthy_model_families"], ["anthropic", "meta", "openai"])
+        direct[0]["repetitions"] = 1
+        one_trial = assess_redteam_quality_gate(cases, direct, staged)
+        self.assertTrue(any("repetitions" in reason for reason in one_trial["failures"]))
+        direct[0]["repetitions"] = 2
+        staged[0]["true_positives"] = 50
+        staged[0]["false_negatives"] = 10
+        failing = assess_redteam_quality_gate(cases, direct, staged)
+        self.assertEqual(failing["status"], "FAIL")
+        self.assertTrue(any("recall" in reason for reason in failing["failures"]))
+        self.assertTrue(any("regresses" in reason for reason in failing["failures"]))
 
     def test_unmatched_quote_counts_false_positive_and_false_negative(self):
         from omnicli.evaluation import evaluate_security_models, load_security_dataset
@@ -2122,7 +2372,7 @@ class TestSecurityEvaluation(unittest.TestCase):
                         "category": "sql_injection",
                         "file": "app/query.py",
                         "line": 2,
-                        "evidence": "cursor.execute",
+                        "evidence": "call_not_in_source",
                     }]
                 } if "unsafe-query" in messages[0]["content"] else {"findings": []})
                 return {"choices": [{"message": {"content": content}}]}
@@ -2135,7 +2385,10 @@ class TestSecurityEvaluation(unittest.TestCase):
             )
         result = report["models"][0]
         self.assertEqual((result["true_positives"], result["false_positives"], result["false_negatives"]), (0, 1, 1))
+        self.assertEqual(result["citation_accuracy"], 0.0)
+        self.assertEqual(result["ungrounded_citations"], 1)
         self.assertIsNone(result["estimated_cost_usd"])
+        self.assertIsNone(result["input_tokens"])
 
     def test_invalid_model_output_counts_as_error_and_missed_gold(self):
         from omnicli.evaluation import (
@@ -2155,6 +2408,8 @@ class TestSecurityEvaluation(unittest.TestCase):
         result = report["models"][0]
         self.assertEqual(result["errors"], 2)
         self.assertEqual(result["false_negatives"], 1)
+        self.assertEqual(result["false_positive_clean_cases"], 1)
+        self.assertEqual(result["specificity"], 0.0)
         self.assertIsNone(recommend_model(report, minimum_cases=1))
 
     def test_invalid_pricing_fails_before_any_model_call(self):
@@ -2176,6 +2431,71 @@ class TestSecurityEvaluation(unittest.TestCase):
                         "output_per_million": 1.0,
                     }},
                 )
+
+    def test_repetitions_report_specificity_and_run_level_results(self):
+        from omnicli.evaluation import evaluate_security_models, load_security_dataset
+        import json
+
+        class VariableClient:
+            def __init__(self):
+                self.clean_calls = 0
+
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                prompt = messages[0]["content"]
+                if "unsafe-query" in prompt:
+                    findings = [{
+                        "category": "sql_injection",
+                        "file": "app/query.py",
+                        "line": 2,
+                        "evidence": 'cursor.execute(f"SELECT {value}")',
+                    }]
+                else:
+                    self.clean_calls += 1
+                    findings = [{
+                        "category": "sql_injection",
+                        "file": "app/safe.py",
+                        "line": 2,
+                        "evidence": 'cursor.execute("SELECT * FROM t WHERE id = %s", (value,))',
+                    }] if self.clean_calls == 1 else []
+                return {"choices": [{"message": {"content": json.dumps({"findings": findings})}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            result = evaluate_security_models(
+                VariableClient(),
+                load_security_dataset(str(self._dataset(td))),
+                [("provider", "model-a")],
+                repetitions=2,
+            )["models"][0]
+        self.assertEqual(result["cases"], 4)
+        self.assertEqual(result["unique_cases"], 2)
+        self.assertEqual(result["repetitions"], 2)
+        self.assertEqual(result["true_positives"], 2)
+        self.assertEqual(result["false_positives"], 1)
+        self.assertEqual(result["specificity"], 0.5)
+        self.assertEqual(result["recall_ci95"], [0.3424, 1.0])
+        self.assertEqual(
+            [case["repetition"] for case in result["case_results"]],
+            [1, 1, 2, 2],
+        )
+        self.assertEqual(result["per_category"]["sql_injection"]["true_positives"], 2)
+
+    def test_static_baseline_runs_same_development_cases_without_provider_calls(self):
+        from omnicli.evaluation import (
+            evaluate_deterministic_security,
+            load_security_dataset,
+            recommend_model,
+        )
+
+        cases = load_security_dataset(
+            str(Path(__file__).parent / "fixtures" / "redteam" / "cases.dev.jsonl")
+        )
+        baseline = evaluate_deterministic_security(cases, repetitions=2)
+        self.assertEqual(baseline["method"], "deterministic_static_baseline")
+        self.assertEqual((baseline["cases"], baseline["unique_cases"]), (24, 12))
+        self.assertEqual(baseline["errors"], 0)
+        self.assertGreater(baseline["true_positives"], 0)
+        self.assertEqual(len(baseline["case_results"]), 24)
+        self.assertIsNone(recommend_model({"models": [baseline]}, minimum_cases=1))
 
 
 class TestSwarm(unittest.TestCase):

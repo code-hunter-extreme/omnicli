@@ -9,6 +9,7 @@ from typing import Dict, Mapping, Optional
 
 _FINDING_HEADER = re.compile(
     r"(?is)(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?FINDING:\s*(?P<title>.*?)"
+    r"(?:\s+CATEGORY:\s*(?P<category>[a-z][a-z0-9_]*))?"
     r"\s+FILE:\s*(?P<file>.*?)"
     r"\s+LINE:\s*(?P<start>\d+)(?:\s*-\s*(?P<end>\d+))?"
     r"\s+QUOTE:\s*"
@@ -47,7 +48,7 @@ def analyze_python_security_facts(
         "write", "send", "grant", "revoke", "create",
     )
     input_markers = {
-        "args", "form", "json", "values", "get_json", "query_params",
+        "args", "form", "json", "values", "get_json", "get_data", "query_params",
         "headers", "cookies", "data", "body",
     }
     sensitive_markers = {
@@ -75,6 +76,35 @@ def analyze_python_security_facts(
             )
         return False
 
+    def request_input_expression(node: ast.AST) -> bool:
+        def access_name(value: ast.AST) -> str:
+            while isinstance(value, ast.Subscript):
+                value = value.value
+            return dotted_name(value)
+
+        return any(
+            isinstance(item, (ast.Attribute, ast.Subscript))
+            and access_name(item).split(".")[0] in {"request", "req"}
+            and any(
+                part.lower() in input_markers
+                for part in access_name(item).split(".")[1:]
+            )
+            for item in ast.walk(node)
+        )
+
+    def security_sink(call: ast.Call) -> Optional[str]:
+        name = dotted_name(call.func).lower()
+        tail = name.rsplit(".", 1)[-1]
+        if tail in {"execute", "executemany"}:
+            return "database_execution"
+        if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
+            return "command_execution"
+        if name in {"pickle.loads", "yaml.load", "marshal.loads"}:
+            return "unsafe_deserialization"
+        if tail == "open" or name == "open":
+            return "filesystem_access"
+        return None
+
     reports: list[Dict[str, object]] = []
     for path, source in sources.items():
         if not path.lower().endswith(".py"):
@@ -90,6 +120,22 @@ def analyze_python_security_facts(
             continue
 
         routes: list[Dict[str, object]] = []
+        request_hooks = []
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorators = [dotted_name(item) for item in function.decorator_list]
+            hook_decorators = [
+                decorator for decorator in decorators
+                if decorator.rsplit(".", 1)[-1].lower()
+                in {"before_request", "before_app_request"}
+            ]
+            if hook_decorators:
+                request_hooks.append({
+                    "handler": function.name,
+                    "line": function.lineno,
+                    "decorators": hook_decorators,
+                })
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -122,8 +168,42 @@ def analyze_python_security_facts(
                     for item in ast.walk(node)
                     if isinstance(item, ast.Call)
                 ]
+                call_sites = [
+                    {"call": dotted_name(item.func), "line": item.lineno}
+                    for item in ast.walk(node)
+                    if isinstance(item, ast.Call)
+                ]
                 decorators = [dotted_name(item) for item in node.decorator_list]
                 names = [dotted_name(item) for item in ast.walk(node)]
+                assignments = [
+                    item for item in ast.walk(node)
+                    if isinstance(item, (ast.Assign, ast.AnnAssign))
+                ]
+                dependencies: Dict[str, set[str]] = {}
+                request_derived = set()
+                for assignment in assignments:
+                    value = assignment.value
+                    if value is None:
+                        continue
+                    targets = (
+                        assignment.targets if isinstance(assignment, ast.Assign)
+                        else [assignment.target]
+                    )
+                    target_names = {
+                        target.id for target in targets if isinstance(target, ast.Name)
+                    }
+                    value_names = {
+                        item.id for item in ast.walk(value)
+                        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+                    }
+                    for target_name in target_names:
+                        dependencies.setdefault(target_name, set()).update(value_names)
+                        if request_input_expression(value):
+                            request_derived.add(target_name)
+                for _ in range(len(dependencies)):
+                    for target_name, value_names in dependencies.items():
+                        if value_names.intersection(request_derived):
+                            request_derived.add(target_name)
                 request_inputs = sorted({
                     name for name in names
                     if name.split(".")[0] in {"request", "req"}
@@ -149,6 +229,39 @@ def analyze_python_security_facts(
                     item.value is not None and literal_only(item.value)
                     for item in returns
                 )
+                sinks = []
+                for item in ast.walk(node):
+                    if not isinstance(item, ast.Call):
+                        continue
+                    category = security_sink(item)
+                    if category:
+                        argument_names = sorted({
+                            child.id for argument in [*item.args, *(
+                                keyword.value for keyword in item.keywords
+                            )]
+                            for child in ast.walk(argument)
+                            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                        })
+                        sinks.append({
+                            "category": category,
+                            "call": dotted_name(item.func),
+                            "line": item.lineno,
+                            "argument_names": argument_names,
+                            "dynamic_argument": any(
+                                isinstance(child, (ast.JoinedStr, ast.BinOp))
+                                for argument in item.args
+                                for child in ast.walk(argument)
+                            ),
+                            "shell_enabled": any(
+                                keyword.arg == "shell"
+                                and isinstance(keyword.value, ast.Constant)
+                                and keyword.value.value is True
+                                for keyword in item.keywords
+                            ),
+                            "request_derived_arguments": sorted(
+                                set(argument_names).intersection(request_derived)
+                            ),
+                        })
                 routes.append({
                     "path": route_path,
                     "methods": methods,
@@ -165,12 +278,111 @@ def analyze_python_security_facts(
                         ]
                     ),
                     "local_auth_guards": local_auth,
+                    "same_module_request_hooks": request_hooks,
                     "request_input_accesses": request_inputs,
+                    "request_derived_variables": sorted(request_derived),
+                    "security_sinks": sinks,
+                    "request_derived_sinks": [
+                        sink for sink in sinks
+                        if sink["request_derived_arguments"]
+                    ],
                     "mutating_calls": mutating_calls,
+                    "call_sites": call_sites,
                     "sensitive_output_markers": output_keys,
                     "returns_only_literals": literal_returns,
                 })
-        reports.append({"file": path, "routes": routes})
+        functions = []
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            calls_in_function = [
+                item for item in ast.walk(function) if isinstance(item, ast.Call)
+            ]
+            assignment_nodes = [
+                item for item in ast.walk(function)
+                if isinstance(item, (ast.Assign, ast.AnnAssign))
+            ]
+            dependencies: Dict[str, set[str]] = {}
+            request_derived = set()
+            for assignment in assignment_nodes:
+                value = assignment.value
+                if value is None:
+                    continue
+                targets = (
+                    assignment.targets if isinstance(assignment, ast.Assign)
+                    else [assignment.target]
+                )
+                target_names = {
+                    target.id for target in targets if isinstance(target, ast.Name)
+                }
+                value_names = {
+                    item.id for item in ast.walk(value)
+                    if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+                }
+                for target_name in target_names:
+                    dependencies.setdefault(target_name, set()).update(value_names)
+                    if request_input_expression(value):
+                        request_derived.add(target_name)
+            for _ in range(len(dependencies)):
+                for target_name, value_names in dependencies.items():
+                    if value_names.intersection(request_derived):
+                        request_derived.add(target_name)
+
+            sinks = []
+            for call in calls_in_function:
+                category = security_sink(call)
+                if not category:
+                    continue
+                argument_names = sorted({
+                    child.id for argument in [*call.args, *(
+                        keyword.value for keyword in call.keywords
+                    )]
+                    for child in ast.walk(argument)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                })
+                sinks.append({
+                    "category": category,
+                    "call": dotted_name(call.func),
+                    "line": call.lineno,
+                    "argument_names": argument_names,
+                    "dynamic_argument": any(
+                        isinstance(child, (ast.JoinedStr, ast.BinOp))
+                        for argument in call.args
+                        for child in ast.walk(argument)
+                    ),
+                    "shell_enabled": any(
+                        keyword.arg == "shell"
+                        and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is True
+                        for keyword in call.keywords
+                    ),
+                    "request_derived_arguments": sorted(
+                        set(argument_names).intersection(request_derived)
+                    ),
+                })
+            function_calls = [
+                {"call": dotted_name(call.func), "line": call.lineno}
+                for call in calls_in_function
+            ]
+            decorators = [dotted_name(item) for item in function.decorator_list]
+            function_names = [*decorators, *(item["call"] for item in function_calls)]
+            functions.append({
+                "name": function.name,
+                "start_line": function.lineno,
+                "end_line": function.end_lineno or function.lineno,
+                "local_auth_guards": sorted({
+                    name for name in function_names
+                    if any(marker in name.lower() for marker in auth_markers)
+                }),
+                "mutating_calls": sorted({
+                    name for name in (item["call"] for item in function_calls)
+                    if any(marker in name.rsplit(".", 1)[-1].lower() for marker in mutation_markers)
+                }),
+                "call_sites": function_calls,
+                "request_derived_variables": sorted(request_derived),
+                "security_sinks": sinks,
+            })
+        reports.append({"file": path, "routes": routes, "functions": functions})
     return reports
 
 
@@ -238,7 +450,12 @@ def triage_grounded_findings(
                         if auth_claim.search(title):
                             mutating = bool(route.get("mutating_calls"))
                             sensitive_output = bool(route.get("sensitive_output_markers"))
-                            if not mutating and not sensitive_output and route.get("returns_only_literals"):
+                            if (
+                                not mutating
+                                and not sensitive_output
+                                and route.get("returns_only_literals")
+                                and not route.get("same_module_request_hooks")
+                            ):
                                 candidate.update({
                                     "status": "not_actionable_for_handler",
                                     "reason": (
@@ -248,12 +465,23 @@ def triage_grounded_findings(
                                     ),
                                 })
                             elif not route.get("local_auth_guards"):
+                                hook_names = [
+                                    hook.get("handler", "unknown")
+                                    for hook in route.get("same_module_request_hooks", [])
+                                    if isinstance(hook, Mapping)
+                                ]
+                                hook_context = (
+                                    " Same-module request hooks were observed "
+                                    f"({', '.join(hook_names)}); inspect their behavior."
+                                    if hook_names else ""
+                                )
                                 candidate.update({
                                     "status": "unverified_authorization_gap",
                                     "reason": (
                                         "No local auth guard pattern was detected before a sensitive "
                                         "operation; middleware, decorators outside this handler, and "
                                         "effective route reachability still require verification."
+                                        + hook_context
                                     ),
                                 })
                         elif input_claim.search(title):
@@ -374,6 +602,7 @@ def validate_quoted_findings(
                 reason = "quoted lines do not exactly match the cited source range"
         checked.append({
             "finding": match.group("title").strip(),
+            "category": (match.group("category") or "unknown").strip().lower(),
             "file": path,
             "start_line": start,
             "end_line": end,
