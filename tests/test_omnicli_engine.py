@@ -735,6 +735,31 @@ class TestCliModeWiring(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0], expected_mode)
                 self.assertEqual(run.call_args.kwargs["size"], 1)
                 self.assertFalse(run.call_args.kwargs["synth"])
+                self.assertEqual(run.call_args.kwargs["provider"], "p")
+                self.assertEqual(run.call_args.kwargs["swarm"], [("p", "openai/test")])
+
+    def test_swarm_checkpoint_options_are_forwarded(self):
+        checkpoint = "/tmp/omnicli-checkpoint.sqlite3"
+        with (
+            patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
+            patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run,
+        ):
+            result = self.runner.invoke(
+                self.main,
+                [
+                    "swarm", "--mode", "redteam", "--checkpoint", checkpoint,
+                    "--resume", "review", "source",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run.call_args.kwargs["checkpoint_path"], checkpoint)
+        self.assertTrue(run.call_args.kwargs["resume"])
+
+    def test_resume_requires_checkpoint_path(self):
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]):
+            result = self.runner.invoke(self.main, ["swarm", "--resume", "review", "source"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--resume requires --checkpoint PATH", result.output)
 
 
 # ── Agent family rotation ─────────────────────────────────────────────────────
@@ -1399,6 +1424,108 @@ class TestSwarm(unittest.TestCase):
         self.assertIsNone(errs["openai/gpt-4o"])
         self.assertIn("down", errs["meta/llama-3.3-70b"])
 
+    def test_checkpointed_swarm_resumes_without_repeating_successful_members(self):
+        from omnicli.orchestrate import run_orchestration
+
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "audit.sqlite3")
+            first_client = self.FakeClient(record=[])
+            first = run_orchestration(
+                "collaborate", self._cfg(), first_client, "review module",
+                size=2, synth=False, checkpoint_path=path,
+            )
+            self.assertEqual(len(first_client.record), 2)
+            self.assertEqual(len(first["events"]), 6)
+            self.assertTrue(Path(path).stat().st_mode & 0o077 == 0)
+
+            resumed_client = self.FakeClient(record=[])
+            resumed = run_orchestration(
+                "collaborate", self._cfg(), resumed_client, "review module",
+                size=2, synth=False, checkpoint_path=path, resume=True,
+            )
+            self.assertEqual(resumed_client.record, [])
+            self.assertEqual(resumed["run_id"], first["run_id"])
+            self.assertEqual(len(resumed["members"]), 2)
+            self.assertTrue(resumed["events"][-1]["event"] == "completed")
+
+    def test_checkpoint_rejects_changed_prompt_or_mode(self):
+        from omnicli.orchestrate import run_orchestration
+
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "audit.sqlite3")
+            run_orchestration(
+                "collaborate", self._cfg(), self.FakeClient(), "review module",
+                size=1, synth=False, checkpoint_path=path,
+            )
+            with self.assertRaisesRegex(ValueError, "must match"):
+                run_orchestration(
+                    "redteam", self._cfg(), self.FakeClient(), "different prompt",
+                    size=1, synth=False, checkpoint_path=path, resume=True,
+                )
+
+    def test_checkpoint_resume_rejects_unrelated_database(self):
+        from omnicli.orchestrate import run_orchestration
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "not-a-checkpoint.sqlite3"
+            import sqlite3
+            with sqlite3.connect(path) as connection:
+                connection.execute("CREATE TABLE unrelated (value TEXT)")
+            with self.assertRaisesRegex(ValueError, "Not an OmniCLI audit checkpoint"):
+                run_orchestration(
+                    "collaborate", self._cfg(), self.FakeClient(), "review module",
+                    size=1, synth=False, checkpoint_path=str(path), resume=True,
+                )
+
+    def test_checkpoint_resume_rejects_changed_run_options(self):
+        from omnicli.orchestrate import run_orchestration
+
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "audit.sqlite3")
+            run_orchestration(
+                "collaborate", self._cfg(), self.FakeClient(), "review module",
+                size=1, synth=False, checkpoint_path=path,
+            )
+            with self.assertRaisesRegex(ValueError, "run options must match"):
+                run_orchestration(
+                    "collaborate", self._cfg(), self.FakeClient(), "review module",
+                    size=1, synth=True, checkpoint_path=path, resume=True,
+                )
+
+    def test_checkpoint_resume_retries_only_failed_members(self):
+        from omnicli.orchestrate import run_orchestration
+
+        class OneTimeFailure(self.FakeClient):
+            def __init__(self):
+                super().__init__(record=[])
+                self.failed = False
+
+            def chat_complete(self, provider_id, messages, model=None, max_tokens=None, **kw):
+                self.record.append({"provider": provider_id, "model": model})
+                if model == "meta/llama-3.3-70b" and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("temporary provider failure")
+                return {"choices": [{"message": {"content": f"ans:{model}"}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "audit.sqlite3")
+            client = OneTimeFailure()
+            first = run_orchestration(
+                "collaborate", self._cfg(), client, "review module",
+                size=2, synth=False, checkpoint_path=path,
+            )
+            self.assertTrue(any(member["error"] for member in first["members"]))
+            self.assertEqual(first["events"][-1]["event"], "partial")
+            attempted_before_resume = len(client.record)
+
+            resumed = run_orchestration(
+                "collaborate", self._cfg(), client, "review module",
+                size=2, synth=False, checkpoint_path=path, resume=True,
+            )
+            self.assertEqual(len(client.record), attempted_before_resume + 1)
+            self.assertFalse(any(member["error"] for member in resumed["members"]))
+            self.assertEqual(resumed["events"][-1]["event"], "completed")
+
     def test_synthesize_merges_multiple(self):
         from omnicli.orchestrate import synthesize
         results = [
@@ -1428,10 +1555,11 @@ class TestSwarm(unittest.TestCase):
     def test_redteam_synthesis_audits_evidence_instead_of_counting_agreement(self):
         from omnicli.orchestrate import swarm_redteam
         rec = []
+        source_evidence = "review source\nSOURCE_EVIDENCE_SENTINEL = True"
         result = swarm_redteam(
             self._cfg(),
             self.FakeClient(record=rec),
-            "review source",
+            source_evidence,
             size=2,
             synth=True,
             judge=("p", "judge"),
@@ -1457,6 +1585,12 @@ class TestSwarm(unittest.TestCase):
         )
         self.assertIn("untrusted hypotheses", sys_prompt)
         self.assertIn("do not upgrade confidence", sys_prompt)
+        user_prompt = next(
+            message["content"] for message in synthesis[0]
+            if message.get("role") == "user"
+        )
+        self.assertIn("SOURCE_EVIDENCE_SENTINEL = True", user_prompt)
+        self.assertIn("ORIGINAL TASK AND EVIDENCE", user_prompt)
 
     def test_builder_swarm_alternates_roles(self):
         from omnicli.orchestrate import swarm_builder

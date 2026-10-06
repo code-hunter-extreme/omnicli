@@ -138,6 +138,7 @@ def run_swarm(
     swarm: Optional[List[Tuple[str, str]]] = None,
     size: Optional[int] = None,
     max_tokens: int = 512,
+    checkpoint: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Fan a prompt out to the swarm IN PARALLEL; one record per member, in swarm order."""
     swarm = swarm if swarm is not None else build_swarm(cfg, size=size)
@@ -145,11 +146,30 @@ def run_swarm(
         return []
     messages = ([{"role": "system", "content": system}] if system else []) + \
                [{"role": "user", "content": prompt}]
-    results: List[Dict[str, Any]] = []
+    saved = checkpoint.load_members() if checkpoint else {}
+    results: List[Dict[str, Any]] = [
+        saved[(provider, model)]
+        for provider, model in swarm
+        if (provider, model) in saved and not saved[(provider, model)].get("error")
+    ]
+    completed_pairs = {(r["provider"], r["model"]) for r in results}
+    pending = [
+        (provider, model)
+        for provider, model in swarm
+        if (provider, model) not in completed_pairs
+    ]
+    if not pending:
+        return results
     with cf.ThreadPoolExecutor(max_workers=max(1, len(swarm))) as ex:
-        futs = [ex.submit(_one_call, client, p, m, messages, max_tokens) for (p, m) in swarm]
-        for fut in cf.as_completed(futs):
-            results.append(fut.result())
+        futures = {
+            ex.submit(_one_call, client, provider, model, messages, max_tokens): (provider, model)
+            for provider, model in pending
+        }
+        for fut in cf.as_completed(futures):
+            result = fut.result()
+            results.append(result)
+            if checkpoint:
+                checkpoint.save_member(result)
     order = {(p, m): i for i, (p, m) in enumerate(swarm)}
     results.sort(key=lambda r: order.get((r["provider"], r["model"]), 1_000_000))
     return results
@@ -384,19 +404,27 @@ Agreement between models is not proof. Independently review every candidate and 
 
 def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = None,
                       max_tokens: int = 512, synth: bool = True,
-                      judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+                      judge: Optional[Tuple[str, str]] = None,
+                      checkpoint: Optional[Any] = None,
+                      swarm: Optional[List[Tuple[str, str]]] = None) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + synthesis."""
-    members = run_swarm(cfg, client, prompt, size=size, max_tokens=max_tokens)
+    members = run_swarm(
+        cfg, client, prompt, size=size, max_tokens=max_tokens,
+        checkpoint=checkpoint, swarm=swarm,
+    )
     final = synthesize(cfg, client, prompt, members, judge=judge) if synth else None
     return {"members": members, "final": final}
 
 
 def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                   max_tokens: int = 512, synth: bool = True,
-                  judge: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+                  judge: Optional[Tuple[str, str]] = None,
+                  checkpoint: Optional[Any] = None,
+                  swarm: Optional[List[Tuple[str, str]]] = None) -> Dict[str, Any]:
     """Multi-model red-team: different families review the target, then consolidate."""
     members = run_swarm(cfg, client, goal, system=_SWARM_REDTEAM_SYSTEM,
-                        size=size, max_tokens=max_tokens)
+                        size=size, max_tokens=max_tokens, checkpoint=checkpoint,
+                        swarm=swarm)
     for member in members:
         if member.get("answer"):
             member["answer"] = (
@@ -407,17 +435,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     final = None
     if synth:
         final = synthesize(
-            cfg, client,
-            f"Consolidate these independent red-team reviews of: {goal}. "
-            "Audit each proposed finding against the original evidence. Require "
-            "verbatim evidence and a concrete input-to-impact path for PROVEN. "
-            "Do not invent findings or upgrade confidence based on repetition. "
-            "Keep conditional claims PLAUSIBLE and explain missing prerequisites. "
-            "Preserve disagreement; if nothing meets the proof bar, state that no "
-            "actionable finding was proven.",
-            members,
-            judge=judge,
-            redteam=True,
+            cfg, client, goal, members, judge=judge, redteam=True,
         )
         final = (
             "NOTICE: This is an AI-generated red-team hypothesis review, not a "
@@ -438,29 +456,43 @@ def swarm_builder(
     max_tokens: int = 512,
     synth: bool = True,
     judge: Optional[Tuple[str, str]] = None,
+    checkpoint: Optional[Any] = None,
+    swarm: Optional[List[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Builder mode: builders propose solutions while red-teamers stress-test in parallel,
     synthesized into a hardened, battle-tested solution."""
     effective_size = 4 if size is None else max(2, size)
-    swarm = build_swarm(cfg, size=effective_size)
+    swarm = swarm if swarm is not None else build_swarm(cfg, size=effective_size)
     if not swarm:
         return {"members": [], "final": None}
 
-    results: List[Dict[str, Any]] = []
+    saved = checkpoint.load_members() if checkpoint else {}
+    results: List[Dict[str, Any]] = [
+        saved[(p, m)]
+        for p, m in swarm
+        if (p, m) in saved and not saved[(p, m)].get("error")
+    ]
+    completed_pairs = {(r["provider"], r["model"]) for r in results}
     with cf.ThreadPoolExecutor(max_workers=max(1, len(swarm))) as ex:
-        futs = []
+        futs = {}
         for i, (p, m) in enumerate(swarm):
+            if (p, m) in completed_pairs:
+                continue
             role = "BUILDER" if (i % 2 == 0) else "REDTEAM"
             sys_prompt = _SWARM_BUILDER_SYSTEM if role == "BUILDER" else _SWARM_BREAKER_SYSTEM
             messages = [
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ]
-            futs.append((role, ex.submit(_one_call, client, p, m, messages, max_tokens)))
-        for role, fut in futs:
+            fut = ex.submit(_one_call, client, p, m, messages, max_tokens)
+            futs[fut] = (role, p, m)
+        for fut in cf.as_completed(futs):
+            role, p, m = futs[fut]
             res = fut.result()
             res["role"] = role
             results.append(res)
+            if checkpoint:
+                checkpoint.save_member(res)
 
     order = {(p, m): i for i, (p, m) in enumerate(swarm)}
     results.sort(key=lambda r: order.get((r["provider"], r["model"]), 1_000_000))
@@ -487,20 +519,100 @@ def run_orchestration(
     max_tokens: int = 512,
     synth: bool = True,
     judge: Optional[Tuple[str, str]] = None,
+    checkpoint_path: Optional[str] = None,
+    resume: bool = False,
+    provider: Optional[str] = None,
+    swarm: Optional[List[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for swarm modes: 'collaborate', 'builder', 'redteam'."""
     enriched = enrich_prompt_with_files(prompt)
     normalized = (mode or "collaborate").lower().strip()
-    if normalized in ("builder", "build", "b"):
-        res = swarm_builder(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
-    elif normalized in ("redteam", "red", "rt"):
-        res = swarm_redteam(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
-        if synth and res.get("final"):
-            try:
-                rep_path = generate_redteam_report(prompt, res["final"], res.get("members", []))
-                res["report_path"] = str(rep_path)
-            except Exception:
-                pass
+    if swarm is not None:
+        selected_swarm = list(swarm)
+    elif normalized in ("builder", "build", "b"):
+        selected_swarm = build_swarm(
+            cfg, size=4 if size is None else max(2, size), provider=provider
+        )
     else:
-        res = swarm_collaborate(cfg, client, enriched, size=size, max_tokens=max_tokens, synth=synth, judge=judge)
-    return res
+        selected_swarm = build_swarm(cfg, size=size, provider=provider)
+    checkpoint = None
+    if checkpoint_path:
+        from omnicli.audit_state import AuditCheckpoint
+        checkpoint = AuditCheckpoint(
+            checkpoint_path,
+            normalized,
+            enriched,
+            resume=resume,
+            options={
+                "synth": synth,
+                "max_tokens": max_tokens,
+                "swarm": selected_swarm,
+            },
+        )
+
+    try:
+        if checkpoint and checkpoint.completed:
+            members = list(checkpoint.load_members().values())
+            if normalized in ("redteam", "red", "rt"):
+                for member in members:
+                    if member.get("answer"):
+                        member["answer"] = (
+                            "UNVERIFIED MODEL HYPOTHESES — no deterministic security "
+                            "verification was performed for this member's claims.\n\n"
+                            + member["answer"]
+                        )
+            result = {
+                "members": members,
+                "final": checkpoint.final,
+                "run_id": checkpoint.run_id,
+                "events": checkpoint.events(),
+            }
+            if normalized in ("redteam", "red", "rt") and result["final"]:
+                report = generate_redteam_report(
+                    prompt, result["final"], result["members"]
+                )
+                result["report_path"] = str(report)
+            return result
+
+        if checkpoint:
+            checkpoint.record_event("collection_started", {"members": len(selected_swarm)})
+
+        if normalized in ("builder", "build", "b"):
+            res = swarm_builder(
+                cfg, client, enriched, size=size, max_tokens=max_tokens,
+                synth=synth, judge=judge, checkpoint=checkpoint,
+                swarm=selected_swarm,
+            )
+        elif normalized in ("redteam", "red", "rt"):
+            res = swarm_redteam(
+                cfg, client, enriched, size=size, max_tokens=max_tokens,
+                synth=synth, judge=judge, checkpoint=checkpoint,
+                swarm=selected_swarm,
+            )
+            if synth and res.get("final"):
+                rep_path = generate_redteam_report(
+                    prompt, res["final"], res.get("members", [])
+                )
+                res["report_path"] = str(rep_path)
+        else:
+            res = swarm_collaborate(
+                cfg, client, enriched, size=size, max_tokens=max_tokens,
+                synth=synth, judge=judge, checkpoint=checkpoint,
+                swarm=selected_swarm,
+            )
+
+        if checkpoint:
+            checkpoint.record_event(
+                "synthesis_completed" if synth else "synthesis_skipped", {}
+            )
+            checkpoint.save_final(res.get("final"))
+            res["run_id"] = checkpoint.run_id
+            res["events"] = checkpoint.events()
+        return res
+    except Exception as exc:
+        if checkpoint:
+            checkpoint.mark_failed(str(exc))
+        raise
+    finally:
+        if checkpoint:
+            checkpoint.close()

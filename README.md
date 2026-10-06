@@ -222,6 +222,10 @@ External tools connect to `http://localhost:8000/v1` and route by prefix, e.g.
   execution sinks. Results are candidate source evidence, not confirmed
   vulnerabilities; indirect flows and framework-specific wrappers may be
   missed, and no finding is not proof of safety.
+- Red-team swarm synthesis now receives the original enriched task/source
+  evidence separately from the untrusted member hypotheses, rather than only a
+  consolidation instruction. This improves grounding but remains model
+  synthesis, not deterministic vulnerability proof.
 - Run it directly with `omni verify python-sql path/to/module.py` (optionally
   scoped with `--function name`).
 - Chat-completion requests retry transient rate-limit, server, and network
@@ -229,7 +233,37 @@ External tools connect to `http://localhost:8000/v1` and route by prefix, e.g.
   using the configured model fallback roster. Permanent client errors are not
   retried, and model calls are not silently redirected to an unconfigured
   provider.
+- Swarm runs can opt in to private local SQLite checkpoints and lifecycle events:
+
+  ```bash
+  omni swarm --mode redteam --checkpoint ./audit-run.sqlite3 "Review ./src"
+  omni swarm --mode redteam --checkpoint ./audit-run.sqlite3 --resume "Review ./src"
+  ```
+
+  Checkpoints store the prompt (which can include source code) and model
+  responses on disk, unencrypted. Protect the file accordingly. Resume requires
+  the same mode, prompt, model roster, and run options; it reuses successful
+  member results and retries failed members. No checkpoint is written unless
+  `--checkpoint` is provided.
 - Verification fails **closed**: no proof means no pass.
 - Memory/history files are owner-only.
 
 See `docs/memory_heartbeat_plan.md` for the memory/heartbeat design.
+
+### Native orchestration patterns
+
+OmniCLI adapts selected patterns from the reviewed projects without importing
+their frameworks as runtime dependencies:
+
+| Reference | OmniCLI application | State |
+|---|---|---|
+| Agent Squad, TrustGraph | Keep original source/evidence available to the synthesis step and clearly isolate untrusted model hypotheses. | Implemented; deterministic citation validation remains future work. |
+| Microsoft Agent Framework, LangGraph | Opt-in local run checkpoints, resumable successful members, retry of failed members, and ordered lifecycle events. | Implemented for swarm runs. |
+| Dynamiq | Dependency-aware execution and explicit detection of conflicting parallel updates. | Planned. |
+| Solace Agent Mesh | Event-driven visibility into run/member/synthesis lifecycle without requiring its deprecated Python runtime. | Basic local event log implemented; external event transport is not. |
+| LiteLLM | Bounded shared provider retries and transparent configured-roster failover. | Shared retry transport implemented; broader adapter unification remains planned. |
+| RouteLLM | Choose models using measured audit quality and cost, not intuition or general-chat scores. | Deferred until a labeled security-audit evaluation set exists. |
+
+Checkpoint files contain prompts (which may include source code) and model
+responses in plaintext. They are opt-in and created with owner-only file
+permissions; do not store sensitive prompts in a location accessible to others.
