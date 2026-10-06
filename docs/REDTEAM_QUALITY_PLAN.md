@@ -64,10 +64,15 @@ upstream notices separately before considering reuse.
 
 - Implemented: source citation grounding, fail-closed evidence gate, staged
   attack/challenge orchestration, conservative Python route facts.
-- Current development benchmark: 12 self-authored, labeled cases (6 positive,
-  6 benign) with exact source-line evidence, split/category/severity metadata,
-  positive preconditions, and clean-case rationales. It is a tuning fixture,
+- Current development benchmark: 24 self-authored, labeled cases (12 positive,
+  12 benign) with exact source-line evidence, split/category/severity metadata,
+  positive preconditions, and clean-case rationales. It includes sink-control
+  near misses and same-module auth-hook context cases. It is a tuning fixture,
   not a held-out benchmark.
+- Development-only tuning observation: the local static baseline now detects
+  12/12 labeled positives with 0/12 benign-case false positives on this 24-case
+  fixture. These cases were used to develop the analyzer; this score is
+  expected to be optimistic and is not a quality-gate result.
 - Implemented evaluation increment: repeated direct and staged trials; exact
   category/file/line/evidence scoring; per-category counts, clean-case
   specificity, separately measured source-line quote accuracy, 95% Wilson
@@ -76,9 +81,10 @@ upstream notices separately before considering reuse.
   the same source cases; stage failures fail the trial. A local deterministic
   pattern-based baseline also runs on the same cases, remains a heuristic, and
   is excluded from model recommendations. `--quality-gate --split held_out`
-  checks the minimum data/model/repetition requirements, pooled thresholds,
-  mode recall non-regression, and emits per-category scores and intervals;
-  failure exits with code 2.
+  first checks dataset size, recognized model-family count, and repetitions
+  before any provider calls, then checks paired healthy-mode trials, pooled
+  thresholds, and mode recall non-regression. It emits per-category scores and
+  intervals; failure exits with code 2.
 - Implemented context increment: source facts now expose function-local
   request-derived variables, selected security sinks/call sites, and
   same-module request hooks. Hooks are surfaced as context, not treated as

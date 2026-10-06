@@ -554,24 +554,88 @@ def _deterministic_findings(case: Dict[str, Any]) -> List[Dict[str, Any]]:
             "password", "secret", "token", "credential", "ssn", "private_key",
             "api_key",
         }
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Return) or node.value is None:
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            reads_environment = any(
-                isinstance(item, ast.Attribute)
-                and isinstance(item.value, ast.Name)
-                and item.value.id == "os"
-                and item.attr == "environ"
-                for item in ast.walk(node.value)
-            )
-            returns_sensitive_key = any(
-                isinstance(item, ast.Constant)
-                and isinstance(item.value, str)
-                and any(marker in item.value.lower() for marker in sensitive_names)
-                for item in ast.walk(node.value)
-            )
-            if reads_environment and returns_sensitive_key:
-                emit("sensitive_data_exposure", node.lineno)
+            assignments = [
+                node for node in ast.walk(function)
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+            ]
+            secret_variables = set()
+            dependencies: Dict[str, set[str]] = {}
+            for assignment in assignments:
+                value = assignment.value
+                if value is None:
+                    continue
+                targets = (
+                    assignment.targets if isinstance(assignment, ast.Assign)
+                    else [assignment.target]
+                )
+                target_names = {
+                    target.id for target in targets if isinstance(target, ast.Name)
+                }
+                value_names = {
+                    node.id for node in ast.walk(value)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                }
+                dependencies.update({
+                    name: value_names for name in target_names
+                })
+                reads_environment = any(
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "os"
+                    and node.attr == "environ"
+                    for node in ast.walk(value)
+                ) or any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"
+                    and node.func.attr == "getenv"
+                    for node in ast.walk(value)
+                )
+                names_sensitive_value = any(
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and any(marker in node.value.lower() for marker in sensitive_names)
+                    for node in ast.walk(value)
+                ) or any(
+                    any(marker in name.lower() for marker in sensitive_names)
+                    for name in target_names
+                )
+                if reads_environment and names_sensitive_value:
+                    secret_variables.update(target_names)
+            for _ in range(len(dependencies)):
+                for target_name, value_names in dependencies.items():
+                    if value_names.intersection(secret_variables):
+                        secret_variables.add(target_name)
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Return) or node.value is None:
+                    continue
+                returned_variables = {
+                    child.id for child in ast.walk(node.value)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                }
+                direct_secret_return = any(
+                    isinstance(child, ast.Attribute)
+                    and isinstance(child.value, ast.Name)
+                    and child.value.id == "os"
+                    and child.attr == "environ"
+                    for child in ast.walk(node.value)
+                )
+                direct_secret_key = any(
+                    isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                    and any(marker in child.value.lower() for marker in sensitive_names)
+                    for child in ast.walk(node.value)
+                )
+                if (
+                    direct_secret_return and direct_secret_key
+                    or isinstance(node.value, ast.Name)
+                    and bool(returned_variables.intersection(secret_variables))
+                ):
+                    emit("sensitive_data_exposure", node.lineno)
 
     return findings
 

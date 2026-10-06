@@ -680,6 +680,59 @@ class TestCliModeWiring(unittest.TestCase):
         self.assertTrue(kwargs["allow_mutating_http"])
         runner_cls.return_value.run.assert_called_once_with("audit this")
 
+    def test_quality_gate_rejects_small_dataset_before_provider_calls(self):
+        import json
+
+        cases = [
+            {
+                "id": "positive",
+                "split": "held_out",
+                "category": "sql_injection",
+                "severity": "high",
+                "prompt": "Review for injection.",
+                "file": "app.py",
+                "source": "execute(user_value)\n",
+                "expected_findings": [{
+                    "category": "sql_injection",
+                    "file": "app.py",
+                    "line": 1,
+                    "evidence": "execute(user_value)",
+                    "preconditions": "The value is controlled by an untrusted caller.",
+                }],
+                "benign_rationale": None,
+            },
+            {
+                "id": "benign",
+                "split": "held_out",
+                "category": "safe_query",
+                "severity": "none",
+                "prompt": "Review this safe query.",
+                "file": "safe.py",
+                "source": "execute('fixed')\n",
+                "expected_findings": [],
+                "benign_rationale": "The argument is a fixed literal.",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            dataset = Path(td) / "cases.jsonl"
+            dataset.write_text(
+                "\n".join(json.dumps(case) for case in cases) + "\n",
+                encoding="utf-8",
+            )
+            with patch("omnicli.cli.client.chat_complete") as chat:
+                result = self.runner.invoke(
+                    self.main,
+                    [
+                        "evaluate-security", "--dataset", str(dataset),
+                        "--model", "provider:openai/gpt-4o",
+                        "--staged-redteam", "--quality-gate",
+                        "--split", "held_out",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("before making model calls", result.output)
+        chat.assert_not_called()
+
     def test_python_sql_analyzer_cli_reports_candidates_as_unconfirmed(self):
         import json
         with tempfile.TemporaryDirectory() as td:
@@ -2151,9 +2204,9 @@ class TestSecurityEvaluation(unittest.TestCase):
 
         path = Path(__file__).parent / "fixtures" / "redteam" / "cases.dev.jsonl"
         cases = load_security_dataset(str(path))
-        self.assertEqual(len(cases), 12)
+        self.assertEqual(len(cases), 24)
         self.assertTrue(all(case["split"] == "development" for case in cases))
-        self.assertEqual(sum(bool(case["expected_findings"]) for case in cases), 6)
+        self.assertEqual(sum(bool(case["expected_findings"]) for case in cases), 12)
 
     def test_gold_evidence_must_match_its_labeled_line(self):
         from omnicli.evaluation import load_security_dataset
@@ -2491,11 +2544,61 @@ class TestSecurityEvaluation(unittest.TestCase):
         )
         baseline = evaluate_deterministic_security(cases, repetitions=2)
         self.assertEqual(baseline["method"], "deterministic_static_baseline")
-        self.assertEqual((baseline["cases"], baseline["unique_cases"]), (24, 12))
+        self.assertEqual((baseline["cases"], baseline["unique_cases"]), (48, 24))
         self.assertEqual(baseline["errors"], 0)
         self.assertGreater(baseline["true_positives"], 0)
-        self.assertEqual(len(baseline["case_results"]), 24)
+        self.assertEqual(len(baseline["case_results"]), 48)
         self.assertIsNone(recommend_model({"models": [baseline]}, minimum_cases=1))
+
+    def test_static_baseline_tracks_intermediate_sql_shell_and_secret_values(self):
+        from omnicli.evaluation import _deterministic_findings
+
+        sql_case = {
+            "id": "sql-flow",
+            "file": "sql.py",
+            "source": (
+                "def search(cursor, request):\n"
+                "    name = request.args['name']\n"
+                "    query = 'SELECT ' + name\n"
+                "    return cursor.execute(query)\n"
+            ),
+            "expected_findings": [],
+        }
+        shell_case = {
+            "id": "shell-flow",
+            "file": "shell.py",
+            "source": (
+                "import os\n"
+                "def run(request):\n"
+                "    action = request.args['action']\n"
+                "    command = 'service ' + action\n"
+                "    return os.system(command)\n"
+            ),
+            "expected_findings": [],
+        }
+        secret_case = {
+            "id": "secret-flow",
+            "file": "secret.py",
+            "source": (
+                "import os\n"
+                "def diagnostics():\n"
+                "    details = {'service_token': os.environ.get('SERVICE_TOKEN')}\n"
+                "    return details\n"
+            ),
+            "expected_findings": [],
+        }
+        self.assertEqual(
+            [finding["category"] for finding in _deterministic_findings(sql_case)],
+            ["sql_injection"],
+        )
+        self.assertEqual(
+            [finding["category"] for finding in _deterministic_findings(shell_case)],
+            ["command_injection"],
+        )
+        self.assertEqual(
+            [finding["category"] for finding in _deterministic_findings(secret_case)],
+            ["sensitive_data_exposure"],
+        )
 
 
 class TestSwarm(unittest.TestCase):

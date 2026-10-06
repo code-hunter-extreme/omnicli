@@ -181,6 +181,7 @@ def analyze_python_security_facts(
                 ]
                 dependencies: Dict[str, set[str]] = {}
                 request_derived = set()
+                dynamic_variables = set()
                 for assignment in assignments:
                     value = assignment.value
                     if value is None:
@@ -200,10 +201,17 @@ def analyze_python_security_facts(
                         dependencies.setdefault(target_name, set()).update(value_names)
                         if request_input_expression(value):
                             request_derived.add(target_name)
+                        if any(
+                            isinstance(item, (ast.JoinedStr, ast.BinOp))
+                            for item in ast.walk(value)
+                        ):
+                            dynamic_variables.add(target_name)
                 for _ in range(len(dependencies)):
                     for target_name, value_names in dependencies.items():
                         if value_names.intersection(request_derived):
                             request_derived.add(target_name)
+                        if value_names.intersection(dynamic_variables):
+                            dynamic_variables.add(target_name)
                 request_inputs = sorted({
                     name for name in names
                     if name.split(".")[0] in {"request", "req"}
@@ -251,8 +259,8 @@ def analyze_python_security_facts(
                                 isinstance(child, (ast.JoinedStr, ast.BinOp))
                                 for argument in item.args
                                 for child in ast.walk(argument)
-                            ),
-                            "shell_enabled": any(
+                            ) or bool(set(argument_names).intersection(dynamic_variables)),
+                            "shell_enabled": dotted_name(item.func) in {"os.system", "os.popen"} or any(
                                 keyword.arg == "shell"
                                 and isinstance(keyword.value, ast.Constant)
                                 and keyword.value.value is True
@@ -281,6 +289,7 @@ def analyze_python_security_facts(
                     "same_module_request_hooks": request_hooks,
                     "request_input_accesses": request_inputs,
                     "request_derived_variables": sorted(request_derived),
+                    "dynamic_variables": sorted(dynamic_variables),
                     "security_sinks": sinks,
                     "request_derived_sinks": [
                         sink for sink in sinks
@@ -304,6 +313,7 @@ def analyze_python_security_facts(
             ]
             dependencies: Dict[str, set[str]] = {}
             request_derived = set()
+            dynamic_variables = set()
             for assignment in assignment_nodes:
                 value = assignment.value
                 if value is None:
@@ -323,10 +333,17 @@ def analyze_python_security_facts(
                     dependencies.setdefault(target_name, set()).update(value_names)
                     if request_input_expression(value):
                         request_derived.add(target_name)
+                    if any(
+                        isinstance(item, (ast.JoinedStr, ast.BinOp))
+                        for item in ast.walk(value)
+                    ):
+                        dynamic_variables.add(target_name)
             for _ in range(len(dependencies)):
                 for target_name, value_names in dependencies.items():
                     if value_names.intersection(request_derived):
                         request_derived.add(target_name)
+                    if value_names.intersection(dynamic_variables):
+                        dynamic_variables.add(target_name)
 
             sinks = []
             for call in calls_in_function:
@@ -349,8 +366,8 @@ def analyze_python_security_facts(
                         isinstance(child, (ast.JoinedStr, ast.BinOp))
                         for argument in call.args
                         for child in ast.walk(argument)
-                    ),
-                    "shell_enabled": any(
+                    ) or bool(set(argument_names).intersection(dynamic_variables)),
+                    "shell_enabled": dotted_name(call.func) in {"os.system", "os.popen"} or any(
                         keyword.arg == "shell"
                         and isinstance(keyword.value, ast.Constant)
                         and keyword.value.value is True
@@ -380,6 +397,7 @@ def analyze_python_security_facts(
                 }),
                 "call_sites": function_calls,
                 "request_derived_variables": sorted(request_derived),
+                "dynamic_variables": sorted(dynamic_variables),
                 "security_sinks": sinks,
             })
         reports.append({"file": path, "routes": routes, "functions": functions})

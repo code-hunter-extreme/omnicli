@@ -642,6 +642,29 @@ def cmd_evaluate_security(
         cases = [case for case in cases if case.get("split") == split]
         if not cases:
             raise click.ClickException(f"Dataset contains no cases in the {split!r} split.")
+    if quality_gate:
+        positive_count = sum(bool(case["expected_findings"]) for case in cases)
+        benign_count = len(cases) - positive_count
+        if positive_count < 30 or benign_count < 30:
+            raise click.ClickException(
+                "Quality gate needs at least 30 positive and 30 benign held-out cases "
+                f"before making model calls; found {positive_count} positive and "
+                f"{benign_count} benign."
+            )
+        from omnicli.scanner import classify_family
+        families = {
+            classify_family(model_id)
+            for _provider, model_id in models
+        } - {"other"}
+        if len(families) < 3:
+            raise click.ClickException(
+                "Quality gate needs models from at least three recognized model "
+                f"families before making calls; found {len(families)}."
+            )
+        if repetitions < 2:
+            raise click.ClickException(
+                "Quality gate needs at least two repetitions before making model calls."
+            )
     staged_results = []
     try:
         with console.status(
