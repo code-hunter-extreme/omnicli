@@ -733,6 +733,23 @@ class TestCliModeWiring(unittest.TestCase):
         self.assertIn("before making model calls", result.output)
         chat.assert_not_called()
 
+    def test_quality_gate_rejects_provisional_full_benchmark_before_provider_calls(self):
+        dataset = Path(__file__).parent / "fixtures" / "redteam" / "cases.held_out.provisional.jsonl"
+        with patch("omnicli.cli.client.chat_complete") as chat:
+            result = self.runner.invoke(
+                self.main,
+                [
+                    "evaluate-security", "--dataset", str(dataset),
+                    "--model", "p:openai/gpt-4o",
+                    "--model", "q:meta/llama-3.3",
+                    "--model", "r:anthropic/claude-3.7",
+                    "--staged-redteam", "--quality-gate", "--split", "held_out",
+                ],
+            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("two-person independent adjudication", result.output)
+        chat.assert_not_called()
+
     def test_python_sql_analyzer_cli_reports_candidates_as_unconfirmed(self):
         import json
         with tempfile.TemporaryDirectory() as td:
@@ -2208,6 +2225,17 @@ class TestSecurityEvaluation(unittest.TestCase):
         self.assertTrue(all(case["split"] == "development" for case in cases))
         self.assertEqual(sum(bool(case["expected_findings"]) for case in cases), 12)
 
+    def test_heldout_corpus_is_provisional_and_balanced(self):
+        from omnicli.evaluation import load_security_dataset
+
+        path = Path(__file__).parent / "fixtures" / "redteam" / "cases.held_out.provisional.jsonl"
+        cases = load_security_dataset(str(path))
+        self.assertEqual(len(cases), 60)
+        self.assertEqual(sum(bool(case["expected_findings"]) for case in cases), 30)
+        self.assertEqual(sum(not case["expected_findings"] for case in cases), 30)
+        self.assertTrue(all(case["adjudication_status"] == "provisional" for case in cases))
+        self.assertTrue(all(case["reviewer_count"] == 1 for case in cases))
+
     def test_gold_evidence_must_match_its_labeled_line(self):
         from omnicli.evaluation import load_security_dataset
         import json
@@ -2358,11 +2386,15 @@ class TestSecurityEvaluation(unittest.TestCase):
             cases.append({
                 "id": f"positive-{index}",
                 "split": "held_out",
+                "adjudication_status": "independently_reviewed",
+                "reviewer_count": 2,
                 "expected_findings": [{"category": "sql_injection"}],
             })
             cases.append({
                 "id": f"benign-{index}",
                 "split": "held_out",
+                "adjudication_status": "independently_reviewed",
+                "reviewer_count": 2,
                 "expected_findings": [],
             })
         model_pairs = [
@@ -2413,6 +2445,27 @@ class TestSecurityEvaluation(unittest.TestCase):
         self.assertEqual(failing["status"], "FAIL")
         self.assertTrue(any("recall" in reason for reason in failing["failures"]))
         self.assertTrue(any("regresses" in reason for reason in failing["failures"]))
+
+    def test_quality_gate_rejects_provisional_labels(self):
+        from omnicli.evaluation import assess_redteam_quality_gate
+
+        case = {
+            "id": "provisional",
+            "split": "held_out",
+            "adjudication_status": "provisional",
+            "reviewer_count": 1,
+            "expected_findings": [{"category": "sql_injection"}],
+        }
+        result = assess_redteam_quality_gate(
+            [case],
+            [],
+            [],
+            minimum_per_class=0,
+            minimum_families=0,
+            minimum_repetitions=1,
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(any("two reviewers" in failure for failure in result["failures"]))
 
     def test_unmatched_quote_counts_false_positive_and_false_negative(self):
         from omnicli.evaluation import evaluate_security_models, load_security_dataset

@@ -60,6 +60,18 @@ upstream notices separately before considering reuse.
    authorized target-to-reproducible-finding workflow. OmniCLI may be used
    internally by Oracle; OmniCLI must not depend on or call Oracle.
 
+### Held-out adjudication procedure
+
+The second reviewer should work from a copy with `expected_findings`,
+`benign_rationale`, and severity concealed. Independently record finding
+category, exact file/line/evidence, impact and required attacker preconditions,
+or explain why the case is benign. Compare both label sets only after the
+independent pass. Resolve disagreements in writing; remove ambiguous cases
+from the held-out set rather than tuning the implementation to them. Mark cases
+`independently_reviewed` with `reviewer_count: 2` only after the comparison and
+resolution are complete. Do not edit held-out labels after evaluating model
+outputs; disputed cases return to development and require a new held-out case.
+
 ## Current status
 
 - Implemented: source citation grounding, fail-closed evidence gate, staged
@@ -73,6 +85,12 @@ upstream notices separately before considering reuse.
   12/12 labeled positives with 0/12 benign-case false positives on this 24-case
   fixture. These cases were used to develop the analyzer; this score is
   expected to be optimistic and is not a quality-gate result.
+- A separate 60-case held-out candidate set now exists at
+  `tests/fixtures/redteam/cases.held_out.provisional.jsonl` (30 positive, 30
+  benign across six source-security categories). It is explicitly marked
+  `provisional` with one reviewer; the CLI and gate refuse to make provider
+  calls or pass the gate until a second reviewer has independently checked
+  every label and the records are updated to two-person reviewed status.
 - Implemented evaluation increment: repeated direct and staged trials; exact
   category/file/line/evidence scoring; per-category counts, clean-case
   specificity, separately measured source-line quote accuracy, 95% Wilson
@@ -82,9 +100,10 @@ upstream notices separately before considering reuse.
   pattern-based baseline also runs on the same cases, remains a heuristic, and
   is excluded from model recommendations. `--quality-gate --split held_out`
   first checks dataset size, recognized model-family count, and repetitions
-  before any provider calls, then checks paired healthy-mode trials, pooled
-  thresholds, and mode recall non-regression. It emits per-category scores and
-  intervals; failure exits with code 2.
+  and two-person adjudication metadata before any provider calls, then checks
+  paired healthy-mode trials, pooled thresholds, and mode recall
+  non-regression. Provisional labels cannot pass. It emits per-category scores
+  and intervals; failure exits with code 2.
 - Implemented context increment: source facts now expose function-local
   request-derived variables, selected security sinks/call sites, and
   same-module request hooks. Hooks are surfaced as context, not treated as
@@ -104,6 +123,9 @@ upstream notices separately before considering reuse.
   12-case fixture is deliberately only a development smoke set. No cross-family
   live trials have been run; the quality gate is not met. Do not promote
   development cases into held-out merely to satisfy its numeric threshold.
+- User can arrange an additional model family and a second reviewer. Those
+  prerequisites are not yet configured/completed, so no held-out model calls
+  have been made.
 
 ## Next execution batch
 

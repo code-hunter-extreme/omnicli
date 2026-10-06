@@ -58,6 +58,24 @@ def load_security_dataset(path: str) -> List[Dict[str, Any]]:
         if split is not None:
             if not isinstance(case.get("category"), str) or not case["category"].strip():
                 raise ValueError(f"Dataset case {case_id} needs a category.")
+            adjudication_status = case.get("adjudication_status")
+            reviewer_count = case.get("reviewer_count")
+            if adjudication_status is not None and adjudication_status not in {
+                "provisional", "independently_reviewed",
+            }:
+                raise ValueError(
+                    f"Dataset case {case_id} has an invalid adjudication_status."
+                )
+            if reviewer_count is not None and (
+                not isinstance(reviewer_count, int)
+                or isinstance(reviewer_count, bool)
+                or reviewer_count < 1
+            ):
+                raise ValueError(f"Dataset case {case_id} has invalid reviewer_count.")
+            if adjudication_status == "independently_reviewed" and reviewer_count != 2:
+                raise ValueError(
+                    f"Independently reviewed case {case_id} must record reviewer_count 2."
+                )
             if findings:
                 if not isinstance(case.get("severity"), str) or not case["severity"].strip():
                     raise ValueError(f"Positive dataset case {case_id} needs a severity.")
@@ -1024,6 +1042,14 @@ def assess_redteam_quality_gate(
     failures = []
     if not cases or any(case.get("split") != "held_out" for case in cases):
         failures.append("Quality-gate evaluation requires only held_out cases.")
+    if any(
+        case.get("adjudication_status") != "independently_reviewed"
+        or case.get("reviewer_count") != 2
+        for case in cases
+    ):
+        failures.append(
+            "Every held-out case must be independently adjudicated by two reviewers."
+        )
     positive_cases = sum(bool(case.get("expected_findings")) for case in cases)
     benign_cases = len(cases) - positive_cases
     if positive_cases < minimum_per_class:

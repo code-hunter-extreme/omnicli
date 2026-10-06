@@ -398,6 +398,11 @@ representative cases. The self-authored development fixtures at
 `tests/fixtures/redteam/cases.dev.jsonl` are for tuning, not a held-out quality
 claim. See `docs/REDTEAM_QUALITY_PLAN.md` for
 the bounded transition gate and current limitations.
+The candidate 60-case held-out set in
+`tests/fixtures/redteam/cases.held_out.provisional.jsonl` is provisional, not
+approved for scoring. A second reviewer must independently verify every gold
+label, line, rationale, and precondition before updating its adjudication
+metadata; the gate refuses to call providers on provisional labels.
 
 To run the transition check after assembling a held-out JSONL set:
 
@@ -416,6 +421,8 @@ omni evaluate-security \
 
 The gate requires at least 30 positive and 30 benign held-out cases, paired
 single-pass/staged results from at least three healthy model families, and two
-or more repetitions. It exits with status 2 on failure. A pass is bounded to
-those labels, models, and settings; it does not establish universal audit
-quality.
+or more repetitions. Every held-out case must also record
+`"adjudication_status":"independently_reviewed"` and `"reviewer_count":2`;
+provisional labels are rejected before provider calls. It exits with status 2
+on failure. A pass is bounded to those labels, models, and settings; it does
+not establish universal audit quality.

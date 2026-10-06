@@ -651,6 +651,15 @@ def cmd_evaluate_security(
                 f"before making model calls; found {positive_count} positive and "
                 f"{benign_count} benign."
             )
+        if any(
+            case.get("adjudication_status") != "independently_reviewed"
+            or case.get("reviewer_count") != 2
+            for case in cases
+        ):
+            raise click.ClickException(
+                "Quality gate requires two-person independent adjudication for "
+                "every held-out case before making model calls."
+            )
         from omnicli.scanner import classify_family
         families = {
             classify_family(model_id)
