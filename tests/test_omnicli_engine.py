@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from omnicli.scanner import classify_family, build_roster_and_panel
-from omnicli.deterministic import CodeVerifier, CrossModelConsensusVerifier
+from omnicli.deterministic import (
+    CodeVerifier, PythonSecurityAnalyzer, CrossModelConsensusVerifier,
+)
 
 
 # ── Scanner ──────────────────────────────────────────────────────────────────
@@ -309,6 +311,103 @@ class TestCodeVerifierPathGuard(unittest.TestCase):
             )
 
 
+class TestPythonSecurityAnalyzer(unittest.TestCase):
+    def analyze(self, source, target_function=None):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "sample.py"
+            path.write_text(source, encoding="utf-8")
+            return PythonSecurityAnalyzer.analyze_file(
+                str(path), allowed_dirs=[Path(td)], target_function=target_function
+            )
+
+    def test_flags_fstring_argument_interpolated_into_execute(self):
+        result = self.analyze(
+            'def lookup(user_id):\n'
+            '    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")\n'
+        )
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(result["findings"][0]["kind"], "possible_sql_injection")
+        self.assertEqual(result["findings"][0]["line"], 2)
+        self.assertIn("user_id", result["findings"][0]["source_parameters"])
+        self.assertIn("does not establish", result["limitations"][1])
+
+    def test_propagates_tainted_value_through_local_query_assignment(self):
+        result = self.analyze(
+            'def lookup(user_id):\n'
+            '    query = "SELECT * FROM users WHERE id = " + user_id\n'
+            '    cursor.execute(query)\n'
+        )
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(result["findings"][0]["line"], 3)
+
+    def test_flags_request_field_interpolation(self):
+        result = self.analyze(
+            'def lookup(request):\n'
+            '    cursor.execute("SELECT * FROM users WHERE id = " + request.args["id"])\n'
+        )
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+
+    def test_flags_raw_request_query_and_string_formatting(self):
+        result = self.analyze(
+            'def lookup(request):\n'
+            '    cursor.execute(request.args["sql"])\n'
+            'def by_id(user_id):\n'
+            '    cursor.execute("SELECT * FROM users WHERE id = {}".format(user_id))\n'
+            'def by_name(name):\n'
+            '    cursor.execute("SELECT * FROM users WHERE name = %s" % name)\n'
+        )
+        self.assertEqual(result["status"], "CANDIDATES_FOUND")
+        self.assertEqual(
+            {item["function"] for item in result["findings"]},
+            {"lookup", "by_id", "by_name"},
+        )
+
+    def test_parameterized_constant_query_is_not_flagged(self):
+        result = self.analyze(
+            'def lookup(user_id):\n'
+            '    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))\n'
+        )
+        self.assertEqual(result["status"], "NO_PATTERN_FOUND")
+        self.assertFalse(result["findings"])
+        self.assertIn("does not prove", result["limitations"][-1])
+
+    def test_does_not_treat_instance_receiver_as_untrusted_input(self):
+        result = self.analyze(
+            'class Repository:\n'
+            '    def lookup(self):\n'
+            '        cursor.execute(f"SELECT {self.table}")\n'
+        )
+        self.assertEqual(result["status"], "NO_PATTERN_FOUND")
+
+    def test_scopes_analysis_to_requested_function(self):
+        result = self.analyze(
+            'def unsafe(user_id):\n'
+            '    cursor.execute(f"SELECT {user_id}")\n'
+            'def safe():\n'
+            '    cursor.execute("SELECT 1")\n',
+            target_function="safe",
+        )
+        self.assertEqual(result["status"], "NO_PATTERN_FOUND")
+
+    def test_rejects_paths_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = PythonSecurityAnalyzer.analyze_file(
+                "/etc/passwd", allowed_dirs=[Path(td)]
+            )
+        self.assertEqual(result["status"], "REJECTED")
+
+    def test_invalid_tilde_path_is_rejected_without_crashing(self):
+        result = PythonSecurityAnalyzer.analyze_file(
+            "~definitely_no_such_user_omnicli_test/sample.py",
+            allowed_dirs=[Path.home()],
+        )
+        self.assertEqual(result["status"], "REJECTED")
+
+    def test_syntax_error_is_inconclusive(self):
+        result = self.analyze("def incomplete(:\n")
+        self.assertEqual(result["status"], "INCONCLUSIVE")
+
+
 # ── Agent red-team mode ───────────────────────────────────────────────────────
 
 class TestAgentRedteam(unittest.TestCase):
@@ -333,7 +432,7 @@ class TestAgentRedteam(unittest.TestCase):
         allnames = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         self.assertEqual(
             rt, {"verify_http", "verify_code", "verify_consensus",
-                 "bash", "read_file", "consult_provider"}
+                 "analyze_python_security", "bash", "read_file", "consult_provider"}
         )
         # write_file / registry_search must NOT be exposed in red-team mode
         self.assertNotIn("write_file", rt)
@@ -445,6 +544,21 @@ class TestCliModeWiring(unittest.TestCase):
         self.assertEqual(kwargs["allowed_hosts"], ["api.example.test", "assets.example.test"])
         self.assertTrue(kwargs["allow_mutating_http"])
         runner_cls.return_value.run.assert_called_once_with("audit this")
+
+    def test_python_sql_analyzer_cli_reports_candidates_as_unconfirmed(self):
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "sample.py"
+            path.write_text(
+                'def lookup(user_id):\n'
+                '    cursor.execute(f"SELECT {user_id}")\n',
+                encoding="utf-8",
+            )
+            result = self.runner.invoke(self.main, ["verify", "python-sql", str(path)])
+        self.assertEqual(result.exit_code, 0, result.output)
+        report = json.loads(result.output)
+        self.assertEqual(report["status"], "CANDIDATES_FOUND")
+        self.assertEqual(report["findings"][0]["kind"], "possible_sql_injection")
 
     def test_chat_modes_and_redteam_alias_are_forwarded(self):
         from omnicli.cli import ChatSession

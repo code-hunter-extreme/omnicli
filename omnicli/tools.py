@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-from omnicli.deterministic import HTTPVerifier, CodeVerifier, CrossModelConsensusVerifier, ScopeGate
+from omnicli.deterministic import (
+    HTTPVerifier, CodeVerifier, PythonSecurityAnalyzer,
+    CrossModelConsensusVerifier, ScopeGate,
+)
 
 
 REGISTRY_DB_PATH = Path("/home/phantomcore/program_registry/core/program_registry.db")
@@ -134,6 +137,26 @@ def tool_verify_code(
     res["interpretation"] = (
         "This result confirms or rejects only literal source-pattern constraints; "
         "a match does not prove exploitability and a non-match does not prove safety."
+    )
+    return json.dumps(res, indent=2)
+
+
+def tool_analyze_python_security(
+    path: str,
+    target_function: Optional[str] = None,
+) -> str:
+    """Analyze Python source for direct input-to-SQL interpolation candidates."""
+    res = PythonSecurityAnalyzer.analyze_file(
+        file_path=path,
+        allowed_dirs=[Path.cwd()],
+        target_function=target_function,
+    )
+    res["verification_type"] = "python_ast_security_pattern"
+    res["security_vulnerability_confirmed"] = False
+    res["interpretation"] = (
+        "CANDIDATES_FOUND identifies source-level input-to-SQL interpolation "
+        "candidates only; it does not confirm reachability or exploitability. "
+        "NO_PATTERN_FOUND is not proof that the code is safe."
     )
     return json.dumps(res, indent=2)
 
@@ -534,6 +557,21 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_python_security",
+            "description": "Run a bounded Python AST analysis for function-parameter or request-derived values interpolated into SQL execution sinks. Reports source-level candidates only, not confirmed vulnerabilities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Python source file inside the current workspace"},
+                    "target_function": {"type": "string", "description": "Optional function name to scope analysis"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "verify_consensus",
             "description": "Run blind verification consensus across multiple AI models / model families (same API key or cross-provider) to corroboratively validate or reject a security hypothesis.",
             "parameters": {
@@ -590,6 +628,11 @@ def execute_tool_call(
             must_not_contain=arguments.get("must_not_contain"),
             target_function=arguments.get("target_function"),
             check_type=arguments.get("check_type"),
+        )
+    elif tool_name == "analyze_python_security":
+        return tool_analyze_python_security(
+            path=arguments.get("path", ""),
+            target_function=arguments.get("target_function"),
         )
     elif tool_name == "verify_consensus":
         return tool_verify_consensus(

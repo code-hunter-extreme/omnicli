@@ -681,6 +681,21 @@ def verify_code_cmd(path: str, must_contain: tuple, must_not_contain: tuple, fun
     ))
 
 
+@cmd_verify.command("python-sql")
+@click.argument("path")
+@click.option("--function", "function_name", help="Optional function name to scope analysis")
+def verify_python_sql_cmd(path: str, function_name: Optional[str]) -> None:
+    """Find direct Python input-to-SQL interpolation candidates."""
+    import json
+    from omnicli.deterministic import PythonSecurityAnalyzer
+
+    result = PythonSecurityAnalyzer.analyze_file(
+        file_path=path,
+        target_function=function_name,
+    )
+    console.print_json(json.dumps(result))
+
+
 @cmd_verify.command("consensus")
 @click.argument("claim")
 @click.option("-f", "--file", "filepath", help="File containing code/evidence to evaluate")
@@ -840,4 +855,3 @@ def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], mod
 
 if __name__ == "__main__":
     main()
-

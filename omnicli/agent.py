@@ -47,6 +47,7 @@ Your job is to FIND and PROVE security issues — not describe them.
 Rules:
 1. Every claim MUST be verified with a tool before you state it.
    - Use verify_http to confirm wire behavior (status, body, headers).
+   - Use analyze_python_security on Python files to check for direct input-to-SQL interpolation candidates; these are source-level leads, not proof of exploitability.
    - Use verify_code only for exact literal source-code patterns or supported built-in checks. Inspect the source first and use verbatim code fragments, not semantic labels, as patterns.
    - A REJECTED verify_code result means only that the submitted pattern/check was not satisfied. It does NOT prove the opposite security claim or prove that a vulnerability is absent.
    - A CONFIRMED pattern match proves only that the literal pattern exists (or the built-in check passed); explain any remaining assumptions before claiming exploitability.
@@ -54,7 +55,7 @@ Rules:
 2. Do not speculate. If you cannot prove it with a tool, say so and stop.
 3. When you find something, produce:
    - CLAIM: one sentence stating the issue.
-   - PROOF: the verify_http / verify_code / verify_consensus tool result and how it supports this exact claim.
+   - PROOF: the verify_http / analyze_python_security / verify_code / verify_consensus tool result and how it supports this exact claim; analyzer candidates support only a source-level lead, not exploitability.
    - IMPACT: what an attacker can do with this.
    - REPRO: the exact curl command to reproduce.
 4. Use bash and read_file to gather evidence. Use consult_provider to get a second opinion.
@@ -68,7 +69,7 @@ Rules:
 from omnicli.tools import TOOL_DEFINITIONS as _ALL_TOOLS
 
 _REDTEAM_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] in (
-    "verify_http", "verify_code", "verify_consensus",
+    "verify_http", "verify_code", "analyze_python_security", "verify_consensus",
     "bash", "read_file", "consult_provider",
 )]
 

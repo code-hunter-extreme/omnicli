@@ -11,6 +11,7 @@ Provides:
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import ipaddress
 import re
@@ -549,6 +550,243 @@ class CodeVerifier:
             "verdict": "CONFIRMED",
             "reason": "Code pattern constraints satisfied deterministically",
             "file": str(p),
+        }
+
+
+class PythonSecurityAnalyzer:
+    """Conservative AST checks for directly traceable Python security patterns."""
+
+    _SQL_SINKS = {
+        "execute", "executemany", "executescript", "query", "raw", "raw_query",
+    }
+
+    @staticmethod
+    def _function_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        args = node.args
+        names = {
+            arg.arg
+            for arg in (
+                list(args.posonlyargs)
+                + list(args.args)
+                + list(args.kwonlyargs)
+            )
+        }
+        if args.vararg:
+            names.add(args.vararg.arg)
+        if args.kwarg:
+            names.add(args.kwarg.arg)
+        names.difference_update({"self", "cls"})
+        return names
+
+    @staticmethod
+    def _has_request_input(node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Attribute) and child.attr.lower() in {
+                "args", "form", "json", "get", "post", "query_params",
+            }:
+                parent = child.value
+                if isinstance(parent, ast.Name) and parent.id.lower() in {
+                    "request", "req",
+                }:
+                    return True
+        return False
+
+    @classmethod
+    def _contains_untrusted_value(cls, node: ast.AST, tainted: set[str]) -> bool:
+        return cls._has_request_input(node) or any(
+            isinstance(child, ast.Name) and child.id in tainted
+            for child in ast.walk(node)
+        )
+
+    @classmethod
+    def _has_dynamic_sql_expression(cls, node: ast.AST, tainted: set[str]) -> bool:
+        if isinstance(node, ast.JoinedStr):
+            return any(
+                isinstance(value, ast.FormattedValue)
+                and cls._contains_untrusted_value(value.value, tainted)
+                for value in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            return (
+                cls._contains_untrusted_value(node.left, tainted)
+                or cls._contains_untrusted_value(node.right, tainted)
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+        ):
+            return any(
+                cls._contains_untrusted_value(arg, tainted)
+                for arg in node.args
+            ) or any(
+                cls._contains_untrusted_value(kw.value, tainted)
+                for kw in node.keywords
+            )
+        return cls._contains_untrusted_value(node, tainted)
+
+    @classmethod
+    def analyze_file(
+        cls,
+        file_path: str,
+        allowed_dirs: Optional[List[Path]] = None,
+        target_function: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find direct Python input-to-SQL interpolation candidates.
+
+        Results are candidates, not proof of exploitability: function arguments
+        are treated as potentially attacker-controlled and call semantics are
+        not inferred.
+        """
+        try:
+            path = Path(file_path).expanduser().resolve()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {
+                "status": "REJECTED",
+                "reason": f"Invalid source path: {exc}",
+                "file": str(file_path),
+                "findings": [],
+            }
+        roots = allowed_dirs if allowed_dirs is not None else _DEFAULT_ALLOWED_DIRS
+        if not any(_is_under(path, root) for root in roots):
+            return {
+                "status": "REJECTED",
+                "reason": f"Path '{path}' is outside the allowed workspace directories.",
+                "file": str(path),
+                "findings": [],
+            }
+        if not path.exists() or not path.is_file():
+            return {
+                "status": "REJECTED",
+                "reason": f"File does not exist or is not a regular file: {file_path}",
+                "file": str(path),
+                "findings": [],
+            }
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError, ValueError) as exc:
+            return {
+                "status": "INCONCLUSIVE",
+                "reason": f"Could not parse Python source: {exc}",
+                "file": str(path),
+                "findings": [],
+            }
+
+        functions = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        if target_function:
+            name = target_function.split(".")[-1]
+            functions = [node for node in functions if node.name == name]
+            if len(functions) != 1:
+                return {
+                    "status": "INCONCLUSIVE",
+                    "reason": (
+                        f"Expected exactly one Python function named '{name}' "
+                        f"for analysis; found {len(functions)}."
+                    ),
+                    "file": str(path),
+                    "findings": [],
+                }
+
+        findings: List[Dict[str, Any]] = []
+        for function in functions:
+            tainted = cls._function_parameters(function)
+            parent_nodes = {
+                child: node
+                for node in ast.walk(function)
+                for child in ast.iter_child_nodes(node)
+            }
+
+            def is_in_nested_scope(node: ast.AST) -> bool:
+                current = node
+                while current is not function:
+                    current = parent_nodes.get(current)
+                    if current is None:
+                        return True
+                    if current is not function and isinstance(
+                        current,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                    ):
+                        return True
+                return False
+
+            scope_nodes = [
+                node for node in ast.walk(function)
+                if not is_in_nested_scope(node)
+            ]
+            assignments = [
+                node for node in scope_nodes
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+            ]
+
+            # Propagate direct argument/request-derived values through local
+            # assignments; this deliberately does not model calls or sanitizers.
+            changed = True
+            while changed:
+                changed = False
+                for assignment in assignments:
+                    value = assignment.value
+                    if not isinstance(value, ast.AST):
+                        continue
+                    source_names = {
+                        n.id for n in ast.walk(value)
+                        if isinstance(n, ast.Name) and n.id in tainted
+                    }
+                    if not source_names and not cls._has_request_input(value):
+                        continue
+                    targets = (
+                        assignment.targets if isinstance(assignment, ast.Assign)
+                        else [assignment.target]
+                    )
+                    for target in targets:
+                        new_names = {
+                            n.id for n in ast.walk(target) if isinstance(n, ast.Name)
+                        }
+                        if not new_names.issubset(tainted):
+                            tainted.update(new_names)
+                            changed = True
+
+            for call in (
+                node for node in scope_nodes if isinstance(node, ast.Call)
+            ):
+                sink = (
+                    call.func.attr if isinstance(call.func, ast.Attribute)
+                    else call.func.id if isinstance(call.func, ast.Name)
+                    else ""
+                )
+                if sink not in cls._SQL_SINKS or not call.args:
+                    continue
+                query_arg = call.args[0]
+                if not cls._has_dynamic_sql_expression(query_arg, tainted):
+                    continue
+                findings.append({
+                    "kind": "possible_sql_injection",
+                    "line": call.lineno,
+                    "function": function.name,
+                    "sink": sink,
+                    "evidence": ast.get_source_segment(source, query_arg) or "",
+                    "source_parameters": sorted(
+                        n.id for n in ast.walk(query_arg)
+                        if isinstance(n, ast.Name) and n.id in tainted
+                    ),
+                    "confidence": "candidate",
+                })
+
+        return {
+            "status": "CANDIDATES_FOUND" if findings else "NO_PATTERN_FOUND",
+            "file": str(path),
+            "analysis": "python_ast_direct_input_to_sql_interpolation",
+            "findings": findings,
+            "limitations": [
+                "Function parameters and recognized request fields are treated as potentially attacker-controlled.",
+                "This check does not establish reachability, sanitization semantics, database behavior, or exploitability.",
+                "Only function bodies are analyzed; module-level SQL execution is outside this check.",
+                "Indirect flows through function calls and framework-specific query wrappers may be missed.",
+                "NO_PATTERN_FOUND means only that this bounded AST pattern was not found; it does not prove the file is safe.",
+            ],
         }
 
 

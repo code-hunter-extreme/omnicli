@@ -217,6 +217,13 @@ External tools connect to `http://localhost:8000/v1` and route by prefix, e.g.
 - `verify_http` blocks internal/metadata IPs, is DNS-rebind-safe, and rejects
   ambiguous URL authorities (parser-differential guard). `--allow-local` opts in
   to local targets.
+- Red-team agent mode exposes `analyze_python_security`, a bounded Python AST
+  check for direct function-parameter/request-value interpolation into SQL
+  execution sinks. Results are candidate source evidence, not confirmed
+  vulnerabilities; indirect flows and framework-specific wrappers may be
+  missed, and no finding is not proof of safety.
+- Run it directly with `omni verify python-sql path/to/module.py` (optionally
+  scoped with `--function name`).
 - Verification fails **closed**: no proof means no pass.
 - Memory/history files are owner-only.
 
