@@ -810,6 +810,126 @@ class TestCliModeWiring(unittest.TestCase):
             self.assertIsNone(saved["recommendation"])
 
 
+class TestWorkflowEngine(unittest.TestCase):
+    def test_dependencies_run_after_and_receive_predecessor_output(self):
+        from omnicli.workflow import run_workflow
+
+        calls = []
+
+        def execute(task, dependencies):
+            calls.append(task["id"])
+            if task["id"] == "second":
+                self.assertEqual(dependencies, {"first": "output:first"})
+            return f"output:{task['id']}"
+
+        result = run_workflow({
+            "tasks": [
+                {"id": "first", "prompt": "first"},
+                {"id": "second", "prompt": "second", "depends_on": ["first"]},
+            ]
+        }, execute)
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], {"succeeded": 2, "failed": 0, "skipped": 0})
+        self.assertEqual(
+            [event["sequence"] for event in result["events"]],
+            list(range(1, len(result["events"]) + 1)),
+        )
+        event_positions = {
+            (event["event"], event["task_id"]): event["sequence"]
+            for event in result["events"]
+        }
+        self.assertLess(
+            event_positions[("task_succeeded", "first")],
+            event_positions[("task_started", "second")],
+        )
+
+    def test_independent_tasks_run_concurrently(self):
+        from threading import Barrier
+        from omnicli.workflow import run_workflow
+
+        barrier = Barrier(2)
+
+        def execute(task, dependencies):
+            barrier.wait(timeout=2)
+            return task["id"]
+
+        result = run_workflow({
+            "tasks": [
+                {"id": "left", "prompt": "left"},
+                {"id": "right", "prompt": "right"},
+            ]
+        }, execute, max_workers=2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"]["succeeded"], 2)
+
+    def test_failed_task_skips_only_dependent_work(self):
+        from omnicli.workflow import run_workflow
+
+        def execute(task, dependencies):
+            if task["id"] == "broken":
+                raise RuntimeError("provider unavailable")
+            return task["id"]
+
+        result = run_workflow({
+            "tasks": [
+                {"id": "broken", "prompt": "fail"},
+                {"id": "blocked", "prompt": "dependent", "depends_on": ["broken"]},
+                {"id": "independent", "prompt": "keep running"},
+            ]
+        }, execute)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["tasks"]["broken"]["status"], "failed")
+        self.assertEqual(result["tasks"]["blocked"]["status"], "skipped")
+        self.assertEqual(result["tasks"]["independent"]["status"], "succeeded")
+
+    def test_rejects_cycles_unknown_dependencies_and_unordered_writes(self):
+        from omnicli.workflow import validate_workflow
+
+        for workflow, error in [
+            ({"tasks": [{"id": "a", "prompt": "a", "depends_on": ["missing"]}]}, "unknown task"),
+            ({"tasks": [
+                {"id": "a", "prompt": "a", "depends_on": ["b"]},
+                {"id": "b", "prompt": "b", "depends_on": ["a"]},
+            ]}, "cycle"),
+            ({"tasks": [
+                {"id": "a", "prompt": "a", "writes": ["artifact"]},
+                {"id": "b", "prompt": "b", "writes": ["artifact"]},
+            ]}, "Unordered workflow tasks"),
+        ]:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                validate_workflow(workflow)
+
+    def test_cli_runs_workflow_and_writes_json_report(self):
+        import json
+        from click.testing import CliRunner
+        from omnicli.cli import main
+
+        with tempfile.TemporaryDirectory() as td:
+            workflow_file = Path(td) / "workflow.json"
+            workflow_file.write_text(json.dumps({
+                "tasks": [{"id": "step", "prompt": "Do one step."}]
+            }), encoding="utf-8")
+            output_file = Path(td) / "result.json"
+
+            class WorkflowClient:
+                def chat_complete(self, **kwargs):
+                    return {"choices": [{"message": {"content": "done"}}]}
+
+            with patch("omnicli.cli.client", WorkflowClient()):
+                result = CliRunner().invoke(
+                    main,
+                    [
+                        "workflow", "run", str(workflow_file),
+                        "--output", str(output_file),
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            report = json.loads(output_file.read_text(encoding="utf-8"))
+            self.assertEqual(report["tasks"]["step"]["output"], "done")
+            self.assertIn("Workflow result saved", result.output)
+
+
 # ── Agent family rotation ─────────────────────────────────────────────────────
 
 class TestAgentFamilyRotation(unittest.TestCase):

@@ -118,6 +118,33 @@ candidate findings — a red-team *team*, not one model. Swarm members do not
 execute deterministic checks: their results are hypotheses for human review,
 and model agreement alone is never proof.
 
+### Dependency-aware workflows
+
+Use `omni workflow run` for a small JSON DAG when work has dependencies as well
+as independent parallel steps:
+
+```json
+{
+  "tasks": [
+    {"id": "inspect", "prompt": "Inspect the supplied project context.", "writes": ["review"]},
+    {"id": "challenge", "prompt": "Find weaknesses in the review.", "depends_on": ["inspect"], "writes": ["critique"]},
+    {"id": "summarize", "prompt": "Summarize the review and critique.", "depends_on": ["inspect", "challenge"]}
+  ]
+}
+```
+
+```bash
+omni workflow run workflow.json --max-workers 4 --output workflow-result.json
+```
+
+Ready independent tasks run concurrently. A task receives the text outputs of
+its direct dependencies; a failed task causes its descendants to be skipped,
+while independent branches continue. Declare shared artifact names in `writes`:
+unordered tasks that both write the same name are rejected before model calls.
+Dependencies establish an order and allow an intentional downstream rewrite.
+The JSON report includes each task's result/status and an ordered event log.
+Workflow execution is advisory model orchestration—outputs still require review.
+
 ## Deterministic verification
 
 Proof, not vibes. These power the agent's red-team tools and are usable directly:
@@ -258,8 +285,8 @@ their frameworks as runtime dependencies:
 | Reference | OmniCLI application | State |
 |---|---|---|
 | Agent Squad, TrustGraph | Keep original source/evidence available to the synthesis step and clearly isolate untrusted model hypotheses. | Implemented; deterministic citation validation remains future work. |
-| Microsoft Agent Framework, LangGraph | Opt-in local run checkpoints, resumable successful members, retry of failed members, and ordered lifecycle events. | Implemented for swarm runs. |
-| Dynamiq | Dependency-aware execution and explicit detection of conflicting parallel updates. | Planned. |
+| Microsoft Agent Framework, LangGraph | Opt-in local run checkpoints, resumable successful members, retry of failed members, and ordered lifecycle events. | Implemented for swarm runs; workflow DAG checkpoints remain future work. |
+| Dynamiq | Dependency-aware task execution, parallel independent work, failure propagation, and conflicting-write detection. | Basic declarative workflow DAG implemented. |
 | Solace Agent Mesh | Event-driven visibility into run/member/synthesis lifecycle without requiring its deprecated Python runtime. | Basic local event log implemented; external event transport is not. |
 | LiteLLM | Bounded shared provider retries and transparent configured-roster failover. | Shared retry transport implemented; broader adapter unification remains planned. |
 | RouteLLM | Compare models using measured security-audit quality and optional per-model price data, not intuition or general-chat scores. | Offline-labeled evaluation and recommendation command implemented; automatic routing remains disabled. |
