@@ -100,11 +100,13 @@ Modes:
 - **`collaborate` (default)** — Models work together constructively. Parallel fanout + merged consensus.
 - **`builder` (`--builder`)** — Council split: Builders/Architects propose the design/implementation while Red-Team Breakers stress-test and attack in parallel. The synthesizer produces a hardened build fortifying against the attacks.
 - **`redteam` (`--redteam`)** — Adversarial audit council probing for vulnerabilities, consolidated by severity.
+- **`deliberate`** — Two bounded rounds: parallel independent proposals, then parallel critiques that receive the complete prior-round transcript, followed by a chair summary that preserves disagreement.
 
 ```bash
 omni swarm "design a token-bucket rate limiter"          # collaborate: parallel + synthesized answer
 omni swarm --builder "design an OAuth2 PKCE auth engine" # builder: architects propose, red-team attacks, synthesized into hardened build
-omni swarm --redteam "audit ~/project for authz bugs"    # red-team: multi-model audit council, consolidated
+omni swarm --redteam --source-file ./src/auth.py "audit authz bugs" # ground citations against source
+omni swarm --mode deliberate "compare approaches for this design"
 omni swarm -n 5 "..."                                     # 5 members
 omni swarm --raw "..."                                    # show each member, skip synthesis
 omni swarm -p openrouter "..."                            # restrict to one provider's families
@@ -113,10 +115,52 @@ omni swarm -p openrouter "..."                            # restrict to one prov
 Each member is a distinct family (e.g. google + meta + openai), queried
 concurrently; a synthesis pass merges agreements and flags disagreements.
 `--builder` couples constructive architects with breaker red-teamers into a fortified solution.
-`--redteam` fans an adversarial review across the families and consolidates the
-candidate findings — a red-team *team*, not one model. Swarm members do not
-execute deterministic checks: their results are hypotheses for human review,
-and model agreement alone is never proof.
+`--redteam` runs a staged review: each member performs separate passes over
+authentication/authorization, tainted-input sinks, sensitive-data handling, and
+state/concurrency/resource risks (even when only one member is configured).
+The challenge stage cross-examines the combined candidate list, then OmniCLI
+uses deterministic source/route facts to deduplicate and screen cited model
+hypotheses. A generic missing-auth claim on a literal-only public health route
+is not treated as actionable; a missing local guard on a mutating route remains
+unverified until middleware, reachability, and impact are checked. Members
+challenge the combined candidate list for unsupported paths, missing
+preconditions, and false positives. When only one model is configured, this is
+explicitly labeled self-critique, not independent corroboration. The final
+red-team report itself is deterministic; it does not ask another model to vote
+on or amplify the same claims. Every stage and provider failure is shown in the
+result.
+This is orchestration of model review, not target execution: the swarm does not
+run tests or HTTP probes, and model agreement alone is never proof. Use
+`omni agent --redteam` when tool-driven inspection and deterministic checks are
+needed; HTTP checks still require an explicit host allowlist.
+For source grounding, supply files explicitly with repeatable `--source-file`
+options. Red-team answers are asked for structured `FINDING` / `FILE` / `LINE` /
+`QUOTE` blocks; OmniCLI checks those lines and quotes against supplied files and
+reports `quotes_grounded`, `unsupported_citations`, `unstructured_claims`,
+`no_structured_findings`, or `no_source_provided`. Malformed citation syntax and
+additional unstructured claims are not treated as an empty finding set.
+Quote grounding confirms only that text exists at that location—it does not
+prove reachability, exploitability, impact, or bounty eligibility. Unstructured
+model claims remain ungrounded hypotheses.
+Deliberate mode costs at least two member calls per selected model plus
+synthesis when more than one member response is available, and currently does
+not support checkpoint/resume. Member and chair outputs are checked for quoted
+source claims when source files are supplied. It is an experiment, not a
+quality guarantee; compare it against single-pass modes on the same reviewed
+tasks before relying on its additional latency or cost.
+
+The staged review and smoke-case design draw on the risk taxonomies and
+evaluation framing in [OpenRedTeaming](https://github.com/Libr-AI/OpenRedTeaming),
+the resource map in [Awesome-LLM-Red-Teaming](https://github.com/user1342/Awesome-LLM-Red-Teaming),
+the explicit challenge objectives in Microsoft's
+[AI Red Teaming Playground Labs](https://github.com/microsoft/AI-Red-Teaming-Playground-Labs),
+and the category/severity metadata pattern in
+[llm-red-teaming-dataset](https://github.com/navirocker/llm-red-teaming-dataset).
+These are design references, not runtime dependencies. OmniCLI's regression
+fixtures are purpose-built source-security cases; it does not import the
+separate dataset's harmful-content prompt payloads or copy the playground app.
+All four repositories currently expose MIT top-level licenses; check nested or
+upstream third-party materials separately before reusing their code or assets.
 
 ### Dependency-aware workflows
 

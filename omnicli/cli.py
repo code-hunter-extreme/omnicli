@@ -762,8 +762,8 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 
 @main.command("swarm")
 @click.option("-n", "--size", type=int, default=None, help="Number of swarm members (default: all active providers)")
-@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam"]), default="collaborate",
-              help="Swarm mode: collaborate (consensus), builder (architects+redteam), or redteam (audit)")
+@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam", "deliberate"]), default="collaborate",
+              help="Mode: parallel synthesis, builder, redteam, or two-round deliberate discussion")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Run collaborative swarm")
 @click.option("--builder", "flag_builder", is_flag=True, default=False, help="Run builder swarm (architects vs redteam)")
 @click.option("--redteam", is_flag=True, default=False,
@@ -772,21 +772,42 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
 @click.option("--checkpoint", type=click.Path(dir_okay=False), help="Opt in to a local SQLite checkpoint (stores the prompt and model outputs)")
 @click.option("--resume", is_flag=True, help="Resume the existing --checkpoint; the same mode and prompt are required")
+@click.option("--source-file", "source_paths", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Supply source for exact quote/line grounding; repeat as needed")
 @click.argument("prompt", nargs=-1, required=True)
 def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_builder: bool,
               redteam: bool, raw: bool, provider: Optional[str],
-              checkpoint: Optional[str], resume: bool, prompt: tuple) -> None:
+              checkpoint: Optional[str], resume: bool, source_paths: tuple,
+              prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
     from omnicli import orchestrate as orch
     task = " ".join(prompt).strip()
+    source_files = {}
+    total_source_chars = 0
+    for source_path in source_paths:
+        path = Path(source_path)
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise click.ClickException(f"Could not read source file {path}: {exc}") from exc
+        total_source_chars += len(content)
+        if total_source_chars > 200_000:
+            raise click.BadParameter(
+                "combined --source-file content exceeds 200,000 characters",
+                param_hint="--source-file",
+            )
+        source_files[str(path)] = content
     swarm = orch.build_swarm(cfg, size=size, provider=provider)
     if not swarm:
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
         return
 
     active_mode = "redteam" if redteam else ("builder" if flag_builder else ("collaborate" if flag_collaborate else mode))
+    if checkpoint and active_mode == "deliberate":
+        raise click.UsageError("--checkpoint is not supported with --mode deliberate yet")
     if resume and not checkpoint:
         raise click.UsageError("--resume requires --checkpoint PATH")
     roster = ", ".join(f"{p}:{m.split('/')[-1]} ({orch.classify_family(m)})" for p, m in swarm)
@@ -800,7 +821,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
             out = orch.run_orchestration(
                 active_mode, cfg, client, task, size=size, synth=not raw,
                 checkpoint_path=checkpoint, resume=resume,
-                provider=provider, swarm=swarm,
+                provider=provider, swarm=swarm, source_files=source_files,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -808,20 +829,60 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
     for r in out["members"]:
         role_tag = f" [{r['role']}]" if "role" in r else ""
         head = escape(f"{r['family']}{role_tag} | {r['provider']}:{r['model']}")
+        body = escape(r["answer"]) if r["answer"] else "[dim](empty)[/dim]"
         if r["error"]:
-            console.print(Panel(f"[red]ERROR: {escape(r['error'])}[/red]", title=head, border_style="red"))
-        else:
-            body = escape(r["answer"]) if r["answer"] else "[dim](empty)[/dim]"
-            console.print(Panel(body, title=head, border_style="dim"))
+            body += f"\n\n[red]STAGE ERROR: {escape(r['error'])}[/red]"
+        if r.get("latency_ms") is not None:
+            body += f"\n\n[dim]Call latency: {r['latency_ms'] / 1000:.1f}s[/dim]"
+        console.print(Panel(body, title=head, border_style="red" if r["error"] else "dim"))
+        if r.get("evidence_validation"):
+            console.print(
+                "[dim]Quote grounding: "
+                f"{r['evidence_validation']['status']} — "
+                "not exploitability verification[/dim]"
+            )
     if out.get("final"):
         title_mode = {
             "collaborate": "[bold green]SYNTHESIZED (swarm consensus)[/bold green]",
             "builder": "[bold green]HARDENED BUILD (synthesized against red-team)[/bold green]",
-            "redteam": "[bold green]CONSOLIDATED (red-team findings)[/bold green]",
+            "redteam": "[bold green]EVIDENCE-LED TRIAGE (model hypotheses)[/bold green]",
+            "deliberate": "[bold green]CHAIR SUMMARY (two-round discussion)[/bold green]",
         }.get(active_mode, "[bold green]SYNTHESIZED[/bold green]")
         console.print(Panel(escape(out["final"]),
                             title=title_mode,
                             border_style="green"))
+    if out.get("final_evidence_validation"):
+        console.print(
+            "[dim]Chair/source grounding: "
+            f"{out['final_evidence_validation']['status']} — "
+            "not exploitability verification[/dim]"
+        )
+    if out.get("metrics"):
+        metrics = out["metrics"]
+        cost = (
+            f"${metrics['estimated_cost_usd']:.6f}"
+            if metrics.get("estimated_cost_usd") is not None else "not reported"
+        )
+        console.print(
+            f"[dim]Pipeline metrics: {metrics['successful_member_calls']} successful / "
+            f"{metrics['failed_member_calls']} failed member calls; "
+            f"{metrics['elapsed_ms'] / 1000:.1f}s total; "
+            f"{metrics['input_tokens_reported']} input / "
+            f"{metrics['output_tokens_reported']} output tokens reported; "
+            f"provider-reported cost {cost}.[/dim]"
+        )
+        for round_info in out.get("rounds", []):
+            console.print(
+                f"[dim]Round {round_info['round']}: "
+                f"{round_info['successful_members']} successful / "
+                f"{round_info['failed_members']} failed; "
+                f"{round_info['latency_ms'] / 1000:.1f}s.[/dim]"
+            )
+        synthesis = metrics.get("synthesis", {})
+        if synthesis.get("performed"):
+            console.print(
+                f"[dim]Chair synthesis: {synthesis['elapsed_ms'] / 1000:.1f}s.[/dim]"
+            )
     if out.get("report_path"):
         console.print(f"\n[bold green]📄 Red-Team Audit Report saved to:[/bold green] [cyan]{out['report_path']}[/cyan]")
         try:

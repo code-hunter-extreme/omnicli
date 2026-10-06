@@ -755,6 +755,33 @@ class TestCliModeWiring(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["checkpoint_path"], checkpoint)
         self.assertTrue(run.call_args.kwargs["resume"])
 
+    def test_swarm_source_files_are_forwarded_for_grounding(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "auth.py"
+            source.write_text("check_auth()\n", encoding="utf-8")
+            with (
+                patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
+                patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run,
+            ):
+                result = self.runner.invoke(
+                    self.main,
+                    ["swarm", "--redteam", "--source-file", str(source), "review auth"],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(run.call_args.kwargs["source_files"], {str(source): "check_auth()\n"})
+
+    def test_deliberate_mode_rejects_unsupported_checkpoint(self):
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]):
+            result = self.runner.invoke(
+                self.main,
+                [
+                    "swarm", "--mode", "deliberate", "--checkpoint",
+                    "/tmp/not-created.sqlite3", "discuss",
+                ],
+            )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not supported with --mode deliberate", result.output)
+
     def test_resume_requires_checkpoint_path(self):
         with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]):
             result = self.runner.invoke(self.main, ["swarm", "--resume", "review", "source"])
@@ -928,6 +955,319 @@ class TestWorkflowEngine(unittest.TestCase):
             report = json.loads(output_file.read_text(encoding="utf-8"))
             self.assertEqual(report["tasks"]["step"]["output"], "done")
             self.assertIn("Workflow result saved", result.output)
+
+
+class TestEvidenceGrounding(unittest.TestCase):
+    def test_exact_file_line_quote_is_grounded_but_not_security_proof(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: Possible unsafe query\n"
+            "FILE: app/query.py\n"
+            "LINE: 2\n"
+            "QUOTE:\n"
+            '    cursor.execute(f"SELECT {value}")'
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app/query.py": 'def query(value):\n    cursor.execute(f"SELECT {value}")\n'},
+        )
+        self.assertEqual(result["status"], "quotes_grounded")
+        self.assertTrue(result["findings_checked"][0]["grounded"])
+        self.assertEqual(result["security_conclusion"], "not_assessed")
+
+    def test_wrong_path_line_and_quote_are_rejected(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: Possible unsafe query\n"
+            "FILE: other.py\n"
+            "LINE: 8\n"
+            "QUOTE:\n"
+            "dangerous()"
+        )
+        result = validate_quoted_findings(answer, {"app.py": "safe()\n"})
+        self.assertEqual(result["status"], "unsupported_citations")
+        self.assertFalse(result["findings_checked"][0]["grounded"])
+
+    def test_unstructured_claims_and_missing_source_are_never_grounded(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        claim = validate_quoted_findings("This vulnerability is exploitable.")
+        self.assertEqual(claim["status"], "no_source_provided")
+        self.assertTrue(claim["candidate_claims_unstructured"])
+        with_source = validate_quoted_findings(
+            "This vulnerability is exploitable.", {"app.py": "safe()\n"}
+        )
+        self.assertEqual(with_source["status"], "unstructured_claims")
+
+    def test_malformed_citation_format_is_not_silently_treated_as_no_findings(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: Unsafe task execution\n"
+            "FILE: app.py\n"
+            "LINE: 8[-1]\n"
+            "QUOTE: `run_task()`"
+        )
+        result = validate_quoted_findings(answer, {"app.py": "run_task()\n"})
+        self.assertEqual(result["status"], "unstructured_claims")
+        self.assertTrue(result["candidate_claims_unstructured"])
+
+    def test_one_line_backtick_quote_is_checked_against_exact_line(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = "FINDING: unsafe call\nFILE: app.py\nLINE: 1\nQUOTE: `run_task()`"
+        result = validate_quoted_findings(answer, {"app.py": "run_task()\n"})
+        self.assertEqual(result["status"], "quotes_grounded")
+
+    def test_inline_finding_fields_and_source_substring_are_grounded(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: Missing authorization FILE: src/admin.py LINE: 5 "
+            'QUOTE: `@app.post("/admin/delete")`'
+        )
+        source = "line 1\nline 2\nline 3\nline 4\n    @app.post(\"/admin/delete\")\n"
+        result = validate_quoted_findings(answer, {"src/admin.py": source})
+        self.assertEqual(result["status"], "quotes_grounded")
+        self.assertEqual(result["findings_checked"][0]["start_line"], 5)
+
+    def test_fenced_quote_with_blank_lines_is_grounded_without_swallowing_following_claims(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        source = "def handler():\n\n    return {\"ok\": True}\n"
+        answer = (
+            "### FINDING: Public handler\n"
+            "FILE: app.py\nLINE: 1-3\nQUOTE:\n"
+            "```python\n"
+            "def handler():\n\n    return {\"ok\": True}\n"
+            "```\n\n"
+            "ATTACK PATH: This is a security issue involving unauthenticated access."
+        )
+        result = validate_quoted_findings(answer, {"app.py": source})
+        self.assertEqual(result["findings_checked"][0]["grounded"], True)
+        self.assertEqual(result["status"], "unsupported_citations")
+        self.assertTrue(result["candidate_claims_unstructured"])
+
+    def test_unstructured_claims_are_not_hidden_by_a_grounded_finding(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: unsafe call\nFILE: app.py\nLINE: 1\nQUOTE:\nrun_task()\n\n"
+            "There is also a second bug in the parser."
+        )
+        result = validate_quoted_findings(answer, {"app.py": "run_task()\n"})
+        self.assertEqual(result["status"], "unsupported_citations")
+        self.assertTrue(result["candidate_claims_unstructured"])
+
+    def test_extracts_only_labeled_source_blocks(self):
+        from omnicli.evidence import extract_sources_from_prompt
+
+        prompt = (
+            "### Source file: app.py\n```python\nsafe()\n```\n"
+            "### Example\n```python\nignored()\n```"
+        )
+        self.assertEqual(extract_sources_from_prompt(prompt), {"app.py": "safe()"})
+
+
+class TestDeliberativeSwarm(unittest.TestCase):
+    def _cfg(self):
+        cfg = MagicMock()
+        cfg.data = {"providers": {"nvidia": {}}}
+        cfg.get_default_model.return_value = "meta/llama-3.3-70b"
+        cfg.get_fallback_models.return_value = ["qwen/qwen-2.5-72b"]
+        return cfg
+
+    def test_discussion_runs_two_rounds_then_chair_synthesis(self):
+        from omnicli.orchestrate import run_orchestration
+
+        record = []
+
+        class RecordingClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                record.append((provider_id, model, messages))
+                return {"choices": [{"message": {"content": f"answer:{model}"}}]}
+
+        result = run_orchestration(
+            "deliberate", self._cfg(), RecordingClient(), "design a safe API",
+            size=2, swarm=[("nvidia", "meta/llama-3.3-70b"), ("nvidia", "qwen/qwen-2.5-72b")],
+        )
+        self.assertEqual([round_info["round"] for round_info in result["rounds"]], [1, 2])
+        self.assertEqual(len(result["members"]), 4)
+        round_two = [
+            call for call in record
+            if any("ROUND 2" in msg["content"] for msg in call[2] if msg["role"] == "user")
+        ]
+        self.assertEqual(len(round_two), 2)
+        transcript = round_two[0][2][1]["content"]
+        self.assertIn("answer:meta/llama-3.3-70b", transcript)
+        self.assertIn("answer:qwen/qwen-2.5-72b", transcript)
+        self.assertEqual(result["final"], "answer:meta/llama-3.3-70b")
+        self.assertEqual(result["metrics"]["successful_member_calls"], 4)
+        self.assertEqual(result["metrics"]["failed_member_calls"], 0)
+        self.assertTrue(result["metrics"]["synthesis"]["performed"])
+
+    def test_raw_discussion_skips_chair_synthesis(self):
+        from omnicli.orchestrate import run_orchestration
+
+        class RecordingClient:
+            calls = 0
+
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                self.calls += 1
+                return {"choices": [{"message": {"content": "proposal"}}]}
+
+        client = RecordingClient()
+        result = run_orchestration(
+            "deliberate", self._cfg(), client, "design a safe API",
+            synth=False, swarm=[("nvidia", "meta/llama-3.3-70b")],
+        )
+        self.assertIsNone(result["final"])
+        self.assertEqual(client.calls, 2)
+        self.assertFalse(result["metrics"]["synthesis"])
+
+    def test_discussion_rejects_checkpoint_until_resume_is_round_aware(self):
+        from omnicli.orchestrate import run_orchestration
+
+        with self.assertRaisesRegex(ValueError, "not yet supported"):
+            run_orchestration(
+                "deliberate", self._cfg(), MagicMock(), "task",
+                checkpoint_path="/tmp/not-created.sqlite3",
+            )
+
+
+class TestRedteamGroundingIntegration(unittest.TestCase):
+    def test_review_fixtures_use_explicit_outcome_labels_and_stable_source_lines(self):
+        import json
+
+        fixture_dir = Path(__file__).parent / "fixtures" / "redteam"
+        cases = json.loads((fixture_dir / "cases.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            {case["expected"] for case in cases}, {"finding", "no_finding"}
+        )
+        for case in cases:
+            source_path = fixture_dir / case["source"]
+            self.assertTrue(source_path.is_file())
+            source = source_path.read_text(encoding="utf-8")
+            self.assertTrue(case["id"])
+            self.assertTrue(case["category"])
+            self.assertTrue(case["required_signal"])
+            self.assertGreater(len(source.splitlines()), 0)
+
+    def test_redteam_prompt_contains_authoritative_one_based_line_map(self):
+        from omnicli.orchestrate import swarm_redteam
+        record = []
+        source = "def first():\n    return 1\n"
+
+        class RecordingClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                record.append({"messages": messages})
+                return {"choices": [{"message": {"content": "NO ACTIONABLE CANDIDATE"}}]}
+
+        swarm_redteam(
+            MagicMock(),
+            RecordingClient(),
+            "Review this source",
+            synth=False,
+            swarm=[("p", "meta/llama-3.3-70b")],
+            source_files={"src/example.py": source},
+        )
+        attack_prompts = [
+            call["messages"][-1]["content"] for call in record
+            if "YOUR ASSIGNED THREAT CATEGORY" in call["messages"][-1]["content"]
+        ]
+        self.assertEqual(len(attack_prompts), 4)
+        self.assertTrue(all("00001 | def first():" in prompt for prompt in attack_prompts))
+        self.assertTrue(all("00002 |     return 1" in prompt for prompt in attack_prompts))
+
+    def test_python_route_facts_distinguish_mutation_from_public_literal_health(self):
+        from omnicli.evidence import (
+            analyze_python_security_facts,
+            triage_grounded_findings,
+        )
+
+        fixture_dir = Path(__file__).parent / "fixtures" / "redteam"
+        sources = {
+            name: (fixture_dir / name).read_text(encoding="utf-8")
+            for name in ("missing_auth.py", "public_health.py")
+        }
+        facts = analyze_python_security_facts(sources)
+        by_file = {report["file"]: report for report in facts}
+        mutating = by_file["missing_auth.py"]["routes"][0]
+        self.assertEqual(mutating["methods"], ["POST"])
+        self.assertEqual(mutating["request_input_accesses"], ["request.get_json"])
+        self.assertIn("delete_user_by_id", mutating["mutating_calls"])
+        self.assertFalse(mutating["local_auth_guards"])
+        health = by_file["public_health.py"]["routes"][0]
+        self.assertEqual(health["methods"], ["GET"])
+        self.assertTrue(health["returns_only_literals"])
+        self.assertFalse(health["request_input_accesses"])
+        self.assertFalse(health["mutating_calls"])
+        triaged = triage_grounded_findings(
+            [{
+                "findings_checked": [{
+                    "finding": "Missing Authentication Guard",
+                    "file": "public_health.py",
+                    "start_line": 7,
+                    "end_line": 8,
+                    "grounded": True,
+                }]
+            }],
+            facts,
+        )
+        self.assertEqual(triaged[0]["status"], "not_actionable_for_handler")
+
+    def test_grounded_auth_candidate_for_privileged_route_stays_unverified(self):
+        from omnicli.evidence import (
+            analyze_python_security_facts,
+            triage_grounded_findings,
+        )
+
+        fixture_dir = Path(__file__).parent / "fixtures" / "redteam"
+        source_path = fixture_dir / "missing_auth.py"
+        facts = analyze_python_security_facts({
+            "missing_auth.py": source_path.read_text(encoding="utf-8")
+        })
+        triaged = triage_grounded_findings(
+            [{
+                "findings_checked": [{
+                    "finding": "Unauthenticated Privileged Deletion",
+                    "file": "missing_auth.py",
+                    "start_line": 6,
+                    "end_line": 10,
+                    "grounded": True,
+                }]
+            }],
+            facts,
+        )
+        self.assertEqual(triaged[0]["status"], "unverified_authorization_gap")
+        self.assertIn("middleware", triaged[0]["reason"])
+
+    def test_redteam_marks_exact_quote_grounded_without_claiming_proof(self):
+        from omnicli.orchestrate import run_orchestration
+
+        class CitedClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                "FINDING: Possible unsafe operation\n"
+                                "FILE: app.py\nLINE: 1\nQUOTE:\nunsafe()"
+                            )
+                        }
+                    }]
+                }
+
+        result = run_orchestration(
+            "redteam", MagicMock(), CitedClient(), "Review this source.",
+            synth=False, swarm=[("nvidia", "meta/llama-3.3-70b")],
+            source_files={"app.py": "unsafe()\n"},
+        )
+        validation = result["members"][0]["evidence_validation"]
+        self.assertEqual(validation["status"], "quotes_grounded")
+        self.assertEqual(validation["security_conclusion"], "not_assessed")
 
 
 # ── Agent family rotation ─────────────────────────────────────────────────────
@@ -1774,6 +2114,42 @@ class TestSwarm(unittest.TestCase):
             self.assertEqual(len(resumed["members"]), 2)
             self.assertTrue(resumed["events"][-1]["event"] == "completed")
 
+    def test_checkpointed_redteam_rebuilds_stages_without_repeating_model_calls(self):
+        from omnicli.orchestrate import run_orchestration
+
+        class RecordingClient:
+            def __init__(self):
+                self.calls = []
+
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                self.calls.append(messages)
+                return {"choices": [{"message": {"content": "NO ACTIONABLE CANDIDATE"}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "redteam.sqlite3")
+            source = "def health():\n    return {\"status\": \"ok\"}\n"
+            roster = [("p", "meta/llama-3.3-70b")]
+            first_client = RecordingClient()
+            first = run_orchestration(
+                "redteam", self._cfg(), first_client, "review health",
+                synth=False, checkpoint_path=path, source_files={"health.py": source},
+                swarm=roster,
+            )
+            self.assertEqual(len(first_client.calls), 5)
+            self.assertEqual(len(first["rounds"]), 2)
+
+            resumed_client = RecordingClient()
+            resumed = run_orchestration(
+                "redteam", self._cfg(), resumed_client, "review health",
+                synth=False, checkpoint_path=path, resume=True,
+                source_files={"health.py": source}, swarm=roster,
+            )
+            self.assertEqual(resumed_client.calls, [])
+            self.assertEqual(len(resumed["members"]), 1)
+            self.assertIn("ATTACK REVIEW: authentication",
+                          resumed["members"][0]["answer"])
+            self.assertEqual(len(resumed["rounds"]), 2)
+
     def test_checkpoint_rejects_changed_prompt_or_mode(self):
         from omnicli.orchestrate import run_orchestration
 
@@ -1878,7 +2254,7 @@ class TestSwarm(unittest.TestCase):
         self.assertIn("Do not invent", redteam_prompt)
         self.assertIn("UNVERIFIED", redteam_prompt)
 
-    def test_redteam_synthesis_audits_evidence_instead_of_counting_agreement(self):
+    def test_redteam_report_is_deterministic_instead_of_another_model_vote(self):
         from omnicli.orchestrate import swarm_redteam
         rec = []
         source_evidence = "review source\nSOURCE_EVIDENCE_SENTINEL = True"
@@ -1895,28 +2271,71 @@ class TestSwarm(unittest.TestCase):
             member["answer"].startswith("UNVERIFIED MODEL HYPOTHESES")
             for member in result["members"] if member["answer"]
         ))
-        self.assertIn("All member claims are unverified hypotheses", result["final"])
-        synthesis = [
-            call["messages"] for call in rec
-            if any(
-                "evidence auditor" in message.get("content", "").lower()
-                for message in call["messages"]
-                if message.get("role") == "system"
-            )
+        self.assertIn("Deterministic evidence-led triage", result["final"])
+        self.assertIn("does not prove exploitability", result["final"])
+        challenge_calls = [
+            call for call in rec
+            if any("challenger" in message.get("content", "").lower()
+                   for message in call["messages"] if message.get("role") == "system")
         ]
-        self.assertTrue(synthesis)
-        sys_prompt = next(
-            message["content"] for message in synthesis[0]
-            if message.get("role") == "system"
+        self.assertEqual(len(challenge_calls), 2)
+        self.assertTrue(result["metrics"]["synthesis"]["performed"] is False)
+        self.assertEqual(len(rec), 10)  # 2x4 attack + 2 challenge; no LLM chair
+        self.assertEqual(result["metrics"]["successful_member_calls"], 10)
+        self.assertEqual([row["stage"] for row in result["rounds"]], [
+            "independent_attack", "cross_examination"
+        ])
+
+    def test_single_model_redteam_still_runs_each_threat_surface(self):
+        from omnicli.orchestrate import swarm_redteam
+        record = []
+        result = swarm_redteam(
+            self._cfg(),
+            self.FakeClient(record=record),
+            "review a source file",
+            size=1,
+            synth=False,
+            swarm=[("p", "meta/llama-3.3-70b")],
         )
-        self.assertIn("untrusted hypotheses", sys_prompt)
-        self.assertIn("do not upgrade confidence", sys_prompt)
-        user_prompt = next(
-            message["content"] for message in synthesis[0]
-            if message.get("role") == "user"
+        attack_calls = [
+            call for call in record
+            if "YOUR ASSIGNED THREAT CATEGORY" in call["messages"][-1]["content"]
+        ]
+        self.assertEqual(len(attack_calls), 4)
+        all_prompts = "\n".join(call["messages"][-1]["content"] for call in attack_calls)
+        for focus in (
+            "authentication, authorization, and privilege boundaries",
+            "untrusted input, injection, and data/control-flow to sensitive sinks",
+            "secrets, sensitive data exposure, and unsafe output",
+            "state changes, concurrency, resource exhaustion, and failure handling",
+        ):
+            self.assertIn(focus, all_prompts)
+        self.assertEqual(result["metrics"]["member_calls"], 5)
+        self.assertIn("not independent corroboration",
+                      result["metrics"]["challenge_independence"])
+
+    def test_redteam_challengers_receive_the_other_members_candidates(self):
+        from omnicli.orchestrate import swarm_redteam
+        rec = []
+        swarm_redteam(
+            self._cfg(),
+            self.FakeClient(record=rec),
+            "review this source",
+            size=2,
+            synth=False,
+            swarm=[("p1", "meta/llama-3.3-70b"), ("p2", "qwen/qwen2.5-72b")],
         )
-        self.assertIn("SOURCE_EVIDENCE_SENTINEL = True", user_prompt)
-        self.assertIn("ORIGINAL TASK AND EVIDENCE", user_prompt)
+        challenges = [
+            call for call in rec
+            if any("challenger" in message.get("content", "").lower()
+                   for message in call["messages"] if message.get("role") == "system")
+        ]
+        self.assertEqual(len(challenges), 2)
+        for call in challenges:
+            user = next(message["content"] for message in call["messages"] if message["role"] == "user")
+            self.assertIn("INDEPENDENT CANDIDATES TO CHALLENGE", user)
+            self.assertIn("meta/llama-3.3-70b", user)
+            self.assertIn("qwen/qwen2.5-72b", user)
 
     def test_builder_swarm_alternates_roles(self):
         from omnicli.orchestrate import swarm_builder
@@ -2030,7 +2449,7 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 self.assertIn("Red-Team Security Assessment", content)
                 self.assertIn("audit auth service", content)
                 self.assertIn("Weak token validation", content)
-                self.assertIn("do not execute code", content)
+                self.assertIn("does not execute code", content)
                 self.assertIn("Agreement between models is not proof", content)
 
 

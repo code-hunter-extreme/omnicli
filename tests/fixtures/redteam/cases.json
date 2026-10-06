@@ -1,0 +1,18 @@
+[
+  {
+    "id": "missing_auth_on_privileged_route",
+    "category": "authentication_authorization",
+    "severity": "high",
+    "expected": "finding",
+    "required_signal": "missing authentication or authorization before privileged deletion",
+    "source": "missing_auth.py"
+  },
+  {
+    "id": "intentionally_public_read_only_health",
+    "category": "benign_public_endpoint",
+    "severity": "none",
+    "expected": "no_finding",
+    "required_signal": "public route is explicitly in scope and read-only",
+    "source": "public_health.py"
+  }
+]
