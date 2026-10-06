@@ -60,6 +60,9 @@ omni agent "summarize the risks in ./config.json"
 # Red-team mode: adversarial "find and PROVE" prompt + deterministic verify tools
 omni agent --redteam "audit ~/project for auth bypass; prove each finding"
 
+# Authorize HTTP verification only for the target's in-scope hosts
+omni agent --redteam --allowed-host api.example.com "audit https://api.example.com"
+
 # Cross-architecture corroboration: switch model family each turn
 omni agent --redteam --rotate-families "review these contracts for reentrancy"
 ```
@@ -76,6 +79,11 @@ Flags:
   destructive/download-to-shell commands are blocked.
 - `--allow-local` — let `verify_http` reach localhost / RFC1918 targets.
   **Off by default**; cloud-metadata/link-local IPs stay blocked regardless.
+- `--allowed-host HOST` — authorize a host for agent HTTP verification; repeat
+  for every in-scope host. Agent verification is denied when no host is allowed.
+- `--allow-mutating-http` — explicitly permit state-changing methods on those
+  allowed hosts. GET, HEAD, and OPTIONS remain the only methods allowed by
+  default.
 - `--max-turns N` — tool-call budget (default 10).
 
 Interactive red-team is also available in chat: `omni chat --redteam
@@ -106,8 +114,9 @@ Each member is a distinct family (e.g. google + meta + openai), queried
 concurrently; a synthesis pass merges agreements and flags disagreements.
 `--builder` couples constructive architects with breaker red-teamers into a fortified solution.
 `--redteam` fans an adversarial review across the families and consolidates the
-findings (proven vs. plausible, ranked by severity) — a red-team *team*, not one
-model.
+candidate findings — a red-team *team*, not one model. Swarm members do not
+execute deterministic checks: their results are hypotheses for human review,
+and model agreement alone is never proof.
 
 ## Deterministic verification
 
@@ -203,6 +212,8 @@ External tools connect to `http://localhost:8000/v1` and route by prefix, e.g.
 
 - Agent shell is **off by default** (`--allow-shell`); destructive commands are
   deny-listed even when enabled.
+- Agent HTTP checks require an explicit `--allowed-host` scope, and automated
+  state-changing methods require the separate `--allow-mutating-http` opt-in.
 - `verify_http` blocks internal/metadata IPs, is DNS-rebind-safe, and rejects
   ambiguous URL authorities (parser-differential guard). `--allow-local` opts in
   to local targets.

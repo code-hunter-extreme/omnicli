@@ -538,10 +538,15 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
               help="Enable the bash tool (OFF by default; destructive commands still blocked)")
 @click.option("--allow-local", is_flag=True, default=False,
               help="Permit verify_http against localhost/RFC1918 (metadata IPs stay blocked)")
+@click.option("--allowed-host", "allowed_hosts", multiple=True,
+              help="Authorize an HTTP target host for agent verification; repeat for each host")
+@click.option("--allow-mutating-http", is_flag=True, default=False,
+              help="Allow state-changing verify_http methods on explicitly allowed hosts")
 @click.argument("goal", nargs=-1, required=True)
 def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               redteam: bool, rotate_families: bool, allow_shell: bool,
-              allow_local: bool, goal: tuple) -> None:
+              allow_local: bool, allowed_hosts: tuple,
+              allow_mutating_http: bool, goal: tuple) -> None:
     """Run an autonomous agent equipped with local tools and cross-provider delegation."""
     from omnicli.agent import AgentRunner
     task_goal = " ".join(goal).strip()
@@ -554,6 +559,8 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
         rotate_families=rotate_families,
         allow_shell=allow_shell,
         allow_local=allow_local,
+        allowed_hosts=list(allowed_hosts),
+        allow_mutating_http=allow_mutating_http,
     )
     runner.run(task_goal)
 
@@ -833,5 +840,4 @@ def cmd_check(target: str, filepath: Optional[str], expected: Optional[str], mod
 
 if __name__ == "__main__":
     main()
-
 

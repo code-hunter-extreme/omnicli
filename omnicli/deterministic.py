@@ -324,6 +324,22 @@ class HTTPVerifier:
                 }
 
         predicates = parse_expected_predicates(expected_str)
+        if not (
+            predicates["status"] is not None
+            or predicates["body_contains"]
+            or predicates["body_not_contains"]
+            or predicates["body_contains_any"]
+            or predicates["headers_absent"]
+            or predicates["headers_contains"]
+        ):
+            return {
+                "verdict": "REJECTED",
+                "reason": "No valid expected predicates were provided.",
+                "url": url,
+                "observed": None,
+                "predicates": predicates,
+            }
+
         req_headers = headers or {}
 
         pin_host = ScopeGate.extract_host(url) if pin_ip else None
@@ -451,11 +467,31 @@ class CodeVerifier:
         if not p.is_file():
             return {"verdict": "REJECTED", "reason": f"Target is not a file: {file_path}", "file": str(p)}
 
-        # Fail closed on a vacuous request: nothing asserted means nothing proven.
-        if not (must_contain or must_not_contain or check_type or target_function):
+        supported_check_types = {"wp_auth_check"}
+        if check_type and check_type not in supported_check_types:
             return {
                 "verdict": "REJECTED",
-                "reason": "No verification constraints provided (must_contain / must_not_contain / check_type / target_function).",
+                "reason": f"Unsupported verification check type: {check_type}",
+                "file": str(p),
+            }
+
+        # A function name scopes inspection; it does not assert a security property.
+        if not (must_contain or must_not_contain or check_type):
+            return {
+                "verdict": "REJECTED",
+                "reason": (
+                    "No verification constraints provided "
+                    "(must_contain / must_not_contain / supported check_type); "
+                    "target_function only scopes inspection."
+                ),
+                "file": str(p),
+            }
+
+        patterns = (must_contain or []) + (must_not_contain or [])
+        if any(not isinstance(pattern, str) or not pattern.strip() for pattern in patterns):
+            return {
+                "verdict": "REJECTED",
+                "reason": "Verification patterns must be non-empty strings.",
                 "file": str(p),
             }
 

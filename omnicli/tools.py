@@ -32,18 +32,49 @@ def tool_verify_http(
     body: Optional[str] = None,
     expected: str = "",
     allow_local: bool = False,
+    allowed_hosts: Optional[List[str]] = None,
+    allow_mutating_http: bool = False,
 ) -> str:
     """Execute deterministic HTTP verification and return verdict.
 
-    A ScopeGate is always applied so a model-chosen URL cannot reach internal
-    or cloud-metadata addresses (SSRF). allow_local (--allow-local) opts into
-    loopback + RFC1918 targets for deliberate local testing; link-local
-    (metadata) stays blocked regardless.
+    The agent must receive an explicit host allowlist before it can probe any
+    target. Private/local hosts additionally require allow_local. State-changing
+    methods additionally require allow_mutating_http.
     """
-    gate = ScopeGate(allow_localhost=allow_local, allow_private=allow_local)
+    scoped_hosts = [
+        host.strip() for host in (allowed_hosts or [])
+        if isinstance(host, str) and host.strip()
+    ]
+    if not scoped_hosts:
+        return json.dumps({
+            "verdict": "REJECTED",
+            "reason": "HTTP verification requires at least one operator-configured allowed host.",
+            "url": url,
+            "observed": None,
+        }, indent=2)
+
+    normalized_method = str(method or "GET").strip().upper()
+    if not normalized_method:
+        normalized_method = "GET"
+    if normalized_method not in {"GET", "HEAD", "OPTIONS"} and not allow_mutating_http:
+        return json.dumps({
+            "verdict": "REJECTED",
+            "reason": (
+                f"HTTP method '{normalized_method}' may change state; "
+                "operator consent via --allow-mutating-http is required."
+            ),
+            "url": url,
+            "observed": None,
+        }, indent=2)
+
+    gate = ScopeGate(
+        allowed_hosts=scoped_hosts,
+        allow_localhost=allow_local,
+        allow_private=allow_local,
+    )
     res = HTTPVerifier.verify(
         url=url,
-        method=method,
+        method=normalized_method,
         headers=headers,
         body=body,
         expected_str=expected,
@@ -90,6 +121,7 @@ def tool_verify_code(
         must_not_contain=_coerce_patterns(must_not_contain),
         target_function=target_function,
         check_type=check_type,
+        allowed_dirs=[Path.cwd()],
     )
     return json.dumps(res, indent=2)
 
@@ -189,20 +221,16 @@ def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str
         return f"Error executing bash: {e}"
 
 
-def check_workspace_jail(path: str | Path) -> Path:
-    """Validate path and prevent access to sensitive host directories."""
+def check_workspace_jail(path: str | Path, workspace_root: Optional[Path] = None) -> Path:
+    """Resolve a path and require it to remain inside the active workspace."""
     p = Path(path).expanduser().resolve()
-    blocked_prefixes = [
-        Path("/etc"), Path("/proc"), Path("/sys"), Path("/dev"),
-        Path.home() / ".ssh", Path.home() / ".gnupg", Path.home() / ".aws"
-    ]
-    for bp in blocked_prefixes:
-        try:
-            if p == bp or p.is_relative_to(bp):
-                raise PermissionError(f"Security Policy: path '{path}' resolves inside protected directory '{bp}'")
-        except AttributeError:
-            if str(p).startswith(str(bp)):
-                raise PermissionError(f"Security Policy: path '{path}' resolves inside protected directory '{bp}'")
+    root = Path(workspace_root or Path.cwd()).expanduser().resolve()
+    try:
+        p.relative_to(root)
+    except ValueError:
+        raise PermissionError(
+            f"Security Policy: path '{path}' resolves outside the allowed workspace '{root}'"
+        ) from None
     return p
 
 
@@ -446,10 +474,15 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Target HTTP/HTTPS URL"},
-                    "method": {"type": "string", "description": "HTTP method (GET, POST, etc.)", "default": "GET"},
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method. GET, HEAD, and OPTIONS are allowed by default; mutating methods require operator opt-in.",
+                        "default": "GET",
+                    },
                     "expected": {
                         "type": "string",
-                        "description": "Prediction string, e.g.: 'status 200, body contains \"user_id\", header x-frame-options absent'",
+                        "description": "Required, parseable prediction, e.g.: 'status 200, body contains \"user_id\", header x-frame-options absent'",
+                        "minLength": 1,
                     },
                     "body": {"type": "string", "description": "Optional request body"},
                 },
@@ -469,12 +502,12 @@ TOOL_DEFINITIONS = [
                     "must_contain": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of string patterns that MUST be present in the target code",
+                        "description": "Exact literal source-code substrings that MUST be present (not semantic labels)",
                     },
                     "must_not_contain": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of string patterns that MUST NOT be present",
+                        "description": "Exact literal source-code substrings that MUST be absent; a failed check does not prove the inverse security claim",
                     },
                     "target_function": {"type": "string", "description": "Optional function name to scope inspection"},
                     "check_type": {
@@ -515,6 +548,8 @@ def execute_tool_call(
     client_ref: Any = None,
     allow_shell: bool = False,
     allow_local: bool = False,
+    allowed_hosts: Optional[List[str]] = None,
+    allow_mutating_http: bool = False,
 ) -> str:
     """Execute a function call by name and arguments."""
     if tool_name == "bash":
@@ -533,6 +568,8 @@ def execute_tool_call(
             body=arguments.get("body"),
             expected=arguments.get("expected", ""),
             allow_local=allow_local,
+            allowed_hosts=allowed_hosts,
+            allow_mutating_http=allow_mutating_http,
         )
     elif tool_name == "verify_code":
         return tool_verify_code(
@@ -573,4 +610,3 @@ def execute_tool_call(
             return f"Error consulting {provider}: {e}"
     else:
         return f"Unknown tool: '{tool_name}'"
-

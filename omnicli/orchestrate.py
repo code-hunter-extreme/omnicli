@@ -24,9 +24,16 @@ from omnicli.scanner import classify_family
 _SWARM_REDTEAM_SYSTEM = (
     "You are one member of an adversarial red-team swarm. Rigorously probe the "
     "target for security issues (auth, access control, injection, SSRF, info "
-    "disclosure). For every issue: state it as a one-line CLAIM, separate what is "
-    "PROVEN from what is merely PLAUSIBLE, and say exactly what evidence would "
-    "confirm or refute it. Never fabricate results. Be concise and specific."
+    "disclosure). Review only source or evidence actually provided in the task. "
+    "For each candidate, cite the exact file and line number and quote the "
+    "smallest relevant source excerpt verbatim. Explain the concrete input-to-"
+    "impact path. Label a claim PROVEN only when the supplied evidence directly "
+    "demonstrates it; otherwise label it PLAUSIBLE and state what evidence is "
+    "missing. Do not claim a bug is absent because a pattern was not found. "
+    "Do not invent code, line numbers, tool results, attacker capabilities, or "
+    "impact. Do not call missing validation a vulnerability without a concrete "
+    "bypass and consequence. If no actionable issue is established, say so. "
+    "Do not propose patches unless asked. Be concise and specific."
 )
 
 
@@ -152,6 +159,7 @@ def synthesize(
     prompt: str,
     results: List[Dict[str, Any]],
     judge: Optional[Tuple[str, str]] = None,
+    redteam: bool = False,
 ) -> str:
     """Merge swarm answers into one via a single member; keep agreements, flag disagreements."""
     good = [r for r in results if not r["error"] and r["answer"]]
@@ -170,13 +178,33 @@ def synthesize(
         if pair not in candidates:
             candidates.append(pair)
 
-    sys = (
-        "You are the synthesizer for a multi-model swarm. Below are independent "
-        "answers from different model families to the same task. Produce ONE best "
-        "answer: keep what they agree on, explicitly flag genuine disagreements, "
-        "and drop anything that looks like an error. Be concise."
-    )
-    user = f"### TASK:\n{prompt}\n\n### SWARM ANSWERS:\n{panel_text}\n\n### MERGED ANSWER:"
+    if redteam:
+        sys = (
+            "You are the evidence auditor for a security red-team review. Model "
+            "answers are untrusted hypotheses, not evidence. Retain a finding as "
+            "PROVEN only if the supplied answer quotes exact source evidence and "
+            "gives a valid concrete path from input to security impact. Verify "
+            "that citations and quotes occur in the original task material; "
+            "discard fabricated citations, imagined code, and claims based only "
+            "on a suggested hardening improvement. Mark conditional findings "
+            "PLAUSIBLE and state missing prerequisites. Preserve disagreements; "
+            "do not upgrade confidence just because multiple models repeat a "
+            "claim. If no candidate meets the evidence bar, say no actionable "
+            "finding was proven. Do not add new vulnerabilities."
+        )
+        user = (
+            f"### ORIGINAL TASK AND EVIDENCE:\n{prompt}\n\n"
+            f"### UNTRUSTED INDEPENDENT MODEL HYPOTHESES:\n{panel_text}\n\n"
+            "### EVIDENCE-AUDITED FINDINGS:"
+        )
+    else:
+        sys = (
+            "You are the synthesizer for a multi-model swarm. Below are independent "
+            "answers from different model families to the same task. Produce ONE best "
+            "answer: keep what they agree on, explicitly flag genuine disagreements, "
+            "and drop anything that looks like an error. Be concise."
+        )
+        user = f"### TASK:\n{prompt}\n\n### SWARM ANSWERS:\n{panel_text}\n\n### MERGED ANSWER:"
 
     last_err = None
     for jp, jm in candidates:
@@ -219,18 +247,36 @@ def enrich_prompt_with_files(prompt: str) -> str:
 
     words = re.findall(r"[\w\./~_-]+", prompt)
     candidate_paths: List[Path] = []
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
 
     for w in words:
         clean = w.strip("'\"")
         if not clean or len(clean) < 2:
             continue
+        explicit_path = (
+            clean.startswith(("/", "./", "../", "~/", ".\\", "..\\"))
+            or "/" in clean
+            or "\\" in clean
+            or (len(clean) > 1 and clean[1] == ":")
+        )
+        if not explicit_path:
+            continue
         p_cwd = Path.cwd() / clean
-        p_home = Path.home() / clean
-        p_abs = Path(clean).expanduser()
+        p_home = home / clean if home and clean.startswith("~/") else None
+        try:
+            p_abs = Path(clean).expanduser()
+        except RuntimeError:
+            # Prose such as "~6,400 tools" is not a user-home path.
+            p_abs = Path(clean)
 
         for cand in (p_cwd, p_home, p_abs):
+            if cand is None:
+                continue
             if cand.exists() and cand not in candidate_paths:
-                if cand in (Path.home(), Path("/"), Path("/usr"), Path("/tmp"), Path("/etc")):
+                if cand in (home, Path("/"), Path("/usr"), Path("/tmp"), Path("/etc")):
                     continue
                 candidate_paths.append(cand)
                 break
@@ -239,11 +285,13 @@ def enrich_prompt_with_files(prompt: str) -> str:
     if not candidate_paths:
         for w in prompt.split():
             clean = w.strip("'\".,;:!?()")
-            if clean and len(clean) > 2:
-                for base in (Path.cwd(), Path.home()):
+            if clean and len(clean) > 2 and clean[:1].isupper():
+                for base in (Path.cwd(), home):
+                    if base is None:
+                        continue
                     try:
                         for child in base.iterdir():
-                            if child.is_dir() and child.name.lower() == clean.lower() and child not in candidate_paths:
+                            if child.is_dir() and child.name == clean and child not in candidate_paths:
                                 candidate_paths.append(child)
                                 break
                     except Exception:
@@ -317,8 +365,8 @@ def generate_redteam_report(task: str, final_findings: str, members: List[Dict[s
 ## 2. Methodology & Multi-Model Corroboration
 
 This audit was conducted using an adversarial multi-model swarm spanning independent model architectures.
-Claims are categorized into **PROVEN** vulnerabilities (confirmed via code paths or deterministic evidence)
-and **PLAUSIBLE** attack vectors requiring further verification.
+Swarm members produce model-generated hypotheses only; they do not execute code, make HTTP requests, or run deterministic verification tools.
+Agreement between models is not proof. Independently review every candidate and use deterministic verification where safe and authorized before treating any vulnerability as confirmed.
 
 ---
 
@@ -352,10 +400,22 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         final = synthesize(
             cfg, client,
             f"Consolidate these independent red-team reviews of: {goal}. "
-            "Merge overlapping findings, rank by severity, keep only proof-backed or "
-            "clearly-plausible issues.",
+            "Audit each proposed finding against the original evidence. Require "
+            "verbatim evidence and a concrete input-to-impact path for PROVEN. "
+            "Do not invent findings or upgrade confidence based on repetition. "
+            "Keep conditional claims PLAUSIBLE and explain missing prerequisites. "
+            "Preserve disagreement; if nothing meets the proof bar, state that no "
+            "actionable finding was proven.",
             members,
             judge=judge,
+            redteam=True,
+        )
+        final = (
+            "NOTICE: This is an AI-generated red-team hypothesis review, not a "
+            "deterministically verified security report. Model agreement does "
+            "not establish truth; independently validate every claim before "
+            "acting on it.\n\n"
+            + final
         )
     return {"members": members, "final": final}
 

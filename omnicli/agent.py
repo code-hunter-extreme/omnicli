@@ -47,16 +47,19 @@ Your job is to FIND and PROVE security issues — not describe them.
 Rules:
 1. Every claim MUST be verified with a tool before you state it.
    - Use verify_http to confirm wire behavior (status, body, headers).
-   - Use verify_code to confirm code patterns or missing guards.
+   - Use verify_code only for exact literal source-code patterns or supported built-in checks. Inspect the source first and use verbatim code fragments, not semantic labels, as patterns.
+   - A REJECTED verify_code result means only that the submitted pattern/check was not satisfied. It does NOT prove the opposite security claim or prove that a vulnerability is absent.
+   - A CONFIRMED pattern match proves only that the literal pattern exists (or the built-in check passed); explain any remaining assumptions before claiming exploitability.
    - Use verify_consensus to cross-check a finding across model families before reporting.
 2. Do not speculate. If you cannot prove it with a tool, say so and stop.
 3. When you find something, produce:
    - CLAIM: one sentence stating the issue.
-   - PROOF: the verify_http / verify_code / verify_consensus tool result.
+   - PROOF: the verify_http / verify_code / verify_consensus tool result and how it supports this exact claim.
    - IMPACT: what an attacker can do with this.
    - REPRO: the exact curl command to reproduce.
 4. Use bash and read_file to gather evidence. Use consult_provider to get a second opinion.
 5. Be thorough. Check auth, access control, information disclosure, and error handling.
+6. Use verify_http only for operator-authorized hosts configured for this run. GET, HEAD, and OPTIONS are permitted by default; never use state-changing methods unless the operator explicitly enabled them.
 """
 
 # Red-team tool definitions — the verify_* set only.
@@ -81,6 +84,8 @@ class AgentRunner:
         rotate_families: bool = False,
         allow_shell: bool = False,
         allow_local: bool = False,
+        allowed_hosts: Optional[List[str]] = None,
+        allow_mutating_http: bool = False,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -92,6 +97,8 @@ class AgentRunner:
         self.rotate_families = rotate_families
         self.allow_shell = allow_shell
         self.allow_local = allow_local
+        self.allowed_hosts = list(allowed_hosts or [])
+        self.allow_mutating_http = allow_mutating_http
 
     def _model_roster(self) -> List[str]:
         """Return [primary] + fallback_models from config, deduped, primary first."""
@@ -193,6 +200,13 @@ class AgentRunner:
             system_prompt = system_override
         elif getattr(self, "redteam", False):
             system_prompt = _REDTEAM_SYSTEM
+            allowed_hosts = getattr(self, "allowed_hosts", [])
+            if allowed_hosts:
+                system_prompt += "\n\nOperator-authorized HTTP hosts for this run: " + ", ".join(allowed_hosts)
+            else:
+                system_prompt += "\n\nNo HTTP hosts are authorized for this run; do not call verify_http."
+            if getattr(self, "allow_mutating_http", False):
+                system_prompt += "\nOperator explicitly enabled state-changing HTTP methods, limited to the authorized hosts."
         else:
             system_prompt = (
                 "You are an expert autonomous AI agent equipped with local tools: "
@@ -296,6 +310,8 @@ class AgentRunner:
                         name, args, client_ref=self.client,
                         allow_shell=getattr(self, "allow_shell", False),
                         allow_local=getattr(self, "allow_local", False),
+                        allowed_hosts=getattr(self, "allowed_hosts", None),
+                        allow_mutating_http=getattr(self, "allow_mutating_http", False),
                     )
 
                     preview = escape(output.strip().split("\n")[0][:120])

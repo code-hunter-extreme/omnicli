@@ -276,6 +276,38 @@ class TestCodeVerifierPathGuard(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
+    def test_function_scope_alone_is_not_a_security_assertion(self):
+        from omnicli.deterministic import CodeVerifier
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write("def login():\n    return True\n")
+            path = f.name
+        try:
+            result = CodeVerifier.verify_file(path, target_function="login")
+            self.assertEqual(result["verdict"], "REJECTED")
+            self.assertIn("only scopes inspection", result["reason"])
+            self.assertEqual(
+                CodeVerifier.verify_file(
+                    path, target_function="login", must_contain=["return True"]
+                )["verdict"],
+                "CONFIRMED",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_unknown_check_type_and_empty_pattern_are_rejected(self):
+        from omnicli.deterministic import CodeVerifier
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "sample.py")
+            Path(path).write_text("def login():\n    return True\n", encoding="utf-8")
+            self.assertEqual(
+                CodeVerifier.verify_file(path, check_type="unknown_check")["verdict"],
+                "REJECTED",
+            )
+            self.assertEqual(
+                CodeVerifier.verify_file(path, must_contain=[""])["verdict"],
+                "REJECTED",
+            )
+
 
 # ── Agent red-team mode ───────────────────────────────────────────────────────
 
@@ -308,6 +340,12 @@ class TestAgentRedteam(unittest.TestCase):
         self.assertNotIn("registry_search", rt)
         self.assertTrue(rt.issubset(allnames))
 
+    def test_redteam_prompt_explains_literal_pattern_verdicts(self):
+        from omnicli.agent import _REDTEAM_SYSTEM
+        self.assertIn("verbatim code fragments", _REDTEAM_SYSTEM)
+        self.assertIn("does NOT prove the opposite security claim", _REDTEAM_SYSTEM)
+        self.assertIn("exists", _REDTEAM_SYSTEM)
+
     def test_redteam_run_uses_adversarial_prompt(self):
         from omnicli.agent import _REDTEAM_SYSTEM
         r = self._runner(redteam=True)
@@ -320,7 +358,36 @@ class TestAgentRedteam(unittest.TestCase):
         r._call_model = fake_call
         r.run("audit this folder")
         self.assertEqual(captured["messages"][0]["role"], "system")
-        self.assertEqual(captured["messages"][0]["content"], _REDTEAM_SYSTEM)
+        self.assertTrue(captured["messages"][0]["content"].startswith(_REDTEAM_SYSTEM))
+        self.assertIn("No HTTP hosts are authorized", captured["messages"][0]["content"])
+
+    def test_authorized_http_scope_is_forwarded_to_tool_dispatch(self):
+        import json as _json
+        r = self._runner(redteam=True)
+        r.allowed_hosts = ["api.example.test"]
+        r.allow_mutating_http = False
+        r.allow_shell = False
+        r.allow_local = False
+        responses = [
+            {"choices": [{"message": {
+                "tool_calls": [{
+                    "id": "http-check",
+                    "function": {
+                        "name": "verify_http",
+                        "arguments": _json.dumps({
+                            "url": "https://api.example.test/",
+                            "expected": "status 200",
+                        }),
+                    },
+                }],
+            }}]},
+            {"choices": [{"message": {"content": "done"}}]},
+        ]
+        r._call_model = MagicMock(side_effect=[(response, None) for response in responses])
+        with patch("omnicli.agent.execute_tool_call", return_value='{"verdict":"REJECTED"}') as execute:
+            r.run("audit api.example.test")
+        self.assertEqual(execute.call_args.kwargs["allowed_hosts"], ["api.example.test"])
+        self.assertFalse(execute.call_args.kwargs["allow_mutating_http"])
 
     def test_non_redteam_uses_default_prompt(self):
         r = self._runner(redteam=False)
@@ -345,6 +412,80 @@ class TestAgentRedteam(unittest.TestCase):
         r._call_model = fake_call
         r.run("goal", system_override="CUSTOM PROMPT")
         self.assertEqual(captured["messages"][0]["content"], "CUSTOM PROMPT")
+
+
+class TestCliModeWiring(unittest.TestCase):
+    def setUp(self):
+        from click.testing import CliRunner
+        from omnicli.cli import main
+        self.runner = CliRunner()
+        self.main = main
+
+    def test_agent_security_flags_are_forwarded(self):
+        with patch("omnicli.agent.AgentRunner") as runner_cls:
+            result = self.runner.invoke(
+                self.main,
+                [
+                    "agent", "--redteam", "--rotate-families", "--allow-shell",
+                    "--allow-local", "--allowed-host", "api.example.test",
+                    "--allowed-host", "assets.example.test",
+                    "--allow-mutating-http", "--max-turns", "4", "audit", "this",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        kwargs = runner_cls.call_args.kwargs
+        self.assertEqual(kwargs["provider"], None)
+        self.assertEqual(kwargs["model"], None)
+        self.assertEqual(kwargs["max_turns"], 4)
+        self.assertTrue(kwargs["console"])
+        self.assertTrue(kwargs["redteam"])
+        self.assertTrue(kwargs["rotate_families"])
+        self.assertTrue(kwargs["allow_shell"])
+        self.assertTrue(kwargs["allow_local"])
+        self.assertEqual(kwargs["allowed_hosts"], ["api.example.test", "assets.example.test"])
+        self.assertTrue(kwargs["allow_mutating_http"])
+        runner_cls.return_value.run.assert_called_once_with("audit this")
+
+    def test_chat_modes_and_redteam_alias_are_forwarded(self):
+        from omnicli.cli import ChatSession
+        cases = [
+            (["--mode", "collaborate"], "collaborate", False),
+            (["--mode", "builder"], "builder", False),
+            (["--mode", "redteam"], "redteam", False),
+            (["--single"], "single", False),
+            (["--redteam"], "redteam", True),
+            (["--mode", "single"], "single", False),
+        ]
+        for options, expected_mode, expected_redteam in cases:
+            with self.subTest(options=options), patch("omnicli.cli.ChatSession") as session_cls:
+                result = self.runner.invoke(self.main, ["chat", *options, "--rotate-families", "--size", "3"])
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(session_cls.call_args.kwargs["mode"], expected_mode)
+                self.assertEqual(session_cls.call_args.kwargs["redteam"], expected_redteam)
+                self.assertTrue(session_cls.call_args.kwargs["rotate_families"])
+                self.assertEqual(session_cls.call_args.kwargs["council_size"], 3)
+                session_cls.return_value.run.assert_called_once_with()
+
+    def test_swarm_modes_and_raw_flag_are_forwarded(self):
+        from omnicli.orchestrate import run_orchestration
+        cases = [
+            (["--mode", "collaborate"], "collaborate"),
+            (["--builder"], "builder"),
+            (["--redteam"], "redteam"),
+            (["--builder", "--redteam"], "redteam"),
+        ]
+        for options, expected_mode in cases:
+            with self.subTest(options=options), \
+                    patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                    patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run:
+                result = self.runner.invoke(
+                    self.main,
+                    ["swarm", *options, "--raw", "--size", "1", "--provider", "p", "audit", "this"],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(run.call_args.args[0], expected_mode)
+                self.assertEqual(run.call_args.kwargs["size"], 1)
+                self.assertFalse(run.call_args.kwargs["synth"])
 
 
 # ── Agent family rotation ─────────────────────────────────────────────────────
@@ -466,7 +607,66 @@ class TestScopeGateSSRF(unittest.TestCase):
         from omnicli.tools import tool_verify_http
         out = _json.loads(tool_verify_http("http://127.0.0.1/x", expected="status 200"))
         self.assertEqual(out["verdict"], "REJECTED")
-        self.assertIn("Scope Gate", out["reason"])
+        self.assertIn("allowed host", out["reason"])
+
+    def test_http_tool_requires_scope_and_blocks_mutating_methods_by_default(self):
+        import json as _json
+        from omnicli.tools import tool_verify_http
+        with patch("omnicli.deterministic.httpx.Client") as client_cls:
+            no_scope = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", expected="status 200"
+            ))
+            mutation = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", method="POST", expected="status 200",
+                allowed_hosts=["8.8.8.8"],
+            ))
+        self.assertEqual(no_scope["verdict"], "REJECTED")
+        self.assertEqual(mutation["verdict"], "REJECTED")
+        self.assertIn("allow-mutating-http", mutation["reason"])
+        client_cls.assert_not_called()
+
+    def test_http_tool_permits_scoped_safe_and_opted_in_mutating_methods(self):
+        import json as _json
+        from types import SimpleNamespace
+        from omnicli.tools import tool_verify_http
+
+        response = SimpleNamespace(status_code=200, text="ok", headers={})
+        with patch("omnicli.deterministic.httpx.Client") as client_cls:
+            client = client_cls.return_value.__enter__.return_value
+            client.request.return_value = response
+            safe = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", expected="status 200",
+                allowed_hosts=["8.8.8.8"],
+            ))
+            mutating = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", method="POST", body="x", expected="status 200",
+                allowed_hosts=["8.8.8.8"], allow_mutating_http=True,
+            ))
+        self.assertEqual(safe["verdict"], "CONFIRMED")
+        self.assertEqual(mutating["verdict"], "CONFIRMED")
+        self.assertEqual([call.kwargs["method"] for call in client.request.call_args_list], ["GET", "POST"])
+
+    def test_http_tool_rejects_out_of_scope_host(self):
+        import json as _json
+        from omnicli.tools import tool_verify_http
+        with patch("omnicli.deterministic.httpx.Client") as client_cls:
+            result = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", expected="status 200",
+                allowed_hosts=["1.1.1.1"],
+            ))
+        self.assertEqual(result["verdict"], "REJECTED")
+        self.assertIn("does not match permitted scopes", result["reason"])
+        client_cls.assert_not_called()
+
+    def test_http_verifier_rejects_vacuous_or_unparseable_expectations(self):
+        from omnicli.deterministic import HTTPVerifier
+        with patch("omnicli.deterministic.httpx.Client") as client_cls:
+            for expected in ("", "not a predicate", 'body contains any of ""'):
+                with self.subTest(expected=expected):
+                    result = HTTPVerifier.verify("https://8.8.8.8/", expected_str=expected)
+                    self.assertEqual(result["verdict"], "REJECTED")
+                    self.assertIn("no valid expected predicates", result["reason"].lower())
+        client_cls.assert_not_called()
 
 
 # ── DNS-rebind pin resolver ────────────────────────────────────────────────────
@@ -816,7 +1016,8 @@ class TestVerifyCodeArgs(unittest.TestCase):
         import json as _json
         from omnicli.tools import tool_verify_code
         path = self._pyfile()
-        out = _json.loads(tool_verify_code(path, must_contain='["ALPHA_MARKER"]'))
+        with patch("omnicli.tools.Path.cwd", return_value=Path(path).parent):
+            out = _json.loads(tool_verify_code(path, must_contain='["ALPHA_MARKER"]'))
         self.assertEqual(out["verdict"], "CONFIRMED")
 
     def test_python_function_scoping(self):
@@ -951,6 +1152,37 @@ class TestSwarm(unittest.TestCase):
         swarm_redteam(self._cfg(), self.FakeClient(record=rec), "audit X", size=2, synth=False)
         sys_msgs = [m["content"] for call in rec for m in call["messages"] if m["role"] == "system"]
         self.assertTrue(any("adversarial" in s.lower() for s in sys_msgs))
+        redteam_prompt = next(s for s in sys_msgs if "adversarial" in s.lower())
+        self.assertIn("quote the", redteam_prompt)
+        self.assertIn("input-to-impact", redteam_prompt)
+        self.assertIn("Do not invent", redteam_prompt)
+
+    def test_redteam_synthesis_audits_evidence_instead_of_counting_agreement(self):
+        from omnicli.orchestrate import swarm_redteam
+        rec = []
+        swarm_redteam(
+            self._cfg(),
+            self.FakeClient(record=rec),
+            "review source",
+            size=2,
+            synth=True,
+            judge=("p", "judge"),
+        )
+        synthesis = [
+            call["messages"] for call in rec
+            if any(
+                "evidence auditor" in message.get("content", "").lower()
+                for message in call["messages"]
+                if message.get("role") == "system"
+            )
+        ]
+        self.assertTrue(synthesis)
+        sys_prompt = next(
+            message["content"] for message in synthesis[0]
+            if message.get("role") == "system"
+        )
+        self.assertIn("untrusted hypotheses", sys_prompt)
+        self.assertIn("do not upgrade confidence", sys_prompt)
 
     def test_builder_swarm_alternates_roles(self):
         from omnicli.orchestrate import swarm_builder
@@ -1024,6 +1256,32 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 self.assertIn("ATTACHED PROJECT DIRECTORY: Oracle", enriched)
                 self.assertIn("Oracle core documentation", enriched)
 
+    def test_enrich_prompt_ignores_tilde_number_prose(self):
+        from omnicli.orchestrate import enrich_prompt_with_files
+        with tempfile.TemporaryDirectory() as td, \
+                unittest.mock.patch("pathlib.Path.cwd", return_value=Path(td)):
+            enriched = enrich_prompt_with_files(
+                "The registry contains ~6,400 tools; review the agent."
+            )
+        self.assertIn("~6,400 tools", enriched)
+
+    def test_enrich_prompt_works_without_home_directory(self):
+        from omnicli.orchestrate import enrich_prompt_with_files
+        with tempfile.TemporaryDirectory() as td, \
+                unittest.mock.patch("pathlib.Path.cwd", return_value=Path(td)), \
+                unittest.mock.patch("pathlib.Path.home", side_effect=RuntimeError("no home")):
+            enriched = enrich_prompt_with_files("Review this source without local attachments.")
+        self.assertIn("Review this source", enriched)
+
+    def test_enrich_prompt_does_not_treat_common_words_as_paths(self):
+        from omnicli.orchestrate import enrich_prompt_with_files
+        with tempfile.TemporaryDirectory() as td, \
+                unittest.mock.patch("pathlib.Path.cwd", return_value=Path(td)), \
+                unittest.mock.patch("pathlib.Path.home", return_value=Path(td)):
+            (Path(td) / "tools").mkdir()
+            prompt = "Review registry tools and consult the provider."
+            self.assertEqual(enrich_prompt_with_files(prompt), prompt)
+
     def test_generate_redteam_report(self):
         from omnicli.orchestrate import generate_redteam_report
         with tempfile.TemporaryDirectory() as td:
@@ -1038,6 +1296,8 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 self.assertIn("Red-Team Security Assessment", content)
                 self.assertIn("audit auth service", content)
                 self.assertIn("Weak token validation", content)
+                self.assertIn("do not execute code", content)
+                self.assertIn("Agreement between models is not proof", content)
 
 
 class TestScannerFilters(unittest.TestCase):
@@ -1067,7 +1327,8 @@ class TestTruncatedWriteGuard(unittest.TestCase):
             self.assertGreater(trunc["open_brackets"], 0)
 
             # Test tool_write_file refuses it
-            msg = tool_write_file(str(target), bad_content)
+            with patch("omnicli.tools.Path.cwd", return_value=Path(td)):
+                msg = tool_write_file(str(target), bad_content)
             self.assertIn("Refused to write", msg)
             # Ensure file is unchanged
             self.assertEqual(target.read_text(encoding="utf-8"), orig_content)
@@ -1117,18 +1378,39 @@ class TestConsensusCliKeyContract(unittest.TestCase):
 # ── Workspace Jail & Security Guardrails ─────────────────────────────────────
 
 class TestWorkspaceJail(unittest.TestCase):
-    def test_blocks_sensitive_system_paths(self):
-        from omnicli.tools import check_workspace_jail, tool_read_file, tool_write_file
-        with self.assertRaises(PermissionError):
-            check_workspace_jail("/etc/shadow")
-        with self.assertRaises(PermissionError):
-            check_workspace_jail(str(Path.home() / ".ssh" / "id_rsa"))
+    def test_all_file_tools_are_confined_to_workspace(self):
+        from omnicli.tools import (
+            check_workspace_jail,
+            tool_read_file,
+            tool_verify_code,
+            tool_write_file,
+        )
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as outside:
+            root = Path(workspace)
+            outside_file = Path(outside) / "secret.txt"
+            outside_file.write_text("secret", encoding="utf-8")
+            in_workspace = root / "source.py"
+            in_workspace.write_text("def safe():\n    return True\n", encoding="utf-8")
+            (root / "escape").symlink_to(Path(outside), target_is_directory=True)
 
-        out = tool_read_file("/etc/passwd")
-        self.assertIn("E_PERMISSION", out)
+            with patch("omnicli.tools.Path.cwd", return_value=root):
+                self.assertEqual(check_workspace_jail(in_workspace), in_workspace)
+                for escaped in (outside_file, root / ".." / Path(outside).name / "secret.txt",
+                                root / "escape" / "secret.txt"):
+                    with self.subTest(path=escaped), self.assertRaises(PermissionError):
+                        check_workspace_jail(escaped)
 
-        out_w = tool_write_file("/etc/cron.d/evil", "evil")
-        self.assertIn("E_PERMISSION", out_w)
+                self.assertIn("source.py", tool_read_file(str(in_workspace)))
+                self.assertIn("Successfully wrote", tool_write_file(str(root / "new.txt"), "workspace"))
+                self.assertEqual((root / "new.txt").read_text(encoding="utf-8"), "workspace")
+                self.assertIn("E_PERMISSION", tool_read_file(str(outside_file)))
+                self.assertIn("E_PERMISSION", tool_write_file(str(outside_file), "overwrite"))
+                self.assertEqual(outside_file.read_text(encoding="utf-8"), "secret")
+                verify = tool_verify_code(
+                    str(outside_file),
+                    must_contain=["secret"],
+                )
+                self.assertIn("REJECTED", verify)
 
 
 def main() -> int:
