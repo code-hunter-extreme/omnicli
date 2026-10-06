@@ -270,6 +270,54 @@ def triage_grounded_findings(
     return list(findings.values())
 
 
+def assess_evidence_gate(
+    sources: Mapping[str, str],
+    validations: list[Mapping[str, object]],
+    provider_errors: list[str],
+    candidate_triage: list[Mapping[str, object]],
+) -> Dict[str, object]:
+    """Fail closed when red-team claims cannot be grounded to supplied evidence."""
+    failures: list[str] = []
+    if not sources:
+        failures.append("No source files were supplied; claims cannot be grounded.")
+    elif not any(isinstance(text, str) and text.strip() for text in sources.values()):
+        failures.append("Supplied source files are empty; claims cannot be grounded.")
+    if provider_errors:
+        failures.extend(f"Review stage failed: {error}" for error in provider_errors)
+
+    bad_validation_statuses = {
+        "no_source_provided",
+        "unsupported_citations",
+        "unstructured_claims",
+    }
+    for index, validation in enumerate(validations, start=1):
+        status = validation.get("status")
+        if status in bad_validation_statuses:
+            failures.append(f"Review output {index} failed grounding: {status}.")
+
+    for candidate in candidate_triage:
+        if candidate.get("status") == "unsupported_citation":
+            failures.append(
+                "Candidate citation is not grounded: "
+                f"{candidate.get('title', 'unnamed candidate')} "
+                f"({candidate.get('file', 'unknown file')}:{candidate.get('start_line', '?')})."
+            )
+
+    return {
+        "status": "FAIL" if failures else "PASS_GROUNDING_ONLY",
+        "failed_checks": failures,
+        "source_files_checked": len(sources),
+        "review_outputs_checked": len(validations),
+        "candidate_count": len(candidate_triage),
+        "security_conclusion": "NOT_ASSESSED",
+        "meaning": (
+            "PASS_GROUNDING_ONLY means the supplied review outputs did not fail "
+            "the source-grounding checks. It does not prove exploitability, "
+            "completeness, or safety."
+        ),
+    }
+
+
 def validate_quoted_findings(
     answer: str,
     sources: Optional[Mapping[str, str]] = None,

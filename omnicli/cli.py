@@ -857,6 +857,33 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
             f"{out['final_evidence_validation']['status']} — "
             "not exploitability verification[/dim]"
         )
+    evidence_gate = out.get("evidence_gate")
+    if active_mode == "redteam" and evidence_gate is None:
+        evidence_gate = {
+            "status": "FAIL",
+            "security_conclusion": "NOT_ASSESSED",
+            "source_files_checked": len(source_files),
+            "review_outputs_checked": 0,
+            "failed_checks": [
+                "Red-team run returned no deterministic evidence-gate result."
+            ],
+        }
+    if evidence_gate:
+        failed_checks = evidence_gate.get("failed_checks", [])
+        gate_passed = evidence_gate.get("status") == "PASS_GROUNDING_ONLY"
+        gate_color = "yellow" if gate_passed else "red"
+        detail = "\n".join(f"• {escape(item)}" for item in failed_checks)
+        if not detail:
+            detail = escape(evidence_gate.get("meaning", "Grounding only; security not assessed."))
+        console.print(Panel(
+            f"[bold {gate_color}]EVIDENCE GATE: {evidence_gate.get('status', 'FAIL')}[/bold {gate_color}]\n"
+            f"[bold]Security conclusion: {evidence_gate.get('security_conclusion', 'NOT_ASSESSED')}[/bold]\n"
+            f"Sources: {evidence_gate.get('source_files_checked', 0)}; "
+            f"review outputs: {evidence_gate.get('review_outputs_checked', 0)}\n\n"
+            f"{detail}",
+            title="Deterministic Evidence Gate",
+            border_style=gate_color,
+        ))
     if out.get("metrics"):
         metrics = out["metrics"]
         cost = (
@@ -885,6 +912,8 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
             )
     if out.get("report_path"):
         console.print(f"\n[bold green]📄 Red-Team Audit Report saved to:[/bold green] [cyan]{out['report_path']}[/cyan]")
+        if evidence_gate and evidence_gate.get("status") != "PASS_GROUNDING_ONLY":
+            raise click.exceptions.Exit(2)
         try:
             accept = click.confirm("\nWould you like to review and accept the proposed remediations/changes?", default=True)
             if accept:
@@ -896,6 +925,8 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
             f"\n[dim]Checkpoint run {out['run_id']} recorded "
             f"{len(out.get('events', []))} lifecycle events.[/dim]"
         )
+    if evidence_gate and evidence_gate.get("status") != "PASS_GROUNDING_ONLY":
+        raise click.exceptions.Exit(2)
 
 
 @main.group("verify")

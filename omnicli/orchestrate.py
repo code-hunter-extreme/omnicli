@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from omnicli.evidence import (
+    assess_evidence_gate,
     analyze_python_security_facts,
     extract_sources_from_prompt,
     triage_grounded_findings,
@@ -614,7 +615,12 @@ def enrich_prompt_with_files(prompt: str) -> str:
     return prompt
 
 
-def generate_redteam_report(task: str, final_findings: str, members: List[Dict[str, Any]]) -> Path:
+def generate_redteam_report(
+    task: str,
+    final_findings: str,
+    members: List[Dict[str, Any]],
+    evidence_gate: Optional[Dict[str, Any]] = None,
+) -> Path:
     """Generate a formal markdown report for red-team audits and write to reports/."""
     from datetime import datetime
     from pathlib import Path
@@ -628,6 +634,14 @@ def generate_redteam_report(task: str, final_findings: str, members: List[Dict[s
         for r in members if not r.get("error")
     )
 
+    gate = evidence_gate or {
+        "status": "FAIL",
+        "failed_checks": ["Evidence gate result was not provided."],
+        "security_conclusion": "NOT_ASSESSED",
+    }
+    failed_checks = "\n".join(
+        f"- {item}" for item in gate.get("failed_checks", [])
+    ) or "- None."
     report_content = f"""# Red-Team Security Assessment & Audit Report
 
 **Date / Timestamp:** {datetime.now().isoformat()}  
@@ -638,6 +652,18 @@ def generate_redteam_report(task: str, final_findings: str, members: List[Dict[s
 ---
 
 ## 1. Executive Summary & Findings Analysis
+
+## EVIDENCE GATE: {gate.get('status', 'FAIL')}
+
+**Security conclusion:** {gate.get('security_conclusion', 'NOT_ASSESSED')}
+**Source files checked:** {gate.get('source_files_checked', 0)}
+**Review outputs checked:** {gate.get('review_outputs_checked', 0)}
+
+**Failed checks:**
+{failed_checks}
+
+> A passing evidence gate means only that model claims were grounded against
+> supplied source text. It does not prove exploitability, completeness, or safety.
 
 {final_findings}
 
@@ -953,6 +979,23 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     candidate_triage = triage_grounded_findings(
         [*attack_validations, *challenge_validations], source_facts
     )
+    provider_errors = []
+    for provider, model in swarm:
+        state = states[(provider, model)]
+        provider_errors.extend(
+            f"{provider}:{model} (independent_attack/{focus}): {error}"
+            for focus, error in state.get("attack_errors", {}).items()
+        )
+        if state.get("challenge_error"):
+            provider_errors.append(
+                f"{provider}:{model} (cross_examination): {state['challenge_error']}"
+            )
+    evidence_gate = assess_evidence_gate(
+        sources,
+        [*attack_validations, *challenge_validations],
+        provider_errors,
+        candidate_triage,
+    )
     final = None
     final_validation = None
     synthesis_telemetry: Dict[str, Any] = {
@@ -964,8 +1007,13 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             "Deterministic evidence-led triage of model-generated hypotheses.",
             "This report does not prove exploitability or establish that the target is safe.",
             "Quote grounding verifies text at a location only; AST patterns are incomplete.",
+            f"EVIDENCE GATE: {evidence_gate['status']}",
             "",
         ]
+        report_lines.extend(
+            f"EVIDENCE GATE FAILURE: {failure}"
+            for failure in evidence_gate["failed_checks"]
+        )
         if candidate_triage:
             for item in candidate_triage:
                 location = (
@@ -1033,6 +1081,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         "metrics": metrics,
         "source_facts": source_facts,
         "candidate_triage": candidate_triage,
+        "evidence_gate": evidence_gate,
     }
 
 
@@ -1179,7 +1228,8 @@ def run_orchestration(
                 result["events"] = checkpoint.events()
                 if synth and result.get("final"):
                     report = generate_redteam_report(
-                        prompt, result["final"], result.get("members", [])
+                        prompt, result["final"], result.get("members", []),
+                        evidence_gate=result.get("evidence_gate"),
                     )
                     result["report_path"] = str(report)
                 return result
@@ -1210,7 +1260,8 @@ def run_orchestration(
             )
             if synth and res.get("final"):
                 rep_path = generate_redteam_report(
-                    prompt, res["final"], res.get("members", [])
+                    prompt, res["final"], res.get("members", []),
+                    evidence_gate=res.get("evidence_gate"),
                 )
                 res["report_path"] = str(rep_path)
         else:

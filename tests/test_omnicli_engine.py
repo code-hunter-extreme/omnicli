@@ -726,7 +726,20 @@ class TestCliModeWiring(unittest.TestCase):
         for options, expected_mode in cases:
             with self.subTest(options=options), \
                     patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
-                    patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run:
+                    patch(
+                        "omnicli.orchestrate.run_orchestration",
+                        side_effect=lambda mode, *args, **kwargs: {
+                            "members": [],
+                            "final": None,
+                            **({
+                                "evidence_gate": {
+                                    "status": "PASS_GROUNDING_ONLY",
+                                    "security_conclusion": "NOT_ASSESSED",
+                                    "failed_checks": [],
+                                }
+                            } if mode == "redteam" else {}),
+                        },
+                    ) as run:
                 result = self.runner.invoke(
                     self.main,
                     ["swarm", *options, "--raw", "--size", "1", "--provider", "p", "audit", "this"],
@@ -742,7 +755,15 @@ class TestCliModeWiring(unittest.TestCase):
         checkpoint = "/tmp/omnicli-checkpoint.sqlite3"
         with (
             patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
-            patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run,
+            patch("omnicli.orchestrate.run_orchestration", return_value={
+                "members": [],
+                "final": None,
+                "evidence_gate": {
+                    "status": "PASS_GROUNDING_ONLY",
+                    "security_conclusion": "NOT_ASSESSED",
+                    "failed_checks": [],
+                },
+            }) as run,
         ):
             result = self.runner.invoke(
                 self.main,
@@ -761,7 +782,15 @@ class TestCliModeWiring(unittest.TestCase):
             source.write_text("check_auth()\n", encoding="utf-8")
             with (
                 patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
-                patch("omnicli.orchestrate.run_orchestration", return_value={"members": [], "final": None}) as run,
+                patch("omnicli.orchestrate.run_orchestration", return_value={
+                    "members": [],
+                    "final": None,
+                    "evidence_gate": {
+                        "status": "PASS_GROUNDING_ONLY",
+                        "security_conclusion": "NOT_ASSESSED",
+                        "failed_checks": [],
+                    },
+                }) as run,
             ):
                 result = self.runner.invoke(
                     self.main,
@@ -769,6 +798,47 @@ class TestCliModeWiring(unittest.TestCase):
                 )
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertEqual(run.call_args.kwargs["source_files"], {str(source): "check_auth()\n"})
+
+    def test_redteam_evidence_gate_failure_is_loud_and_returns_nonzero(self):
+        failed_gate = {
+            "status": "FAIL",
+            "security_conclusion": "NOT_ASSESSED",
+            "source_files_checked": 1,
+            "review_outputs_checked": 5,
+            "failed_checks": ["Review output 1 failed grounding: unsupported_citations."],
+        }
+        with (
+            patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
+            patch("omnicli.orchestrate.run_orchestration", return_value={
+                "members": [],
+                "final": "No verified conclusion.",
+                "evidence_gate": failed_gate,
+            }),
+        ):
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--redteam", "--provider", "p", "--source-file",
+                 str(Path(__file__).parent / "fixtures/redteam/public_health.py"),
+                 "review source"],
+            )
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("EVIDENCE GATE: FAIL", result.output)
+        self.assertIn("unsupported_citations", result.output)
+
+    def test_redteam_missing_gate_fails_closed(self):
+        with (
+            patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]),
+            patch("omnicli.orchestrate.run_orchestration", return_value={
+                "members": [],
+                "final": "Missing gate must not look successful.",
+            }),
+        ):
+            result = self.runner.invoke(
+                self.main, ["swarm", "--redteam", "--provider", "p", "review source"]
+            )
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("EVIDENCE GATE: FAIL", result.output)
+        self.assertIn("returned no deterministic evidence-gate result", result.output)
 
     def test_deliberate_mode_rejects_unsupported_checkpoint(self):
         with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]):
@@ -1070,6 +1140,52 @@ class TestEvidenceGrounding(unittest.TestCase):
         )
         self.assertEqual(extract_sources_from_prompt(prompt), {"app.py": "safe()"})
 
+    def test_evidence_gate_fails_closed_for_missing_source_provider_and_bad_citations(self):
+        from omnicli.evidence import assess_evidence_gate
+
+        missing_source = assess_evidence_gate({}, [], [], [])
+        self.assertEqual(missing_source["status"], "FAIL")
+        self.assertIn("No source files", missing_source["failed_checks"][0])
+        empty_source = assess_evidence_gate({"app.py": " \n"}, [], [], [])
+        self.assertEqual(empty_source["status"], "FAIL")
+        self.assertIn("empty", empty_source["failed_checks"][0])
+
+        provider_failure = assess_evidence_gate(
+            {"app.py": "safe()"},
+            [{"status": "no_structured_findings"}],
+            ["provider:model unavailable"],
+            [],
+        )
+        self.assertEqual(provider_failure["status"], "FAIL")
+
+        malformed = assess_evidence_gate(
+            {"app.py": "safe()"},
+            [{"status": "unsupported_citations"}],
+            [],
+            [{
+                "title": "Unsafe operation",
+                "file": "app.py",
+                "start_line": 1,
+                "status": "unsupported_citation",
+            }],
+        )
+        self.assertEqual(malformed["status"], "FAIL")
+        self.assertGreaterEqual(len(malformed["failed_checks"]), 2)
+        self.assertEqual(malformed["security_conclusion"], "NOT_ASSESSED")
+
+    def test_evidence_gate_pass_means_grounding_only_not_security_verification(self):
+        from omnicli.evidence import assess_evidence_gate
+
+        result = assess_evidence_gate(
+            {"app.py": "safe()"},
+            [{"status": "no_structured_findings"}],
+            [],
+            [],
+        )
+        self.assertEqual(result["status"], "PASS_GROUNDING_ONLY")
+        self.assertEqual(result["security_conclusion"], "NOT_ASSESSED")
+        self.assertIn("does not prove", result["meaning"])
+
 
 class TestDeliberativeSwarm(unittest.TestCase):
     def _cfg(self):
@@ -1154,6 +1270,30 @@ class TestRedteamGroundingIntegration(unittest.TestCase):
             self.assertTrue(case["category"])
             self.assertTrue(case["required_signal"])
             self.assertGreater(len(source.splitlines()), 0)
+
+    def test_redteam_without_sources_fails_evidence_gate_even_if_model_says_no_issue(self):
+        from omnicli.orchestrate import run_orchestration
+
+        class NoFindingClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                return {"choices": [{
+                    "message": {"content": "NO ACTIONABLE CANDIDATE"}
+                }]}
+
+        result = run_orchestration(
+            "redteam",
+            MagicMock(),
+            NoFindingClient(),
+            "Review an unspecified target.",
+            synth=True,
+            swarm=[("p", "meta/llama-3.3-70b")],
+        )
+        self.assertEqual(result["evidence_gate"]["status"], "FAIL")
+        self.assertIn(
+            "No source files",
+            "\n".join(result["evidence_gate"]["failed_checks"]),
+        )
+        self.assertIn("EVIDENCE GATE: FAIL", result["final"])
 
     def test_redteam_prompt_contains_authoritative_one_based_line_map(self):
         from omnicli.orchestrate import swarm_redteam
@@ -2273,6 +2413,8 @@ class TestSwarm(unittest.TestCase):
         ))
         self.assertIn("Deterministic evidence-led triage", result["final"])
         self.assertIn("does not prove exploitability", result["final"])
+        self.assertEqual(result["evidence_gate"]["status"], "FAIL")
+        self.assertEqual(result["evidence_gate"]["security_conclusion"], "NOT_ASSESSED")
         challenge_calls = [
             call for call in rec
             if any("challenger" in message.get("content", "").lower()
@@ -2442,7 +2584,14 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 rep = generate_redteam_report(
                     task="audit auth service",
                     final_findings="PROVEN: Weak token validation",
-                    members=[{"family": "meta", "provider": "groq", "model": "openai/gpt-oss-120b"}]
+                    members=[{"family": "meta", "provider": "groq", "model": "openai/gpt-oss-120b"}],
+                    evidence_gate={
+                        "status": "FAIL",
+                        "failed_checks": ["Unsupported citation at app.py:4."],
+                        "source_files_checked": 1,
+                        "review_outputs_checked": 4,
+                        "security_conclusion": "NOT_ASSESSED",
+                    },
                 )
                 self.assertTrue(rep.exists())
                 content = rep.read_text(encoding="utf-8")
@@ -2451,6 +2600,8 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 self.assertIn("Weak token validation", content)
                 self.assertIn("does not execute code", content)
                 self.assertIn("Agreement between models is not proof", content)
+                self.assertIn("EVIDENCE GATE: FAIL", content)
+                self.assertIn("Unsupported citation at app.py:4.", content)
 
 
 class TestScannerFilters(unittest.TestCase):

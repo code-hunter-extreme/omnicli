@@ -142,6 +142,12 @@ additional unstructured claims are not treated as an empty finding set.
 Quote grounding confirms only that text exists at that location—it does not
 prove reachability, exploitability, impact, or bounty eligibility. Unstructured
 model claims remain ungrounded hypotheses.
+Red-team runs also apply a fail-closed **evidence gate**: missing source,
+provider-stage failures, malformed/unstructured candidate claims, or citations
+that do not match the supplied file cause a prominent `EVIDENCE GATE: FAIL`
+and CLI exit code `2`. `PASS_GROUNDING_ONLY` means only that the supplied
+outputs passed these citation checks; it is not a security verdict. A red-team
+result without a gate is itself treated as a failure.
 Deliberate mode costs at least two member calls per selected model plus
 synthesis when more than one member response is available, and currently does
 not support checkpoint/resume. Member and chair outputs are checked for quoted
