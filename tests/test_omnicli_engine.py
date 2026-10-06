@@ -51,6 +51,98 @@ class TestProviderAuthHeaders(unittest.TestCase):
         self.assertEqual(token, "demo-key")
 
 
+class TestProviderTransientRetries(unittest.TestCase):
+    def _client(self):
+        from omnicli.client import OmniClient
+
+        cfg = MagicMock()
+        cfg.get_base_url.return_value = "https://provider.example/v1"
+        cfg.get_api_key.return_value = "demo-key"
+        cfg.get_default_model.return_value = "model-a"
+        return OmniClient(cfg)
+
+    def test_retries_rate_limit_then_returns_success(self):
+        client = self._client()
+        responses = [
+            MagicMock(status_code=429, headers={"Retry-After": "0"}, text="rate limited"),
+            MagicMock(status_code=200, headers={}, text="", json=lambda: {"ok": True}),
+        ]
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.__exit__.return_value = False
+        http_client.post.side_effect = responses
+        with (
+            patch("omnicli.client.httpx.Client", return_value=http_client),
+            patch("omnicli.client.time.sleep") as sleep,
+        ):
+            result = client.post_chat_completion(
+                "https://provider.example/v1/chat/completions",
+                {}, {"model": "model-a"}, 1,
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(http_client.post.call_count, 2)
+        sleep.assert_called_once_with(0.0)
+
+    def test_retries_are_bounded_and_leave_final_error_visible(self):
+        client = self._client()
+        response = MagicMock(status_code=503, headers={}, text="unavailable")
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.__exit__.return_value = False
+        http_client.post.return_value = response
+        with (
+            patch("omnicli.client.httpx.Client", return_value=http_client),
+            patch("omnicli.client.time.sleep"),
+            patch("omnicli.client.random.uniform", return_value=0.1),
+        ):
+            result = client.post_chat_completion(
+                "https://provider.example/v1/chat/completions",
+                {}, {"model": "model-a"}, 1,
+            )
+        self.assertIs(result, response)
+        self.assertEqual(http_client.post.call_count, 3)
+
+    def test_does_not_retry_permanent_client_error(self):
+        client = self._client()
+        response = MagicMock(status_code=401, headers={}, text="unauthorized")
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.__exit__.return_value = False
+        http_client.post.return_value = response
+        with (
+            patch("omnicli.client.httpx.Client", return_value=http_client),
+            patch("omnicli.client.time.sleep") as sleep,
+        ):
+            result = client.post_chat_completion(
+                "https://provider.example/v1/chat/completions",
+                {}, {"model": "model-a"}, 1,
+            )
+        self.assertIs(result, response)
+        http_client.post.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_retries_network_failure_before_returning_response(self):
+        import httpx
+
+        client = self._client()
+        request = httpx.Request("POST", "https://provider.example/v1/chat/completions")
+        response = MagicMock(status_code=200, headers={}, text="", json=lambda: {"ok": True})
+        http_client = MagicMock()
+        http_client.__enter__.return_value = http_client
+        http_client.__exit__.return_value = False
+        http_client.post.side_effect = [httpx.ConnectError("temporary", request=request), response]
+        with (
+            patch("omnicli.client.httpx.Client", return_value=http_client),
+            patch("omnicli.client.time.sleep"),
+        ):
+            result = client.post_chat_completion(
+                "https://provider.example/v1/chat/completions",
+                {}, {"model": "model-a"}, 1,
+            )
+        self.assertIs(result, response)
+        self.assertEqual(http_client.post.call_count, 2)
+
+
 # ── Scanner ──────────────────────────────────────────────────────────────────
 
 class TestClassifyFamily(unittest.TestCase):
@@ -165,6 +257,27 @@ class TestAgentFallbackRoster(unittest.TestCase):
         runner = self._make_runner([])
         roster = runner._model_roster()
         self.assertEqual(roster, ["google/gemini-2.5-flash"])
+
+    def test_tool_agent_uses_shared_retry_transport(self):
+        from omnicli.agent import AgentRunner
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.client = MagicMock()
+        runner.client.get_endpoint_url.return_value = "https://provider.example/v1/chat/completions"
+        runner.client.get_headers.return_value = {"Authorization": "Bearer test"}
+        response = MagicMock(status_code=200, json=lambda: {"choices": []})
+        runner.client.post_chat_completion.return_value = response
+        runner.redteam = False
+
+        result, error = runner._call_model("provider", "model", [{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result, {"choices": []})
+        self.assertIsNone(error)
+        runner.client.post_chat_completion.assert_called_once()
+        self.assertEqual(
+            runner.client.post_chat_completion.call_args.kwargs["url"],
+            "https://provider.example/v1/chat/completions",
+        )
 
 
 # ── ConsensusVerifier vote math ───────────────────────────────────────────────

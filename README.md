@@ -224,6 +224,11 @@ External tools connect to `http://localhost:8000/v1` and route by prefix, e.g.
   missed, and no finding is not proof of safety.
 - Run it directly with `omni verify python-sql path/to/module.py` (optionally
   scoped with `--function name`).
+- Chat-completion requests retry transient rate-limit, server, and network
+  failures up to three attempts, honoring `Retry-After` where available before
+  using the configured model fallback roster. Permanent client errors are not
+  retried, and model calls are not silently redirected to an unconfigured
+  provider.
 - Verification fails **closed**: no proof means no pass.
 - Memory/history files are owner-only.
 

@@ -177,15 +177,19 @@ class AgentRunner:
             "max_tokens": 2048,
         }
         try:
-            with httpx.Client(timeout=90.0) as http_client:
-                res = http_client.post(url, headers=headers, json=payload)
-                if res.status_code in _HARD_FAIL_CODES:
-                    return None, f"hard_fail:{res.status_code}:{res.text[:120]}"
-                if res.status_code in _RETRY_CODES:
-                    return None, f"retry:{res.status_code}:{res.text[:120]}"
-                if res.status_code != 200:
-                    return None, f"error:{res.status_code}:{res.text[:120]}"
-                return res.json(), None
+            res = self.client.post_chat_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=90.0,
+            )
+            if res.status_code in _HARD_FAIL_CODES:
+                return None, f"hard_fail:{res.status_code}:{res.text[:120]}"
+            if res.status_code in _RETRY_CODES:
+                return None, f"retry:{res.status_code}:{res.text[:120]}"
+            if res.status_code != 200:
+                return None, f"error:{res.status_code}:{res.text[:120]}"
+            return res.json(), None
         except httpx.TimeoutException:
             return None, "retry:timeout"
         except Exception as e:

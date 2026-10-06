@@ -6,12 +6,18 @@ Handles streaming, headers, model discovery, authentication, and error reporting
 from __future__ import annotations
 
 import json
+import random
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple
 
 import httpx
 
 from omnicli.config import ConfigManager
+
+
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_MAX_CHAT_ATTEMPTS = 3
 
 
 class ProviderError(Exception):
@@ -55,6 +61,50 @@ class OmniClient:
         base = self.cfg.get_base_url(provider_id).rstrip("/")
         path = path.lstrip("/")
         return f"{base}/{path}"
+
+    @staticmethod
+    def _retry_delay(response: Optional[httpx.Response], attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), 10.0)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after).timestamp()
+                    return min(max(retry_at - time.time(), 0.0), 10.0)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        return min((1.5 ** attempt) + random.uniform(0.1, 0.4), 10.0)
+
+    def post_chat_completion(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        timeout: float,
+    ) -> httpx.Response:
+        """POST a chat request with bounded retries for transient failures only."""
+        with httpx.Client(timeout=timeout) as client:
+            response: Optional[httpx.Response] = None
+            for attempt in range(_MAX_CHAT_ATTEMPTS):
+                try:
+                    response = client.post(url, headers=headers, json=payload)
+                except httpx.RequestError:
+                    if attempt + 1 == _MAX_CHAT_ATTEMPTS:
+                        raise
+                    time.sleep(self._retry_delay(None, attempt))
+                    continue
+
+                if (
+                    response.status_code not in _RETRYABLE_STATUS_CODES
+                    or attempt + 1 == _MAX_CHAT_ATTEMPTS
+                ):
+                    return response
+                time.sleep(self._retry_delay(response, attempt))
+
+        if response is None:
+            raise ProviderError("", None, "Chat request ended without a response")
+        return response
 
     def list_models(self, provider_id: str, timeout: float = 10.0) -> List[Dict[str, Any]]:
         """Fetch available models from the provider.
@@ -317,38 +367,24 @@ class OmniClient:
             payload["max_tokens"] = max_tokens
 
         try:
-            with httpx.Client(timeout=timeout) as client:
-                res = None
-                for attempt in range(3):
-                    res = client.post(url, headers=headers, json=payload)
-                    if res.status_code == 429 and attempt < 2:
-                        retry_after = res.headers.get("Retry-After")
-                        if retry_after and retry_after.isdigit():
-                            wait_sec = min(float(retry_after), 10.0)
-                        else:
-                            import random
-                            wait_sec = (1.5 ** attempt) + random.uniform(0.1, 0.4)
-                        time.sleep(wait_sec)
-                        continue
-                    break
-
-                if res.status_code != 200:
-                    if res.status_code in (400, 404) and any(
-                        x in res.text.lower() for x in ("model_not_found", "does not exist", "not have access", "invalid_model")
-                    ):
-                        try:
-                            from omnicli.scanner import scan_provider
-                            scan_provider(provider_id, cfg=self.cfg, client=self)
-                            new_model = self.cfg.get_default_model(provider_id)
-                            if new_model and new_model != payload["model"]:
-                                payload["model"] = new_model
-                                retry_res = client.post(url, headers=headers, json=payload)
-                                if retry_res.status_code == 200:
-                                    return retry_res.json()
-                        except Exception:
-                            pass
-                    raise ProviderError(provider_id, res.status_code, res.text)
-                return res.json()
+            res = self.post_chat_completion(url, headers, payload, timeout)
+            if res.status_code != 200:
+                if res.status_code in (400, 404) and any(
+                    x in res.text.lower() for x in ("model_not_found", "does not exist", "not have access", "invalid_model")
+                ):
+                    try:
+                        from omnicli.scanner import scan_provider
+                        scan_provider(provider_id, cfg=self.cfg, client=self)
+                        new_model = self.cfg.get_default_model(provider_id)
+                        if new_model and new_model != payload["model"]:
+                            payload["model"] = new_model
+                            retry_res = self.post_chat_completion(url, headers, payload, timeout)
+                            if retry_res.status_code == 200:
+                                return retry_res.json()
+                    except Exception:
+                        pass
+                raise ProviderError(provider_id, res.status_code, res.text)
+            return res.json()
         except httpx.RequestError as e:
             raise ProviderError(provider_id, None, f"Request failed: {e}")
 
