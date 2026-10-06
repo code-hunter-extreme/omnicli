@@ -29,6 +29,28 @@ from omnicli.deterministic import (
 )
 
 
+class TestProviderAuthHeaders(unittest.TestCase):
+    def test_configured_key_is_sent_as_bearer_token(self):
+        from omnicli.client import OmniClient
+
+        cfg = MagicMock()
+        cfg.get_api_key.return_value = "demo-key"
+        client = OmniClient(cfg)
+        scheme, token = client.get_headers("nvidia")["Authorization"].split(" ", 1)
+        self.assertEqual(scheme, "Bearer")
+        self.assertEqual(token, "demo-key")
+
+    def test_existing_bearer_scheme_is_not_duplicated(self):
+        from omnicli.client import OmniClient
+
+        cfg = MagicMock()
+        cfg.get_api_key.return_value = "Bearer " + "demo-key"
+        client = OmniClient(cfg)
+        scheme, token = client.get_headers("nvidia")["Authorization"].split(" ", 1)
+        self.assertEqual(scheme, "Bearer")
+        self.assertEqual(token, "demo-key")
+
+
 # ── Scanner ──────────────────────────────────────────────────────────────────
 
 class TestClassifyFamily(unittest.TestCase):
