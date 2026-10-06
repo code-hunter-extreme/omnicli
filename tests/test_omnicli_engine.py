@@ -609,6 +609,22 @@ class TestScopeGateSSRF(unittest.TestCase):
         self.assertEqual(out["verdict"], "REJECTED")
         self.assertIn("allowed host", out["reason"])
 
+    def test_http_result_distinguishes_wire_match_from_vulnerability_proof(self):
+        import json as _json
+        from types import SimpleNamespace
+        from omnicli.tools import tool_verify_http
+        with patch("omnicli.deterministic.httpx.Client") as client_cls:
+            client_cls.return_value.__enter__.return_value.request.return_value = (
+                SimpleNamespace(status_code=200, text="ok", headers={})
+            )
+            result = _json.loads(tool_verify_http(
+                "https://8.8.8.8/", expected="status 200",
+                allowed_hosts=["8.8.8.8"],
+            ))
+        self.assertEqual(result["verdict"], "CONFIRMED")
+        self.assertEqual(result["verification_type"], "http_response_predicates")
+        self.assertFalse(result["security_vulnerability_confirmed"])
+
     def test_http_tool_requires_scope_and_blocks_mutating_methods_by_default(self):
         import json as _json
         from omnicli.tools import tool_verify_http
@@ -1019,6 +1035,8 @@ class TestVerifyCodeArgs(unittest.TestCase):
         with patch("omnicli.tools.Path.cwd", return_value=Path(path).parent):
             out = _json.loads(tool_verify_code(path, must_contain='["ALPHA_MARKER"]'))
         self.assertEqual(out["verdict"], "CONFIRMED")
+        self.assertEqual(out["verification_type"], "literal_source_pattern")
+        self.assertFalse(out["security_vulnerability_confirmed"])
 
     def test_python_function_scoping(self):
         from omnicli.deterministic import CodeVerifier
@@ -1156,11 +1174,12 @@ class TestSwarm(unittest.TestCase):
         self.assertIn("quote the", redteam_prompt)
         self.assertIn("input-to-impact", redteam_prompt)
         self.assertIn("Do not invent", redteam_prompt)
+        self.assertIn("UNVERIFIED", redteam_prompt)
 
     def test_redteam_synthesis_audits_evidence_instead_of_counting_agreement(self):
         from omnicli.orchestrate import swarm_redteam
         rec = []
-        swarm_redteam(
+        result = swarm_redteam(
             self._cfg(),
             self.FakeClient(record=rec),
             "review source",
@@ -1168,6 +1187,12 @@ class TestSwarm(unittest.TestCase):
             synth=True,
             judge=("p", "judge"),
         )
+        self.assertTrue(result["members"])
+        self.assertTrue(all(
+            member["answer"].startswith("UNVERIFIED MODEL HYPOTHESES")
+            for member in result["members"] if member["answer"]
+        ))
+        self.assertIn("All member claims are unverified hypotheses", result["final"])
         synthesis = [
             call["messages"] for call in rec
             if any(

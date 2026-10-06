@@ -27,9 +27,11 @@ _SWARM_REDTEAM_SYSTEM = (
     "disclosure). Review only source or evidence actually provided in the task. "
     "For each candidate, cite the exact file and line number and quote the "
     "smallest relevant source excerpt verbatim. Explain the concrete input-to-"
-    "impact path. Label a claim PROVEN only when the supplied evidence directly "
-    "demonstrates it; otherwise label it PLAUSIBLE and state what evidence is "
-    "missing. Do not claim a bug is absent because a pattern was not found. "
+    "impact path, including every required precondition. Separate directly "
+    "observed code behavior from the security conclusion. Source inspection "
+    "alone does not prove exploitability; label security claims UNVERIFIED unless "
+    "the supplied evidence establishes the complete path and impact. Do not "
+    "claim a bug is absent because a pattern was not found. "
     "Do not invent code, line numbers, tool results, attacker capabilities, or "
     "impact. Do not call missing validation a vulnerability without a concrete "
     "bypass and consequence. If no actionable issue is established, say so. "
@@ -395,6 +397,13 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     """Multi-model red-team: different families review the target, then consolidate."""
     members = run_swarm(cfg, client, goal, system=_SWARM_REDTEAM_SYSTEM,
                         size=size, max_tokens=max_tokens)
+    for member in members:
+        if member.get("answer"):
+            member["answer"] = (
+                "UNVERIFIED MODEL HYPOTHESES — no deterministic security "
+                "verification was performed for this member's claims.\n\n"
+                + member["answer"]
+            )
     final = None
     if synth:
         final = synthesize(
@@ -412,7 +421,8 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         )
         final = (
             "NOTICE: This is an AI-generated red-team hypothesis review, not a "
-            "deterministically verified security report. Model agreement does "
+            "deterministically verified security report. All member claims are "
+            "unverified hypotheses. Model agreement does "
             "not establish truth; independently validate every claim before "
             "acting on it.\n\n"
             + final

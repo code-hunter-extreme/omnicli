@@ -80,6 +80,12 @@ def tool_verify_http(
         expected_str=expected,
         scope_gate=gate,
     )
+    res["verification_type"] = "http_response_predicates"
+    res["security_vulnerability_confirmed"] = False
+    res["interpretation"] = (
+        "This result confirms or rejects only the specified HTTP response predicates; "
+        "it does not independently establish that the behavior is a vulnerability."
+    )
     return json.dumps(res, indent=2)
 
 
@@ -122,6 +128,12 @@ def tool_verify_code(
         target_function=target_function,
         check_type=check_type,
         allowed_dirs=[Path.cwd()],
+    )
+    res["verification_type"] = "literal_source_pattern"
+    res["security_vulnerability_confirmed"] = False
+    res["interpretation"] = (
+        "This result confirms or rejects only literal source-pattern constraints; "
+        "a match does not prove exploitability and a non-match does not prove safety."
     )
     return json.dumps(res, indent=2)
 
