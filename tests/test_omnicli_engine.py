@@ -761,6 +761,54 @@ class TestCliModeWiring(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("--resume requires --checkpoint PATH", result.output)
 
+    def test_security_evaluation_cli_loads_dataset_and_saves_report(self):
+        import json
+        from omnicli.evaluation import evaluate_security_models
+
+        with tempfile.TemporaryDirectory() as td:
+            dataset = Path(td) / "cases.jsonl"
+            dataset.write_text(
+                json.dumps({
+                    "id": "positive",
+                    "file": "app.py",
+                    "prompt": "Inspect source.",
+                    "source": "unsafe()",
+                    "expected_findings": [{
+                        "category": "injection", "file": "app.py",
+                        "line": 1, "evidence": "unsafe()",
+                    }],
+                }) + "\n" + json.dumps({
+                    "id": "negative",
+                    "file": "safe.py",
+                    "prompt": "Inspect source.",
+                    "source": "safe()",
+                    "expected_findings": [],
+                }) + "\n",
+                encoding="utf-8",
+            )
+            output = Path(td) / "results.json"
+            with patch(
+                "omnicli.evaluation.evaluate_security_models",
+                wraps=evaluate_security_models,
+            ) as evaluate:
+                class EvalClient:
+                    def chat_complete(self, **kwargs):
+                        return {"choices": [{"message": {"content": '{"findings": []}'}}]}
+                with patch("omnicli.cli.client", EvalClient()):
+                    result = self.runner.invoke(
+                        self.main,
+                        [
+                            "evaluate-security", "--dataset", str(dataset),
+                            "--model", "provider:model-a", "--minimum-cases", "2",
+                            "--output", str(output),
+                        ],
+                    )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(evaluate.call_args.args[1][0]["id"], "positive")
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(saved["schema_version"], 1)
+            self.assertIsNone(saved["recommendation"])
+
 
 # ── Agent family rotation ─────────────────────────────────────────────────────
 
@@ -1371,6 +1419,164 @@ class TestVerifyCodeArgs(unittest.TestCase):
 
 
 # ── Swarm orchestration (multi-model, cross-provider, parallel) ─────────────────
+
+class TestSecurityEvaluation(unittest.TestCase):
+    def _dataset(self, directory):
+        import json
+
+        path = Path(directory) / "security-cases.jsonl"
+        cases = [
+            {
+                "id": "unsafe-query",
+                "file": "app/query.py",
+                "prompt": "Review for SQL injection.",
+                "source": 'def find(value):\n    cursor.execute(f"SELECT {value}")\n',
+                "expected_findings": [{
+                    "category": "sql_injection",
+                    "file": "app/query.py",
+                    "line": 2,
+                    "evidence": 'cursor.execute(f"SELECT {value}")',
+                }],
+            },
+            {
+                "id": "safe-query",
+                "file": "app/safe.py",
+                "prompt": "Review for SQL injection.",
+                "source": 'def find(value):\n    cursor.execute("SELECT * FROM t WHERE id = %s", (value,))\n',
+                "expected_findings": [],
+            },
+        ]
+        path.write_text(
+            "\n".join(json.dumps(case) for case in cases) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_load_requires_positive_and_clean_labeled_cases(self):
+        import json
+        from omnicli.evaluation import load_security_dataset
+
+        with tempfile.TemporaryDirectory() as td:
+            path = self._dataset(td)
+            self.assertEqual(len(load_security_dataset(str(path))), 2)
+            cases = [json.loads(line) for line in path.read_text().splitlines()]
+            cases.pop()
+            path.write_text(json.dumps(cases[0]) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "clean case"):
+                load_security_dataset(str(path))
+
+    def test_scores_exact_source_evidence_and_clean_case(self):
+        from omnicli.evaluation import evaluate_security_models, load_security_dataset, recommend_model
+        import json
+
+        class EvaluatorClient:
+            def __init__(self):
+                self.prompts = []
+
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                self.prompts.append(messages[0]["content"])
+                body = json.dumps({
+                    "findings": [{
+                        "category": "sql_injection",
+                        "file": "app/query.py",
+                        "line": 2,
+                        "evidence": 'cursor.execute(f"SELECT {value}")',
+                    }]
+                } if "unsafe-query" in messages[0]["content"] else {"findings": []})
+                return {
+                    "choices": [{"message": {"content": body}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            cases = load_security_dataset(str(self._dataset(td)))
+            client = EvaluatorClient()
+            report = evaluate_security_models(
+                client,
+                cases,
+                [("provider", "model-a")],
+                pricing={"provider:model-a": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 2.0,
+                }},
+            )
+        result = report["models"][0]
+        self.assertEqual((result["true_positives"], result["false_positives"], result["false_negatives"]), (1, 0, 0))
+        self.assertEqual(result["f1"], 1.0)
+        self.assertEqual(result["estimated_cost_usd"], 0.00028)
+        self.assertIn("1: def find(value):", client.prompts[0])
+        self.assertIsNone(recommend_model(report, minimum_cases=3))
+        self.assertEqual(
+            recommend_model(report, minimum_cases=2)["model"],
+            "model-a",
+        )
+
+    def test_unmatched_quote_counts_false_positive_and_false_negative(self):
+        from omnicli.evaluation import evaluate_security_models, load_security_dataset
+        import json
+
+        class FalseEvidenceClient:
+            def chat_complete(self, provider_id, messages, model=None, **kwargs):
+                content = json.dumps({
+                    "findings": [{
+                        "category": "sql_injection",
+                        "file": "app/query.py",
+                        "line": 2,
+                        "evidence": "cursor.execute",
+                    }]
+                } if "unsafe-query" in messages[0]["content"] else {"findings": []})
+                return {"choices": [{"message": {"content": content}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            report = evaluate_security_models(
+                FalseEvidenceClient(),
+                load_security_dataset(str(self._dataset(td))),
+                [("provider", "model-a")],
+            )
+        result = report["models"][0]
+        self.assertEqual((result["true_positives"], result["false_positives"], result["false_negatives"]), (0, 1, 1))
+        self.assertIsNone(result["estimated_cost_usd"])
+
+    def test_invalid_model_output_counts_as_error_and_missed_gold(self):
+        from omnicli.evaluation import (
+            evaluate_security_models, load_security_dataset, recommend_model,
+        )
+
+        class InvalidClient:
+            def chat_complete(self, **kwargs):
+                return {"choices": [{"message": {"content": "not json"}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            report = evaluate_security_models(
+                InvalidClient(),
+                load_security_dataset(str(self._dataset(td))),
+                [("provider", "model-a")],
+            )
+        result = report["models"][0]
+        self.assertEqual(result["errors"], 2)
+        self.assertEqual(result["false_negatives"], 1)
+        self.assertIsNone(recommend_model(report, minimum_cases=1))
+
+    def test_invalid_pricing_fails_before_any_model_call(self):
+        from omnicli.evaluation import evaluate_security_models, load_security_dataset
+
+        class UnusedClient:
+            def chat_complete(self, **kwargs):
+                raise AssertionError("invalid pricing must be rejected before API calls")
+
+        with tempfile.TemporaryDirectory() as td:
+            cases = load_security_dataset(str(self._dataset(td)))
+            with self.assertRaisesRegex(ValueError, "input_per_million"):
+                evaluate_security_models(
+                    UnusedClient(),
+                    cases,
+                    [("provider", "model-a")],
+                    pricing={"provider:model-a": {
+                        "input_per_million": float("nan"),
+                        "output_per_million": 1.0,
+                    }},
+                )
+
 
 class TestSwarm(unittest.TestCase):
     def _cfg(self):

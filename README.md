@@ -262,8 +262,38 @@ their frameworks as runtime dependencies:
 | Dynamiq | Dependency-aware execution and explicit detection of conflicting parallel updates. | Planned. |
 | Solace Agent Mesh | Event-driven visibility into run/member/synthesis lifecycle without requiring its deprecated Python runtime. | Basic local event log implemented; external event transport is not. |
 | LiteLLM | Bounded shared provider retries and transparent configured-roster failover. | Shared retry transport implemented; broader adapter unification remains planned. |
-| RouteLLM | Choose models using measured audit quality and cost, not intuition or general-chat scores. | Deferred until a labeled security-audit evaluation set exists. |
+| RouteLLM | Compare models using measured security-audit quality and optional per-model price data, not intuition or general-chat scores. | Offline-labeled evaluation and recommendation command implemented; automatic routing remains disabled. |
 
 Checkpoint files contain prompts (which may include source code) and model
 responses in plaintext. They are opt-in and created with owner-only file
 permissions; do not store sensitive prompts in a location accessible to others.
+
+### Labeled security evaluation
+
+Compare candidates on an operator-reviewed JSONL dataset:
+
+```bash
+omni evaluate-security \
+  --dataset security-cases.jsonl \
+  --model openrouter:provider/model-a \
+  --model nvidia:provider/model-b \
+  --minimum-cases 20 \
+  --output evaluation-results.json
+```
+
+Each non-empty line is one case. The dataset must include both positive and clean
+cases. Expected evidence must occur in the source; a true positive requires an
+exact category, file, line, and quoted evidence match:
+
+```json
+{"id":"sqli-01","file":"app/query.py","prompt":"Review this function for SQL injection.","source":"def find(value):\n    cursor.execute(f\"SELECT {value}\")\n","expected_findings":[{"category":"sql_injection","file":"app/query.py","line":2,"evidence":"cursor.execute(f\"SELECT {value}\")"}]}
+{"id":"clean-01","file":"app/safe.py","prompt":"Review this function for SQL injection.","source":"def find(value):\n    cursor.execute(\"SELECT * FROM t WHERE id = %s\", (value,))\n","expected_findings":[]}
+```
+
+The command reports precision, recall, F1, request errors, p50 latency, and cost
+only when an optional `--pricing` JSON file supplies per-model
+`input_per_million` / `output_per_million` rates and provider responses include
+token usage. Its recommendation is advisory, requires the configured minimum
+number of error-free cases and at least one exact match, and does not change
+normal model routing. A benchmark is only as reliable as its independently
+reviewed labels and representative cases.

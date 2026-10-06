@@ -527,6 +527,131 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
         )
 
 
+@main.command("evaluate-security")
+@click.option(
+    "--dataset", "dataset_path", required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Labeled JSONL security benchmark; see README for the schema",
+)
+@click.option(
+    "--model", "model_specs", multiple=True, required=True,
+    help="Model to evaluate as provider:model; repeat to compare candidates",
+)
+@click.option(
+    "--minimum-cases", type=click.IntRange(min=1), default=10, show_default=True,
+    help="Minimum labeled cases before a model recommendation is shown",
+)
+@click.option(
+    "--pricing", type=click.Path(exists=True, dir_okay=False),
+    help="Optional JSON price map keyed by provider:model",
+)
+@click.option(
+    "--output", type=click.Path(dir_okay=False),
+    help="Optional path to save the full JSON evaluation report",
+)
+def cmd_evaluate_security(
+    dataset_path: str,
+    model_specs: tuple,
+    minimum_cases: int,
+    pricing: Optional[str],
+    output: Optional[str],
+) -> None:
+    """Compare red-team models against an operator-labeled security dataset."""
+    import json
+    import math
+    from omnicli.evaluation import (
+        evaluate_security_models,
+        load_security_dataset,
+        recommend_model,
+    )
+
+    models = []
+    for spec in model_specs:
+        if ":" not in spec:
+            raise click.BadParameter(
+                "models must use provider:model format", param_hint="--model"
+            )
+        provider_id, model_id = spec.split(":", 1)
+        if not provider_id.strip() or not model_id.strip():
+            raise click.BadParameter("model provider and id must not be empty", param_hint="--model")
+        models.append((provider_id.strip(), model_id.strip()))
+
+    price_data = None
+    if pricing:
+        try:
+            price_data = json.loads(Path(pricing).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise click.BadParameter(f"could not read pricing JSON: {exc}", param_hint="--pricing") from exc
+        if not isinstance(price_data, dict):
+            raise click.BadParameter("pricing file must contain a JSON object", param_hint="--pricing")
+        for model_key, rates in price_data.items():
+            if (
+                not isinstance(rates, dict)
+                or not isinstance(rates.get("input_per_million"), (int, float))
+                or not isinstance(rates.get("output_per_million"), (int, float))
+                or isinstance(rates.get("input_per_million"), bool)
+                or isinstance(rates.get("output_per_million"), bool)
+                or not math.isfinite(rates.get("input_per_million", float("nan")))
+                or not math.isfinite(rates.get("output_per_million", float("nan")))
+                or rates["input_per_million"] < 0
+                or rates["output_per_million"] < 0
+            ):
+                raise click.BadParameter(
+                    f"invalid prices for {model_key}; provide non-negative input_per_million and output_per_million",
+                    param_hint="--pricing",
+                )
+
+    try:
+        cases = load_security_dataset(dataset_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        with console.status(
+            f"[cyan]Evaluating {len(models)} model(s) on {len(cases)} labeled security case(s)...[/cyan]"
+        ):
+            report = evaluate_security_models(client, cases, models, pricing=price_data)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    report["recommendation"] = recommend_model(report, minimum_cases=minimum_cases)
+
+    table = Table(title="Security Model Evaluation", border_style="dim")
+    table.add_column("Provider / Model", style="cyan")
+    table.add_column("Cases", justify="right")
+    table.add_column("P / R / F1", justify="right")
+    table.add_column("Errors", justify="right")
+    table.add_column("P50 ms", justify="right")
+    table.add_column("Est. cost", justify="right")
+    for result in sorted(report["models"], key=lambda item: (-item["f1"], item["provider"], item["model"])):
+        cost = f"${result['estimated_cost_usd']:.6f}" if result["estimated_cost_usd"] is not None else "n/a"
+        table.add_row(
+            f"{result['provider']}:{result['model']}",
+            str(result["cases"]),
+            f"{result['precision']:.3f} / {result['recall']:.3f} / {result['f1']:.3f}",
+            str(result["errors"]),
+            str(result["p50_latency_ms"]),
+            cost,
+        )
+    console.print(table)
+    recommendation = report["recommendation"]
+    if recommendation:
+        console.print(
+            f"Measured recommendation (not automatically routed): "
+            f"[bold]{recommendation['provider']}:{recommendation['model']}[/bold] "
+            f"(F1 {recommendation['f1']:.3f}; tie-break {recommendation['tie_breaker']})"
+        )
+    else:
+        console.print(
+            f"[yellow]No recommendation:[/yellow] each candidate needs at least "
+            f"{minimum_cases} error-free labeled cases."
+        )
+    console.print("[dim]This score measures only the supplied labels; it is not exploitability proof.[/dim]")
+    if output:
+        output_path = Path(output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        console.print(f"Full report saved to {output_path}")
+
+
 @main.command("agent")
 @click.option("-p", "--provider", help="Supervisor provider (default: openrouter or nvidia)")
 @click.option("-m", "--model", help="Supervisor model")
