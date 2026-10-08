@@ -83,6 +83,92 @@ def write_status(
         return None
 
 
+# ── Deterministic engine health (no network) ─────────────────────────────────
+#
+# Reports each registered red-team engine's version, rule-set date, staleness,
+# and a canary result. The canary runs every engine against a tiny fixture:
+# a pickle.loads sink must be SUPPORTED by python_general and NOT_COVERED by
+# python_web; an auth finding on a routeless file must be NOT_COVERED by
+# python_web. A canary failure is a result, not a crash.
+
+_CANARY_SOURCES = {
+    "canary.py": (
+        "import pickle\n"
+        "\n"
+        "def load_blob(data):\n"
+        "    return pickle.loads(data)\n"
+    ),
+}
+
+_CANARY_CANDIDATES = [
+    {
+        "id": "canary-deser",
+        "category": "unsafe_deserialization",
+        "file": "canary.py",
+        "start_line": 4,
+        "end_line": 4,
+        "quote": "return pickle.loads(data)",
+        "finding": "canary unsafe deserialization",
+    },
+    {
+        "id": "canary-auth",
+        "category": "authentication_authorization",
+        "file": "canary.py",
+        "start_line": 3,
+        "end_line": 3,
+        "quote": "def load_blob(data):",
+        "finding": "canary auth finding",
+    },
+]
+
+_CANARY_EXPECTED = {
+    "python_general": {"canary-deser": "supported", "canary-auth": "not_covered"},
+    "python_web": {"canary-deser": "not_covered", "canary-auth": "not_covered"},
+}
+
+
+def engine_health_report() -> List[Dict[str, Any]]:
+    """Per-engine health: version, rule-set date, staleness, canary pass/fail."""
+    from datetime import date as _date
+
+    from omnicli.engines import ENGINE_REGISTRY
+
+    today = _date.today()
+    records: List[Dict[str, Any]] = []
+    try:
+        engines = list(ENGINE_REGISTRY.values())
+    except Exception as e:  # noqa: BLE001 - report the failure, don't crash
+        return [{"engine": "<registry>", "ok": False, "error": str(e)[:120]}]
+    for engine in engines:
+        rec: Dict[str, Any] = {
+            "engine": engine.name,
+            "version": engine.version,
+            "rule_set_date": engine.rule_set_date,
+        }
+        try:
+            rule_date = _date.fromisoformat(str(engine.rule_set_date))
+            rec["staleness_days"] = (today - rule_date).days
+        except ValueError:
+            rec["staleness_days"] = None
+        try:
+            votes = engine.analyze(_CANARY_SOURCES, _CANARY_CANDIDATES)
+            expected = _CANARY_EXPECTED.get(engine.name, {})
+            mismatches = [
+                f"{cid}: got {votes[cid].vote}, want {want}"
+                for cid, want in expected.items()
+                if cid not in votes or votes[cid].vote != want
+            ]
+            rec["canary"] = {
+                "ok": not mismatches,
+                "detail": "; ".join(mismatches)[:200] if mismatches else "2/2 fixtures as expected",
+            }
+        except Exception as e:  # noqa: BLE001 - canary failure is a result
+            rec["canary"] = {"ok": False, "error": str(e)[:120]}
+        rec["ok"] = bool(rec.get("canary", {}).get("ok", False))
+        records.append(rec)
+    return records
+
+
 # ── Task runner (increment D) ──────────────────────────────────────────────────
 #
 # Health checks above are the default. The task file is USER-POPULATED: a JSON

@@ -146,6 +146,7 @@ class ChatSession:
         # re-layered on top whenever the active provider changes.
         self.base_system_prompt = self.system_prompt
         self.messages: List[Dict[str, str]] = []
+        self.pending_files: Dict[str, str] = {}
         self.last_report_path: Optional[str] = None
 
         if self.system_prompt:
@@ -401,6 +402,7 @@ class ChatSession:
 
         elif cmd == "/clear":
             self.messages = []
+            self.pending_files = {}
             if self.system_prompt:
                 self.messages.append({"role": "system", "content": self.system_prompt})
             self.console.print("[bold yellow]Chat history cleared.[/bold yellow]")
@@ -432,9 +434,23 @@ class ChatSession:
                 else:
                     try:
                         content = fpath.read_text(encoding="utf-8", errors="replace")
-                        formatted = f"\n\n[File Content: {fpath.name}]\n```\n{content}\n```\n"
-                        self.messages.append({"role": "user", "content": formatted})
-                        self.console.print(f"[bold green]Loaded file into context:[/bold green] {fpath.name} ({len(content)} chars)")
+                        pending_files = getattr(self, "pending_files", {})
+                        total_chars = sum(
+                            len(existing)
+                            for existing_path, existing in pending_files.items()
+                            if existing_path != str(fpath)
+                        ) + len(content)
+                        if total_chars > 200_000:
+                            self.console.print(
+                                "[red]Attached source files exceed the 200,000-character limit.[/red]"
+                            )
+                        else:
+                            pending_files[str(fpath)] = content
+                            self.pending_files = pending_files
+                            self.console.print(
+                                f"[bold green]Loaded file for the next prompt:[/bold green] "
+                                f"{fpath} ({len(content):,} chars)"
+                            )
                     except Exception as e:
                         self.console.print(f"[red]Error reading file: {e}[/red]")
 
@@ -532,11 +548,43 @@ class ChatSession:
 
     def stream_turn(self, user_prompt: str) -> None:
         self._apply_memory()  # refresh memory for the active provider
-        self.messages.append({"role": "user", "content": user_prompt})
+        pending_files = dict(getattr(self, "pending_files", {}))
+        orchestration_prompt = user_prompt
+        source_files = {}
+        if self.mode == "redteam":
+            from omnicli.evidence import extract_sources_from_prompt
+
+            source_files = {
+                **extract_sources_from_prompt(user_prompt),
+                **pending_files,
+            }
+            if sum(len(content) for content in source_files.values()) > 200_000:
+                self.console.print(
+                    "[red]Red-team source files exceed the 200,000-character limit.[/red]"
+                )
+                return
+        self.pending_files = {}
+        if pending_files and self.mode != "redteam":
+            orchestration_prompt += "\n\n" + "\n\n".join(
+                f"### Source file: {path}\n```text\n{content}\n```"
+                for path, content in pending_files.items()
+            )
+        self.messages.append({"role": "user", "content": orchestration_prompt})
 
         if self.mode in ("collaborate", "builder", "redteam"):
             from omnicli.orchestrate import run_orchestration
             from rich.markup import escape
+            if self.mode == "redteam" and source_files:
+                disclosed_files = "\n".join(
+                    f"- {escape(path)} ({len(content):,} characters)"
+                    for path, content in source_files.items()
+                )
+                self.console.print(Panel(
+                    "These explicitly supplied files will be sent to the "
+                    "configured model providers:\n" + disclosed_files,
+                    title="Red-Team Source Disclosure",
+                    border_style="yellow",
+                ))
             t0 = time.perf_counter()
             with self.console.status(
                 f"[bold cyan]Council ({self.mode.upper()}) reasoning across {self.council_size} models in parallel...[/bold cyan]",
@@ -546,10 +594,11 @@ class ChatSession:
                     mode=self.mode,
                     cfg=self.cfg,
                     client=self.client,
-                    prompt=user_prompt,
+                    prompt=orchestration_prompt if self.mode != "redteam" else user_prompt,
                     size=self.council_size,
                     synth=True,
                     judge=(self.provider, self.model),
+                    source_files=source_files,
                 )
             total_time = time.perf_counter() - t0
 
@@ -563,14 +612,67 @@ class ChatSession:
                     preview = escape(r["answer"][:300] + ("..." if len(r["answer"]) > 300 else ""))
                     self.console.print(Panel(preview, title=head, border_style="dim"))
 
+            evidence_gate = out.get("evidence_gate")
+            if self.mode == "redteam" and evidence_gate is None:
+                evidence_gate = {
+                    "status": "FAIL",
+                    "security_conclusion": "NOT_ASSESSED",
+                    "failed_checks": [
+                        "Red-team run returned no deterministic evidence-gate result."
+                    ],
+                }
+
             # Display final synthesized answer
             final_ans = out.get("final") or "All swarm members failed to respond."
             title_mode = {
                 "collaborate": "[bold green]SYNTHESIZED CONSENSUS (All Models Reasoning Together)[/bold green]",
                 "builder": "[bold green]HARDENED BUILD (Builders Fortified Against Red-Team)[/bold green]",
-                "redteam": "[bold green]CONSOLIDATED RED-TEAM FINDINGS[/bold green]",
+                "redteam": "[bold yellow]EVIDENCE-LED RED-TEAM TRIAGE (NOT A SECURITY VERDICT)[/bold yellow]",
             }.get(self.mode, "[bold green]ORCHESTRATED CONSENSUS[/bold green]")
-            self.console.print(Panel(Markdown(final_ans), title=title_mode, border_style="green"))
+            final_border = (
+                "red"
+                if evidence_gate and evidence_gate.get("status") != "PASS_GROUNDING_ONLY"
+                else "yellow"
+                if self.mode == "redteam"
+                else "green"
+            )
+            self.console.print(
+                Panel(Markdown(final_ans), title=title_mode, border_style=final_border)
+            )
+
+            if evidence_gate:
+                failures = evidence_gate.get("failed_checks", [])
+                detail = "\n".join(f"- {item}" for item in failures)
+                if not detail:
+                    detail = evidence_gate.get(
+                        "meaning", "Grounding only; security was not assessed."
+                    )
+                self.console.print(Panel(
+                    f"EVIDENCE GATE: {evidence_gate.get('status', 'FAIL')}\n"
+                    f"Security conclusion: "
+                    f"{evidence_gate.get('security_conclusion', 'NOT_ASSESSED')}\n"
+                    f"{detail}",
+                    title="Deterministic Evidence Gate",
+                    border_style=(
+                        "yellow"
+                        if evidence_gate.get("status") == "PASS_GROUNDING_ONLY"
+                        else "red"
+                    ),
+                ))
+
+            if self.mode == "redteam" and out.get("scenario_coverage"):
+                rows = [
+                    f"- {item['id']}: {item.get('completed_reviews', 0)}/"
+                    f"{item.get('reviews', len(out.get('members', [])) if item.get('triggered') else 0)} "
+                    "review responses complete"
+                    for item in out["scenario_coverage"]
+                ]
+                self.console.print(Panel(
+                    "\n".join(rows)
+                    + "\n\nCompletion is not evidence of security or completeness.",
+                    title="Source-Security Scenario Coverage",
+                    border_style="cyan",
+                ))
 
             if out.get("report_path"):
                 self.last_report_path = out["report_path"]

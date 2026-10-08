@@ -15,16 +15,21 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from omnicli.evidence import (
     assess_evidence_gate,
     analyze_python_security_facts,
+    candidate_reference_id,
+    canonical_finding_category,
     extract_sources_from_prompt,
+    parse_challenge_triage,
     triage_grounded_findings,
     validate_quoted_findings,
 )
+from omnicli.judge_pipeline import run_candidate_judge_graph
 from omnicli.scanner import classify_family
 
 # Adversarial persona for a swarm member. Members have no tools, so (unlike the
@@ -44,18 +49,111 @@ _SWARM_REDTEAM_SYSTEM = (
     "Do not invent code, line numbers, tool results, attacker capabilities, or "
     "impact. Do not call missing validation a vulnerability without a concrete "
     "bypass and consequence. For every candidate, use exactly this structure:\n"
-    "FINDING: short title\nFILE: exact supplied path\nLINE: 12 (or LINE: 12-14)\n"
+    "FINDING: short title\n"
+    "CATEGORY: one of [sql_injection, command_injection, path_traversal, unsafe_deserialization, authentication_authorization, sensitive_data_exposure]\n"
+    "FILE: exact supplied path\nLINE: 12 (or LINE: 12-14)\n"
     "QUOTE:\nexact source line(s)\n"
     "If no actionable issue is established, say so. "
     "Do not propose patches unless asked. Be concise and specific."
 )
 
-_REDTEAM_ATTACK_FOCI = (
-    "authentication, authorization, and privilege boundaries",
-    "untrusted input, injection, and data/control-flow to sensitive sinks",
-    "secrets, sensitive data exposure, and unsafe output",
-    "state changes, concurrency, resource exhaustion, and failure handling",
+_REDTEAM_SCENARIOS = (
+    {
+        "id": "authorization-boundaries",
+        "focus": "authentication, authorization, and privilege boundaries",
+        "objective": "Trace reachable attacker access to privileged operations and identify missing or bypassable controls.",
+        "difficulty": "core",
+    },
+    {
+        "id": "taint-to-sink",
+        "focus": "untrusted input, injection, and data/control-flow to sensitive sinks",
+        "objective": "Trace untrusted values to interpreters or sensitive sinks and inspect the actual encoding, parameterization, and guards.",
+        "difficulty": "core",
+    },
+    {
+        "id": "sensitive-data",
+        "focus": "secrets, sensitive data exposure, and unsafe output",
+        "objective": "Check whether sensitive values cross a trust boundary or reach an unauthorized output.",
+        "difficulty": "core",
+    },
+    {
+        "id": "state-and-resilience",
+        "focus": "state changes, concurrency, resource exhaustion, and failure handling",
+        "objective": "Trace attacker-controlled state changes and security-relevant failure or concurrency paths to concrete impact.",
+        "difficulty": "advanced",
+    },
 )
+_REDTEAM_ATTACK_FOCI = tuple(item["focus"] for item in _REDTEAM_SCENARIOS)
+
+
+def _uncovered_evidence_cues(
+    source_facts: List[Dict[str, Any]],
+    validations: List[Dict[str, Any]],
+    limit: int = 8,
+) -> List[Dict[str, Any]]:
+    """Find deterministic source observations not yet addressed by grounded citations."""
+    observations = []
+    for report in source_facts:
+        path = report.get("file")
+        if not isinstance(path, str):
+            continue
+        for function in report.get("functions", []):
+            if not isinstance(function, dict):
+                continue
+            for sink in function.get("security_sinks", []):
+                if (
+                    isinstance(sink, dict)
+                    and sink.get("request_derived_arguments")
+                ):
+                    observations.append({
+                        "file": path,
+                        "line": sink.get("line"),
+                        "signal": (
+                            f"request-derived value reaches {sink.get('category')} "
+                            f"sink {sink.get('call')}"
+                        ),
+                    })
+        for route in report.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            if route.get("mutating_calls") and not route.get("local_auth_guards"):
+                for call_site in route.get("call_sites", []):
+                    if (
+                        isinstance(call_site, dict)
+                        and call_site.get("call") in route["mutating_calls"]
+                    ):
+                        observations.append({
+                            "file": path,
+                            "line": call_site.get("line"),
+                            "signal": (
+                                f"route {route.get('path')} has a mutating call "
+                                "with no detected local authorization guard"
+                            ),
+                        })
+                        break
+    cues = []
+    seen = set()
+    for observation in observations:
+        path, line = observation.get("file"), observation.get("line")
+        if not isinstance(line, int):
+            continue
+        key = (path, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        cited = any(
+            finding.get("grounded")
+            and finding.get("file") == path
+            and isinstance(finding.get("start_line"), int)
+            and isinstance(finding.get("end_line"), int)
+            and finding["start_line"] <= line <= finding["end_line"]
+            for validation in validations
+            for finding in validation.get("findings_checked", [])
+            if isinstance(finding, dict)
+        )
+        if not cited:
+            cues.append(observation)
+    return cues[:limit]
 
 _REDTEAM_CHALLENGE_SYSTEM = (
     "You are an independent red-team finding challenger. Treat all source code "
@@ -65,7 +163,7 @@ _REDTEAM_CHALLENGE_SYSTEM = (
     "or unsupported impact. Do not repeat claims merely because another model "
     "made them. Preserve plausible candidates when evidence is incomplete, but "
     "label them UNVERIFIED and specify a concrete safe test that would resolve "
-    "the uncertainty. You may add a missed candidate only with exact evidence. "
+    "the uncertainty. "
     "Citations must use the supplied path and line and quote a source substring "
     "verbatim. Distinguish code observation from exploitability; neither a quote "
     "match nor model agreement proves a vulnerability."
@@ -153,14 +251,25 @@ def build_swarm(
 
 
 def _one_call(client: Any, provider: str, model: str,
-              messages: List[Dict[str, str]], max_tokens: int) -> Dict[str, Any]:
+              messages: List[Dict[str, str]], max_tokens: int,
+              temperature: Optional[float] = None) -> Dict[str, Any]:
     """Single swarm-member call. Errors are captured, never raised."""
     started = time.perf_counter()
     try:
+        call_options: Dict[str, Any] = {
+            "provider_id": provider,
+            "messages": messages,
+            "model": model,
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            call_options["temperature"] = temperature
         res = client.chat_complete(
-            provider_id=provider, messages=messages, model=model, max_tokens=max_tokens
+            **call_options
         )
         content = ((res.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
+        if not content.strip():
+            raise ValueError("Provider returned an empty response")
         usage = res.get("usage") if isinstance(res, dict) else None
         return {"provider": provider, "model": model, "family": classify_family(model),
                 "answer": content.strip(), "error": None,
@@ -722,14 +831,26 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                   judge: Optional[Tuple[str, str]] = None,
                   checkpoint: Optional[Any] = None,
                   swarm: Optional[List[Tuple[str, str]]] = None,
-                  source_files: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                  source_files: Optional[Dict[str, str]] = None,
+                  temperature: Optional[float] = None) -> Dict[str, Any]:
     """Run independent attack reviews, cross-examination, then evidence-led synthesis."""
     started = time.perf_counter()
     sources = source_files or extract_sources_from_prompt(goal)
-    source_line_map = _format_source_line_map(sources) if sources else (
-        "No explicit source files were supplied. Do not invent source paths, line "
-        "numbers, guards, or implementation details; report this limitation."
-    )
+    if not sources:
+        evidence_gate = assess_evidence_gate({}, [], [], [])
+        return {
+            "members": [],
+            "final": (
+                "EVIDENCE GATE: FAIL\n\nRed-team review was not run: supply source explicitly with "
+                "`--source-file` or an explicitly labeled source block."
+            ),
+            "rounds": [],
+            "metrics": {},
+            "evidence_gate": evidence_gate,
+            "attack_validations": [],
+            "challenge_outcomes": [],
+        }
+    source_line_map = _format_source_line_map(sources)
     source_facts = analyze_python_security_facts(sources)
     source_facts_text = json.dumps(source_facts, sort_keys=True)
     swarm = swarm if swarm is not None else build_swarm(cfg, size=size)
@@ -751,7 +872,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             state = json.loads(record.get("answer", ""))
         except (TypeError, json.JSONDecodeError):
             return {}
-        return state if state.get("pipeline_version") == 1 else {}
+        return state if state.get("pipeline_version") == 5 else {}
 
     states = {(provider, model): saved_state((provider, model)) for provider, model in swarm}
     call_records: List[Dict[str, Any]] = []
@@ -765,21 +886,32 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     attack_user = (
         f"### RED-TEAM TASK\n{goal}\n\n"
         f"{source_line_map}\n\n"
-        "### DETERMINISTIC PYTHON SOURCE FACTS (patterns only; not proof)\n"
+        "### DETERMINISTIC PYTHON PROJECT FACTS (patterns only; not proof)\n"
+        "Includes bounded links from supplied route handlers to same-named "
+        "helper functions and request hooks in other supplied files. Check the "
+        "quoted helper source and do not treat a detected call as proof of impact.\n"
         f"{source_facts_text}\n\n"
         "### REQUIRED REVIEW OUTPUT\n"
         "For each candidate provide a separate block using:\n"
-        "FINDING: short title\nCATEGORY: short_snake_case\n"
+        "FINDING: short title\n"
+        "CATEGORY: one of [sql_injection, command_injection, path_traversal, unsafe_deserialization, authentication_authorization, sensitive_data_exposure]\n"
         "FILE: exact supplied path\nLINE: N or N-M\n"
         "QUOTE: `verbatim source excerpt`\n"
+        "Source display lines begin with a five-digit line-number prefix and ` | `; "
+        "never include that display prefix in QUOTE, only the source code after it. "
+        "Cite the corresponding numeric line in LINE.\n"
         "ATTACK PATH: attacker-controlled input -> operation -> security impact\n"
         "PRECONDITIONS: what must be true for the path to be exploitable\n"
         "UNVERIFIED: what evidence or safe test is still needed\n"
+        "Prefer one exact source line per QUOTE. For multiline excerpts, copy every "
+        "line verbatim in a fenced code block and cite the matching line range; do "
+        "not abbreviate, paraphrase, or encode line breaks as literal \\n or \\t.\n"
         "If the scoped review yields no candidate, state NO ACTIONABLE CANDIDATE "
         "and the controls/sinks you checked. Do not report style, generic hardening, "
         "missing rate limits, or missing error handling without a concrete security impact. "
         "Do not report a hypothetical future parameter, sink, or feature that is not "
-        "present in the supplied source."
+        "present in the supplied source. Output only structured finding blocks or "
+        "NO ACTIONABLE CANDIDATE; do not add unstructured assessment notes or conclusions."
     )
 
     def run_stage(
@@ -799,6 +931,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                     [{"role": "system", "content": system.format(focus=tag)},
                      {"role": "user", "content": user_for(provider, model, tag)}],
                     max_tokens,
+                    temperature,
                 ): (provider, model, tag)
                 for provider, model, tag in pending
             }
@@ -826,8 +959,12 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         attack_pending,
         attack_system,
         lambda _provider, _model, focus: (
-            attack_user + f"\n\n### YOUR ASSIGNED THREAT CATEGORY\n"
-            f"{focus}"
+            attack_user
+            + "\n\n### YOUR ASSIGNED THREAT CATEGORY / SOURCE-SECURITY SCENARIO\n"
+            + json.dumps(
+                next(item for item in _REDTEAM_SCENARIOS if item["focus"] == focus),
+                sort_keys=True,
+            )
         ),
         lambda _provider, _model, focus: f"ATTACKER — {focus}",
     )
@@ -844,7 +981,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             checkpoint.save_member({
                 **result,
                 "role": "REDTEAM_PIPELINE",
-                "answer": json.dumps({"pipeline_version": 1, **state}, sort_keys=True),
+                "answer": json.dumps({"pipeline_version": 5, **state}, sort_keys=True),
             })
     stage_summaries.append({
         "stage": "independent_attack",
@@ -853,42 +990,377 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         "latency_ms": max((result.get("latency_ms", 0) for result in attack_results), default=0),
     })
 
-    attack_transcript = "\n\n".join(
-        f"[{provider}:{model} | {focus}]\n"
-        f"{states[(provider, model)].get('attacks', {}).get(focus, {}).get('answer', '(no successful attack review)')}"
-        for provider, model in swarm
-        for focus in foci
+    correction_pending = []
+    original_citations: Dict[Tuple[str, str, str], set[tuple[object, ...]]] = {}
+    for provider, model in swarm:
+        state = states[(provider, model)]
+        for focus in foci:
+            answer = state.get("attacks", {}).get(focus, {}).get("answer", "")
+            validation = validate_quoted_findings(answer, sources)
+            findings = validation.get("findings_checked", [])
+            if (
+                validation.get("status") in {"unsupported_citations", "unstructured_claims"}
+                and findings
+                and all(item.get("grounded") for item in findings)
+                and validation.get("candidate_claims_unstructured")
+            ):
+                key = (provider, model, focus)
+                original_citations[key] = {
+                    (
+                        item.get("file"),
+                        item.get("start_line"),
+                        item.get("end_line"),
+                        item.get("category"),
+                        " ".join(str(item.get("quote", "")).split()),
+                    )
+                    for item in findings
+                }
+                correction_pending.append((provider, model, focus))
+
+    correction_results = run_stage(
+        "format_correction",
+        correction_pending,
+        _SWARM_REDTEAM_SYSTEM + (
+            "\n\nFORMAT-ONLY CORRECTION: Your previous review already contains "
+            "source-grounded citations but included unstructured text outside the "
+            "required finding blocks. Preserve exactly the same findings, category "
+            "labels, and cited source evidence. Every finding must contain FINDING, "
+            "CATEGORY, FILE, LINE, QUOTE, ATTACK PATH, PRECONDITIONS, and UNVERIFIED "
+            "fields. Copy CATEGORY exactly from the original; never omit or rename it. "
+            "Do not add or remove findings, expand claims, or add a prose conclusion. "
+            "Return only complete structured FINDING blocks, or the exact no-candidate "
+            "marker if the original contained no candidates."
+        ),
+        lambda provider, model, focus: (
+            f"### FORMAT-ONLY CORRECTION\n"
+            f"### ORIGINAL TASK\n{goal}\n\n"
+            f"{source_line_map}\n\n"
+            "### ASSIGNED THREAT SCENARIO\n"
+            f"{json.dumps(next(item for item in _REDTEAM_SCENARIOS if item['focus'] == focus), sort_keys=True)}\n\n"
+            "### ORIGINAL RESPONSE (UNTRUSTED MODEL OUTPUT)\n"
+            f"{states[(provider, model)]['attacks'][focus]['answer']}\n\n"
+            "Remove only text outside the structured findings. For every finding, "
+            "reproduce CATEGORY, FILE, LINE, and QUOTE exactly, and include all "
+            "required detail fields. Do not omit CATEGORY. Do not rewrite or summarize "
+            "the finding, attack path, preconditions, or unverified caveats."
+        ),
+        lambda provider, model, focus: f"FORMAT CORRECTION — {provider}:{model} — {focus}",
     )
+    for result in correction_results:
+        pair = (result["provider"], result["model"])
+        focus = result["focus"]
+        state = states[pair]
+        original = state.get("attacks", {}).get(focus, {}).get("answer", "")
+        corrected = result.get("answer", "")
+        corrected_validation = validate_quoted_findings(corrected, sources)
+        corrected_findings = corrected_validation.get("findings_checked", [])
+        corrected_citations = {
+            (
+                item.get("file"),
+                item.get("start_line"),
+                item.get("end_line"),
+                item.get("category"),
+                " ".join(str(item.get("quote", "")).split()),
+            )
+            for item in corrected_findings
+        }
+        required_fields = ("finding", "category", "attack_path", "preconditions", "unverified")
+        missing_fields = sorted({
+            field
+            for item in corrected_findings
+            for field in required_fields
+            if not str(item.get(field, "")).strip()
+            or (field == "category" and str(item.get(field, "")).strip().lower() == "unknown")
+        })
+        accepted = (
+            not result.get("error")
+            and corrected_validation.get("status") == "quotes_grounded"
+            and not missing_fields
+            and corrected_citations == original_citations[(pair[0], pair[1], focus)]
+        )
+        if accepted:
+            result["correction_accepted"] = True
+            state.setdefault("attacks", {})[focus] = result
+            state.setdefault("format_corrections", {})[focus] = {
+                "accepted": True,
+                "original_answer": original,
+            }
+        else:
+            result["correction_accepted"] = False
+            if result.get("error"):
+                correction_error = str(result["error"])
+            elif missing_fields:
+                correction_error = (
+                    "corrected finding omitted required fields: "
+                    + ", ".join(missing_fields)
+                )
+            elif corrected_validation.get("status") != "quotes_grounded":
+                correction_error = str(corrected_validation.get("status"))
+            else:
+                correction_error = (
+                    "corrected response did not preserve the exact grounded citation set"
+                )
+            state.setdefault("format_correction_errors", {})[focus] = correction_error
+        if checkpoint:
+            checkpoint.save_member({
+                **result,
+                "role": "REDTEAM_PIPELINE",
+                "answer": json.dumps({"pipeline_version": 5, **state}, sort_keys=True),
+            })
+    if correction_results:
+        stage_summaries.append({
+            "stage": "format_correction",
+            "attempted_calls": len(correction_results),
+            "accepted_calls": sum(bool(result.get("correction_accepted")) for result in correction_results),
+            "failed_calls": sum(not result.get("correction_accepted") for result in correction_results),
+            "latency_ms": max(
+                (result.get("latency_ms", 0) for result in correction_results),
+                default=0,
+            ),
+        })
+
+    initial_attack_validations = []
+    for provider, model in swarm:
+        state = states[(provider, model)]
+        for scenario in _REDTEAM_SCENARIOS:
+            answer = state.get("attacks", {}).get(scenario["focus"], {}).get("answer", "")
+            validation = validate_quoted_findings(answer, sources)
+            validation.update({
+                "review_complete": bool(
+                    validation.get("findings_checked")
+                    or re.search(r"\bNO ACTIONABLE CANDIDATE\b", answer, re.IGNORECASE)
+                ),
+                "stage": "independent_attack",
+                "provider": provider,
+                "model": model,
+                "focus": scenario["focus"],
+                "scenario_id": scenario["id"],
+            })
+            initial_attack_validations.append(validation)
+
+    evidence_gap_cues = _uncovered_evidence_cues(source_facts, initial_attack_validations)
+    adaptive_pending = [
+        (provider, model, "adaptive_evidence_gap")
+        for provider, model in swarm
+        if evidence_gap_cues
+        and (
+            not states[(provider, model)].get("adaptive_probe")
+            or states[(provider, model)].get("adaptive_probe_error")
+        )
+    ]
+    adaptive_results = run_stage(
+        "adaptive_evidence_gap",
+        adaptive_pending,
+        _SWARM_REDTEAM_SYSTEM + (
+            "\n\nThis is a targeted follow-up, not a fresh broad audit. Investigate the "
+            "unaddressed deterministic evidence cues below. Treat each cue as a lead, "
+            "not a vulnerability verdict. Trace the actual source and controls; report "
+            "only a concrete supported path, otherwise explicitly state that the cue "
+            "does not establish a vulnerability."
+        ),
+        lambda _provider, _model, _tag: (
+            f"### TARGETED EVIDENCE-GAP FOLLOW-UP\n{goal}\n\n"
+            f"{source_line_map}\n\n"
+            "### DETERMINISTIC PYTHON PROJECT FACTS (patterns only; not proof)\n"
+            "Cross-file helper and request-hook links are bounded heuristics; "
+            "confirm them against supplied source.\n"
+            f"{source_facts_text}\n\n"
+            "### UNADDRESSED DETERMINISTIC SOURCE OBSERVATIONS\n"
+            f"{json.dumps(evidence_gap_cues, sort_keys=True)}\n\n"
+            "For each cue either provide a structured FINDING with exact FILE, LINE, "
+            "QUOTE, ATTACK PATH, PRECONDITIONS, and UNVERIFIED fields, or explain why "
+            "it is not a vulnerability and state NO ACTIONABLE CANDIDATE if none remain."
+        ),
+        lambda provider, model, _tag: f"ADAPTIVE EVIDENCE-GAP REVIEW — {provider}:{model}",
+    )
+    for result in adaptive_results:
+        pair = (result["provider"], result["model"])
+        state = states[pair]
+        if result.get("error"):
+            state["adaptive_probe_error"] = result["error"]
+        else:
+            state["adaptive_probe"] = result
+            state.pop("adaptive_probe_error", None)
+        if checkpoint:
+            checkpoint.save_member({
+                **result,
+                "role": "REDTEAM_PIPELINE",
+                "answer": json.dumps({"pipeline_version": 5, **state}, sort_keys=True),
+            })
+    if evidence_gap_cues:
+        stage_summaries.append({
+            "stage": "adaptive_evidence_gap",
+            "triggered": True,
+            "cue_count": len(evidence_gap_cues),
+            "successful_calls": sum(not result.get("error") for result in adaptive_results),
+            "failed_calls": sum(bool(result.get("error")) for result in adaptive_results),
+            "latency_ms": max(
+                (result.get("latency_ms", 0) for result in adaptive_results),
+                default=0,
+            ),
+        })
+
+    attack_validations = list(initial_attack_validations)
+    for provider, model in swarm:
+        probe = states[(provider, model)].get("adaptive_probe", {})
+        answer = probe.get("answer", "")
+        if answer:
+            validation = validate_quoted_findings(answer, sources)
+            validation.update({
+                "review_complete": bool(
+                    validation.get("findings_checked")
+                    or re.search(r"\bNO ACTIONABLE CANDIDATE\b", answer, re.IGNORECASE)
+                ),
+                "stage": "adaptive_evidence_gap",
+                "provider": provider,
+                "model": model,
+                "focus": "unaddressed deterministic source observations",
+                "scenario_id": "adaptive-evidence-gap",
+            })
+            attack_validations.append(validation)
+        if states[(provider, model)].get("adaptive_probe_error"):
+            provider_errors_for_model = states[(provider, model)]["adaptive_probe_error"]
+            states[(provider, model)].setdefault("attack_errors", {})[
+                "adaptive_evidence_gap"
+            ] = provider_errors_for_model
+    candidate_index: Dict[str, Dict[str, object]] = {}
+    for validation in attack_validations:
+        items = validation.get("findings_checked", [])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("grounded"):
+                continue
+            cat = canonical_finding_category(str(item.get("category", "unknown")))
+            candidate_id = candidate_reference_id(
+                str(item.get("file", "")),
+                item.get("start_line"),
+                item.get("end_line"),
+                cat,
+                str(item.get("quote", "")),
+            )
+            candidate = candidate_index.setdefault(candidate_id, {
+                "title": str(item.get("finding", "Unspecified candidate")),
+                "file": str(item.get("file", "")),
+                "line": item.get("start_line"),
+                "end_line": item.get("end_line"),
+                "category": cat,
+                "reported_categories": [],
+                "quote": str(item.get("quote", "")),
+                "attack_path": str(item.get("attack_path", "")),
+                "preconditions": str(item.get("preconditions", "")),
+                "unverified": str(item.get("unverified", "")),
+                "grounded": bool(item.get("grounded")),
+                "reported_by": [],
+            })
+            if cat not in candidate["reported_categories"]:
+                candidate["reported_categories"].append(cat)
+            reporter = f"{validation.get('provider')}:{validation.get('model')}"
+            if reporter not in candidate["reported_by"]:
+                candidate["reported_by"].append(reporter)
     challenge_pending = [
         (provider, model, "challenge") for provider, model in swarm
         if not states[(provider, model)].get("challenge")
         or states[(provider, model)].get("challenge_error")
     ]
+    challenge_assignments: Dict[Tuple[str, str], List[str]] = {
+        pair: [] for pair in swarm
+    }
+    challenge_loads = {pair: 0 for pair in swarm}
+    challenge_reviewers_per_candidate = min(2, len(swarm))
+    for candidate_id, candidate in sorted(candidate_index.items()):
+        reported_by = set(candidate["reported_by"])
+        eligible = [
+            pair for pair in swarm
+            if f"{pair[0]}:{pair[1]}" not in reported_by
+        ] or list(swarm)
+        eligible.sort(key=lambda pair: (challenge_loads[pair], swarm.index(pair)))
+        reviewers = []
+        reviewer_families = set()
+        for pair in eligible:
+            family = classify_family(pair[1])
+            family_key = (
+                family if family != "other"
+                else f"other:{pair[0]}:{pair[1]}"
+            )
+            if family_key not in reviewer_families:
+                reviewers.append(pair)
+                reviewer_families.add(family_key)
+                if len(reviewers) == challenge_reviewers_per_candidate:
+                    break
+        if len(reviewers) < challenge_reviewers_per_candidate:
+            reviewers.extend(
+                pair for pair in eligible
+                if pair not in reviewers
+            )
+            reviewers = reviewers[:challenge_reviewers_per_candidate]
+        for reviewer in reviewers:
+            challenge_assignments[reviewer].append(candidate_id)
+            challenge_loads[reviewer] += 1
+
+    def challenge_prompt_for(provider: str, model: str, _tag: str) -> str:
+        assigned = [
+            {"candidate_id": candidate_id, **candidate_index[candidate_id]}
+            for candidate_id in challenge_assignments[(provider, model)]
+        ]
+        return (
+            f"### ORIGINAL TASK AND SOURCE EVIDENCE\n{goal}\n\n"
+            f"{source_line_map}\n\n"
+            "### DETERMINISTIC PYTHON PROJECT FACTS (patterns only; not proof)\n"
+            "Cross-file helper and request-hook links are bounded heuristics; "
+            "confirm them against the supplied file contents.\n"
+            f"{source_facts_text}\n\n"
+            "### CANDIDATES ASSIGNED TO YOU\n"
+            f"{json.dumps(assigned, sort_keys=True)}\n\n"
+            "### COUNCIL ROSTER\n"
+            f"{json.dumps([f'{p}:{m}' for p, m in swarm])}\n\n"
+            "Review only the assigned candidate IDs. Return one triage block for "
+            "each assigned ID:\n"
+            "TRIAGE: SUPPORTED / REFUTED / UNRESOLVED\n"
+            "CANDIDATE: exact CAND-ID assigned to you\n"
+            "REASON: concise code-based reasoning, including guards or missing preconditions\n"
+            "EVIDENCE: exact FILE / LINE / QUOTE when available\n"
+            "SAFE TEST: a non-destructive check that would confirm or refute it\n"
+            "Do not skip an assigned candidate. Use only assigned IDs; do not add "
+            "candidates. These are challenge opinions, not security verdicts. "
+            "If no candidates were assigned, state NO CANDIDATES TO CHALLENGE. "
+            "Do not infer safety from a missing quote or from model agreement."
+        )
+
+    challenge_retry_assignments: Dict[Tuple[str, str], List[str]] = {}
+
+    def challenge_retry_prompt_for(provider: str, model: str, _tag: str) -> str:
+        missing = challenge_retry_assignments[(provider, model)]
+        assigned = [
+            {"candidate_id": candidate_id, **candidate_index[candidate_id]}
+            for candidate_id in missing
+        ]
+        return (
+            "Your prior challenge response omitted assigned candidate IDs. "
+            "Review only these missing IDs using the source evidence and facts "
+            "below; do not repeat IDs already reviewed or introduce new ones.\n\n"
+            f"{source_line_map}\n\n"
+            f"{json.dumps(assigned, sort_keys=True)}\n\n"
+            "Return one complete triage block per ID using TRIAGE, CANDIDATE, "
+            "REASON, EVIDENCE, and SAFE TEST fields."
+        )
+
     challenge_results = run_stage(
         "cross_examination",
         challenge_pending,
         _REDTEAM_CHALLENGE_SYSTEM,
-        lambda _provider, _model, _tag: (
-            f"### ORIGINAL TASK AND SOURCE EVIDENCE\n{goal}\n\n"
-            f"{source_line_map}\n\n"
-            "### DETERMINISTIC PYTHON SOURCE FACTS (patterns only; not proof)\n"
-            f"{source_facts_text}\n\n"
-            f"### INDEPENDENT CANDIDATES TO CHALLENGE\n{attack_transcript}\n\n"
-            "Review every candidate independently. Return one triage block per candidate:\n"
-            "TRIAGE: SUPPORTED / REFUTED / UNRESOLVED\n"
-            "CANDIDATE: exact title or member/model reference\n"
-            "REASON: code-based reasoning, including guards and missing preconditions\n"
-            "EVIDENCE: exact FILE / LINE / QUOTE when available\n"
-            "SAFE TEST: a non-destructive check that would confirm or refute it\n"
-            "Do not interpret absence of a quoted pattern as proof of safety. "
-            "Do not endorse generic hardening suggestions as vulnerabilities."
-        ),
+        challenge_prompt_for,
         lambda provider, model, _tag: (
             f"INDEPENDENT CHALLENGER — {provider}:{model}"
             if len(swarm) > 1 else f"SELF-CRITIQUE — {provider}:{model}"
         ),
     )
     for result in challenge_results:
+        result["assigned_candidate_ids"] = challenge_assignments[
+            (result["provider"], result["model"])
+        ]
         pair = (result["provider"], result["model"])
         state = states[pair]
         if result.get("error"):
@@ -900,7 +1372,69 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             checkpoint.save_member({
                 **result,
                 "role": "REDTEAM_PIPELINE",
-                "answer": json.dumps({"pipeline_version": 1, **state}, sort_keys=True),
+                "answer": json.dumps({"pipeline_version": 5, **state}, sort_keys=True),
+            })
+    for provider, model in swarm:
+        pair = (provider, model)
+        initial = states[pair].get("challenge", {}).get("answer", "")
+        reviewed = {
+            item["candidate_id"] for item in parse_challenge_triage(initial)
+        }
+        missing = [
+            candidate_id for candidate_id in challenge_assignments[pair]
+            if candidate_id not in reviewed
+        ]
+        if missing:
+            challenge_retry_assignments[pair] = missing
+    challenge_retry_results = run_stage(
+        "cross_examination_recovery",
+        [
+            (provider, model, "missing_assigned_candidates")
+            for provider, model in swarm
+            if (provider, model) in challenge_retry_assignments
+        ],
+        _REDTEAM_CHALLENGE_SYSTEM,
+        challenge_retry_prompt_for,
+        lambda provider, model, _tag: f"CHALLENGE RECOVERY — {provider}:{model}",
+    )
+    for result in challenge_retry_results:
+        pair = (result["provider"], result["model"])
+        state = states[pair]
+        allowed = set(challenge_retry_assignments[pair])
+        retry_outcomes = [
+            item for item in parse_challenge_triage(result.get("answer", ""))
+            if item["candidate_id"] in allowed
+        ]
+        recovery = {
+            "assigned_candidate_ids": sorted(allowed),
+            "reviewed_candidate_ids": sorted(
+                item["candidate_id"] for item in retry_outcomes
+            ),
+            "error": result.get("error"),
+        }
+        if retry_outcomes:
+            recovery["answer"] = "\n".join(
+                f"TRIAGE: {item['status'].upper()}\n"
+                f"CANDIDATE: {item['candidate_id']}\n"
+                f"REASON: {item['reason']}\n"
+                f"SAFE TEST: {item['safe_test']}"
+                for item in retry_outcomes
+            )
+            original = state.get("challenge", {}).get("answer", "")
+            state["challenge"]["answer"] = "\n\n".join(
+                part for part in (original, recovery["answer"]) if part
+            )
+        if result.get("error"):
+            state["challenge_error"] = result["error"]
+        elif len(recovery["reviewed_candidate_ids"]) == len(allowed):
+            state.pop("challenge_error", None)
+        state["challenge_recovery"] = recovery
+        if checkpoint:
+            challenge = state.get("challenge", {})
+            checkpoint.save_member({
+                **challenge,
+                "role": "REDTEAM_PIPELINE",
+                "answer": json.dumps({"pipeline_version": 5, **state}, sort_keys=True),
             })
     stage_summaries.append({
         "stage": "cross_examination",
@@ -908,6 +1442,16 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         "failed_calls": sum(bool(result.get("error")) for result in challenge_results),
         "latency_ms": max((result.get("latency_ms", 0) for result in challenge_results), default=0),
     })
+    if challenge_retry_results:
+        stage_summaries.append({
+            "stage": "cross_examination_recovery",
+            "successful_calls": sum(not result.get("error") for result in challenge_retry_results),
+            "failed_calls": sum(bool(result.get("error")) for result in challenge_retry_results),
+            "latency_ms": max(
+                (result.get("latency_ms", 0) for result in challenge_retry_results),
+                default=0,
+            ),
+        })
 
     members: List[Dict[str, Any]] = []
     for provider, model in swarm:
@@ -979,24 +1523,84 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             "attack_validations": attack_checks,
         })
 
-    attack_validations = [
-        validate_quoted_findings(
-            states[(provider, model)].get("attacks", {}).get(focus, {}).get("answer", ""),
-            sources,
+    challenge_outcomes = []
+    challenge_validations = []
+    for provider, model in swarm:
+        answer = states[(provider, model)].get("challenge", {}).get("answer", "")
+        outcomes = parse_challenge_triage(answer)
+        for outcome in outcomes:
+            if outcome["candidate_id"] in candidate_index:
+                challenge_outcomes.append({
+                    **outcome,
+                    "provider": provider,
+                    "model": model,
+                })
+        challenge_validation = validate_quoted_findings(answer, sources)
+        challenge_validation["status"] = "challenge_opinions"
+        challenge_validation["candidate_claims_unstructured"] = False
+        assigned_ids = set(challenge_assignments[(provider, model)])
+        reviewed_ids = {
+            outcome["candidate_id"] for outcome in outcomes
+            if outcome["candidate_id"] in assigned_ids
+        }
+        challenge_validation["review_complete"] = (
+            reviewed_ids == assigned_ids
+            if assigned_ids
+            else bool(re.search(r"\bNO CANDIDATES TO CHALLENGE\b", answer, re.IGNORECASE))
         )
-        for provider, model in swarm
-        for focus in foci
-    ]
-    challenge_validations = [
-        validate_quoted_findings(
-            states[(provider, model)].get("challenge", {}).get("answer", ""),
-            sources,
-        )
-        for provider, model in swarm
-    ]
+        challenge_validation["assigned_candidate_ids"] = sorted(assigned_ids)
+        challenge_validation["reviewed_candidate_ids"] = sorted(reviewed_ids)
+        challenge_validation["stage"] = "cross_examination"
+        challenge_validation["provider"] = provider
+        challenge_validation["model"] = model
+        if states[(provider, model)].get("challenge_recovery"):
+            challenge_validation["recovery"] = states[(provider, model)][
+                "challenge_recovery"
+            ]
+        challenge_validations.append(challenge_validation)
     candidate_triage = triage_grounded_findings(
-        [*attack_validations, *challenge_validations], source_facts
+        attack_validations, source_facts, challenge_outcomes
     )
+    typed_judgment = run_candidate_judge_graph(
+        candidate_triage,
+        sources,
+        source_facts,
+        swarm,
+        model_call=lambda provider, model, messages, token_limit: _one_call(
+            client,
+            provider,
+            model,
+            messages,
+            token_limit,
+            temperature,
+        ),
+        max_tokens=max_tokens,
+        designated_judge=judge,
+    )
+    call_records.extend(typed_judgment["calls"])
+    typed_judgment_counts = {
+        verdict: sum(
+            1 for item in typed_judgment["verdicts"]
+            if item.get("verdict") == verdict
+        )
+        for verdict in ("UPHOLD", "KILL", "CONTESTED", "UNJUDGED")
+    }
+    stage_summaries.append({
+        "stage": "typed_candidate_judge",
+        "graph_status": typed_judgment["graph_status"],
+        "candidates": len(candidate_triage),
+        "verdicts": typed_judgment_counts,
+        "successful_calls": sum(
+            not result.get("error") for result in typed_judgment["calls"]
+        ),
+        "failed_calls": sum(
+            bool(result.get("error")) for result in typed_judgment["calls"]
+        ),
+        "unparseable_judgments": sum(
+            result.get("parsed_judgment", {}).get("judgment") == "UNPARSEABLE"
+            for result in typed_judgment["calls"]
+        ),
+    })
     provider_errors = []
     for provider, model in swarm:
         state = states[(provider, model)]
@@ -1004,16 +1608,75 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             f"{provider}:{model} (independent_attack/{focus}): {error}"
             for focus, error in state.get("attack_errors", {}).items()
         )
+        provider_errors.extend(
+            f"{provider}:{model} (format_correction/{focus}): {error}"
+            for focus, error in state.get("format_correction_errors", {}).items()
+        )
         if state.get("challenge_error"):
             provider_errors.append(
                 f"{provider}:{model} (cross_examination): {state['challenge_error']}"
             )
+    provider_errors.extend(typed_judgment["failures"])
     evidence_gate = assess_evidence_gate(
         sources,
         [*attack_validations, *challenge_validations],
         provider_errors,
         candidate_triage,
     )
+    scenario_coverage = []
+    for scenario in _REDTEAM_SCENARIOS:
+        reviews = [
+            item for item in attack_validations
+            if item.get("scenario_id") == scenario["id"]
+        ]
+        grounded_count = sum(
+            bool(finding.get("grounded"))
+            for review in reviews
+            for finding in review.get("findings_checked", [])
+        )
+        scenario_coverage.append({
+            **scenario,
+            "reviews": len(reviews),
+            "completed_reviews": sum(bool(item.get("review_complete")) for item in reviews),
+            "grounded_candidates": grounded_count,
+            "ungrounded_candidates": sum(
+                not bool(finding.get("grounded"))
+                for review in reviews
+                for finding in review.get("findings_checked", [])
+            ),
+            "explicit_no_candidate_reviews": sum(
+                bool(item.get("explicit_no_findings")) for item in reviews
+            ),
+        })
+    adaptive_validations = [
+        item for item in attack_validations
+        if item.get("scenario_id") == "adaptive-evidence-gap"
+    ]
+    cue_outcomes = []
+    for cue in evidence_gap_cues:
+        line = cue["line"]
+        addressed = any(
+            finding.get("grounded")
+            and finding.get("file") == cue["file"]
+            and finding.get("start_line", 0) <= line <= finding.get("end_line", 0)
+            for validation in adaptive_validations
+            for finding in validation.get("findings_checked", [])
+        )
+        cue_outcomes.append({**cue, "addressed_by_grounded_citation": addressed})
+    scenario_coverage.append({
+        "id": "adaptive-evidence-gap",
+        "objective": "Revisit deterministic security-relevant source observations not covered by a grounded first-pass citation.",
+        "difficulty": "adaptive",
+        "triggered": bool(evidence_gap_cues),
+        "cue_count": len(evidence_gap_cues),
+        "grounded_cues_addressed": sum(
+            item["addressed_by_grounded_citation"] for item in cue_outcomes
+        ),
+        "cue_outcomes": cue_outcomes,
+        "completed_reviews": sum(
+            bool(item.get("review_complete")) for item in adaptive_validations
+        ),
+    })
     final = None
     final_validation = None
     synthesis_telemetry: Dict[str, Any] = {
@@ -1027,7 +1690,49 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             "Quote grounding verifies text at a location only; AST patterns are incomplete.",
             f"EVIDENCE GATE: {evidence_gate['status']}",
             "",
+            "## Scenario coverage (review completion is not a security verdict)",
         ]
+        report_lines.extend(
+            f"- {item['id']}: {item.get('completed_reviews', 0)}/"
+            f"{item.get('reviews', item.get('triggered') and len(swarm) or 0)} "
+            f"reviews complete; {item.get('grounded_candidates', item.get('grounded_cues_addressed', 0))} "
+            "grounded candidate/cue citations."
+            for item in scenario_coverage
+        )
+        report_lines.extend([
+            "",
+            "## Evidence-fed typed judge (supplemental; not exploit confirmation)",
+        ])
+        for item in typed_judgment["verdicts"]:
+            candidate = item["candidate"]
+            report_lines.append(
+                f"- {item['verdict']}: {candidate['finding']} "
+                f"(`{candidate['file']}:{candidate.get('start_line')}`); "
+                f"engine assessment: {item['global_verdict'].get('verdict')}; "
+                f"judge: {item.get('provider')}:{item.get('model')}."
+            )
+            if candidate.get("citation_reanchored"):
+                reanchored = candidate["citation_reanchored"]["from"]
+                report_lines.append(
+                    "  Citation was narrowly re-anchored to the unique route "
+                    f"mutation call; original citation retained: "
+                    f"{reanchored.get('start_line')} "
+                    f"`{reanchored.get('quote', '')}`."
+                )
+            if item.get("provider_error"):
+                report_lines.append(
+                    f"  Judge provider error: {item['provider_error']}"
+                )
+            report_lines.extend(
+                f"  Adjudication note: {note}" for note in item.get("flip_notes", [])
+            )
+        report_lines.append(
+            "This graph reuses candidates from the existing scenario, adaptive "
+            "evidence-gap, and cross-examination stages; it does not rerun probes."
+        )
+        report_lines.extend([
+            "",
+        ])
         report_lines.extend(
             f"EVIDENCE GATE FAILURE: {failure}"
             for failure in evidence_gate["failed_checks"]
@@ -1036,13 +1741,53 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             for item in candidate_triage:
                 location = (
                     f"{item['file']}:{item['start_line']}"
+                    + (
+                        f"-{item['end_line']}"
+                        if item.get("end_line") != item.get("start_line")
+                        else ""
+                    )
                     if item.get("start_line") is not None
                     else str(item.get("file") or "unknown location")
                 )
                 report_lines.extend([
                     f"- **{item['status']} — {item['title']}** (`{location}`)",
+                    f"  Category: {item.get('category', 'unknown')}",
+                    *(
+                        [f"  Also reported as: {', '.join(item['reported_categories'])}"]
+                        if len(item.get("reported_categories", [])) > 1
+                        else []
+                    ),
+                    f"  Grounded source quote (text match only): `{item.get('quote', '')}`",
                     f"  {item['reason']}",
                 ])
+                if item.get("attack_path"):
+                    report_lines.append(
+                        f"  Model-reported attack path (unverified): {item['attack_path']}"
+                    )
+                if item.get("preconditions"):
+                    report_lines.append(
+                        f"  Preconditions to verify: {item['preconditions']}"
+                    )
+                if item.get("unverified"):
+                    report_lines.append(
+                        f"  Unverified / safe-test guidance (not executed): {item['unverified']}"
+                    )
+                for review in item.get("challenge_reviews", []):
+                    reviewer = ":".join(
+                        part for part in (review.get("provider"), review.get("model"))
+                        if part
+                    )
+                    reviewer_text = f" by {reviewer}" if reviewer else ""
+                    reason_text = f" — {review['reason']}" if review.get("reason") else ""
+                    report_lines.append(
+                        "  Model challenge opinion (not verification): "
+                        f"{review['status'].upper()}{reviewer_text}{reason_text}"
+                    )
+                    if review.get("safe_test"):
+                        report_lines.append(
+                            "  Suggested safe test (not executed): "
+                            f"{review['safe_test']}"
+                        )
         else:
             report_lines.append(
                 "No structured source-cited candidates were available for deterministic triage. "
@@ -1110,10 +1855,14 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         "rounds": stage_summaries,
         "metrics": metrics,
         "source_facts": source_facts,
+        "scenario_coverage": scenario_coverage,
+        "evidence_gap_cues": cue_outcomes,
         "candidate_triage": candidate_triage,
+        "typed_judgment": typed_judgment,
         "attack_validations": attack_validations,
         "challenge_validations": challenge_validations,
         "evidence_gate": evidence_gate,
+        "stage_calls": call_records,
     }
 
 
@@ -1195,7 +1944,9 @@ def run_orchestration(
     source_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for parallel, builder, red-team, and deliberate modes."""
-    enriched = enrich_prompt_with_files(prompt)
+    normalized = (mode or "collaborate").lower().strip()
+    is_redteam = normalized in ("redteam", "red", "rt")
+    enriched = prompt if is_redteam else enrich_prompt_with_files(prompt)
     normalized_sources = {
         path.replace("\\", "/"): content
         for path, content in (source_files or {}).items()
@@ -1209,7 +1960,6 @@ def run_orchestration(
         **extract_sources_from_prompt(enriched),
         **normalized_sources,
     }
-    normalized = (mode or "collaborate").lower().strip()
     if normalized in ("deliberate", "discussion", "boardroom"):
         if checkpoint_path:
             raise ValueError(

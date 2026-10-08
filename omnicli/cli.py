@@ -54,6 +54,48 @@ def main() -> None:
     pass
 
 
+@main.command("prepare-security-review")
+@click.option(
+    "--dataset", "dataset_path", required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Held-out labeled JSONL benchmark to redact for independent review",
+)
+@click.option(
+    "--output", required=True, type=click.Path(dir_okay=False),
+    help="New JSON path for the redacted reviewer package",
+)
+def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
+    """Create a neutral source-only package for independent held-out review."""
+    import hashlib
+    import json
+    from omnicli.evaluation import (
+        create_blinded_review_package,
+        load_security_dataset,
+    )
+
+    try:
+        cases = load_security_dataset(dataset_path)
+        package = create_blinded_review_package(cases)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    source_path = Path(dataset_path).expanduser()
+    output_path = Path(output).expanduser()
+    if output_path.exists():
+        raise click.ClickException(
+            f"Refusing to overwrite existing reviewer package: {output_path}"
+        )
+    package["source_dataset_sha256"] = hashlib.sha256(
+        source_path.read_bytes()
+    ).hexdigest()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+    console.print(
+        f"Redacted independent-review package with {len(cases)} cases saved to "
+        f"{output_path}"
+    )
+
+
 @main.command("ask")
 @click.option("-p", "--provider", help="Provider ID (groq, openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
 @click.option("-m", "--model", help="Model identifier")
@@ -534,7 +576,7 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
     help="Labeled JSONL security benchmark; see README for the schema",
 )
 @click.option(
-    "--model", "model_specs", multiple=True, required=True,
+    "--model", "model_specs", multiple=True,
     help="Model to evaluate as provider:model; repeat to compare candidates",
 )
 @click.option(
@@ -551,7 +593,7 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
 )
 @click.option(
     "--staged-redteam", is_flag=True,
-    help="Also run the staged attack/challenge pipeline on the same cases and models",
+    help="Run the existing multi-model red-team orchestration on each case",
 )
 @click.option(
     "--split", type=click.Choice(["all", "development", "held_out"]),
@@ -589,6 +631,7 @@ def cmd_evaluate_security(
         evaluate_security_models,
         evaluate_deterministic_security,
         evaluate_staged_security,
+        evaluate_staged_council,
         assess_redteam_quality_gate,
         load_security_dataset,
         recommend_model,
@@ -604,6 +647,15 @@ def cmd_evaluate_security(
         if not provider_id.strip() or not model_id.strip():
             raise click.BadParameter("model provider and id must not be empty", param_hint="--model")
         models.append((provider_id.strip(), model_id.strip()))
+    if not models:
+        from omnicli.orchestrate import build_swarm
+
+        models.extend(build_swarm(cfg))
+    models = list(dict.fromkeys(models))
+    if not models:
+        raise click.UsageError(
+            "No active provider models are configured; supply one or more --model options."
+        )
 
     price_data = None
     if pricing:
@@ -681,28 +733,32 @@ def cmd_evaluate_security(
             f"{len(cases) * repetitions} case trial(s)...[/cyan]"
         ):
             report = evaluate_security_models(
-                client,
-                cases,
-                models,
-                pricing=price_data,
-                repetitions=repetitions,
+                client, cases, models, pricing=price_data, repetitions=repetitions,
             )
             if static_baseline:
                 report["models"].append(
                     evaluate_deterministic_security(cases, repetitions=repetitions)
                 )
             if staged_redteam:
-                staged_report = evaluate_staged_security(
+                if quality_gate:
+                    staged_report = evaluate_staged_security(
+                        cfg,
+                        client,
+                        cases,
+                        models,
+                        repetitions=repetitions,
+                        pricing=price_data,
+                    )
+                    staged_results = staged_report["models"]
+                    report["models"].extend(staged_results)
+                    report["limitations"].extend(staged_report["limitations"])
+                report["staged_council"] = evaluate_staged_council(
                     cfg,
                     client,
                     cases,
                     models,
                     repetitions=repetitions,
-                    pricing=price_data,
                 )
-                staged_results = staged_report["models"]
-                report["models"].extend(staged_results)
-                report["limitations"].extend(staged_report["limitations"])
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     if quality_gate:
@@ -737,6 +793,16 @@ def cmd_evaluate_security(
             cost,
         )
     console.print(table)
+    council_result = report.get("staged_council")
+    if council_result:
+        console.print(
+            "[bold cyan]Multi-model council:[/bold cyan] "
+            f"{len(council_result['models'])} models; "
+            f"{council_result['member_calls']} member calls; "
+            f"{council_result['errors']} invalid case trials; "
+            f"P/R/F1 {council_result['precision']:.3f}/"
+            f"{council_result['recall']:.3f}/{council_result['f1']:.3f}"
+        )
     recommendation = report["recommendation"]
     if recommendation:
         console.print(
@@ -929,6 +995,17 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
         f"[dim]{escape(roster)}[/dim]\n[bold green]Task:[/bold green] {escape(task)}",
         title="Swarm Active", border_style="cyan",
     ))
+    if active_mode == "redteam" and source_files:
+        disclosed_files = "\n".join(
+            f"- {escape(path)} ({len(content):,} characters)"
+            for path, content in source_files.items()
+        )
+        console.print(Panel(
+            f"These explicitly selected files will be sent to the configured model providers:\n"
+            f"{disclosed_files}",
+            title="Red-Team Source Disclosure",
+            border_style="yellow",
+        ))
     with console.status(f"[cyan]Querying {len(swarm)} models in parallel ({active_mode})...[/cyan]", spinner="dots"):
         try:
             out = orch.run_orchestration(
@@ -996,6 +1073,31 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
             f"{detail}",
             title="Deterministic Evidence Gate",
             border_style=gate_color,
+        ))
+    scenario_coverage = out.get("scenario_coverage", [])
+    if scenario_coverage:
+        rows = []
+        for scenario in scenario_coverage:
+            expected_reviews = scenario.get(
+                "reviews",
+                len(swarm) if scenario.get("triggered") else 0,
+            )
+            completed_reviews = scenario.get("completed_reviews", 0)
+            cues = scenario.get("cue_count")
+            cue_text = (
+                f"; grounded gap cues: {scenario.get('grounded_cues_addressed', 0)}/{cues}"
+                if cues is not None else ""
+            )
+            rows.append(
+                f"- {escape(scenario['id'])}: "
+                f"{completed_reviews}/{expected_reviews} review responses complete"
+                f"{cue_text}"
+            )
+        console.print(Panel(
+            "\n".join(rows)
+            + "\n\nCompletion/cue coverage is not evidence of security or completeness.",
+            title="Source-Security Scenario Coverage",
+            border_style="cyan",
         ))
     if out.get("metrics"):
         metrics = out["metrics"]

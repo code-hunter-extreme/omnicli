@@ -1,0 +1,372 @@
+{
+  "schema_version": 1,
+  "purpose": "independent_held_out_security_adjudication",
+  "review_instructions": [
+    "Work independently before comparing results with any existing labels.",
+    "Do not infer expected outcomes from filenames, identifiers, or prior reports.",
+    "Record findings or an explicit benign rationale for every review_id."
+  ],
+  "cases": [
+    {
+      "review_id": "review-001",
+      "file": "source_001.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def search(cursor, request):\n    term = request.args[\"q\"]\n    query = f\"SELECT id FROM items WHERE name = '{term}'\"\n    return cursor.execute(query)\n"
+    },
+    {
+      "review_id": "review-002",
+      "file": "source_002.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def lookup(db, request):\n    key = request.json[\"key\"]\n    statement = \"SELECT * FROM records WHERE key = \" + key\n    return db.execute(statement)\n"
+    },
+    {
+      "review_id": "review-003",
+      "file": "source_003.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def browse(session, request):\n    term = request.args[\"term\"]\n    return session.execute(\"SELECT * FROM catalog WHERE title = '\" + term + \"'\")\n"
+    },
+    {
+      "review_id": "review-004",
+      "file": "source_004.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def report(connection, request):\n    suffix = request.args[\"suffix\"]\n    script = \"SELECT * FROM reports; \" + suffix\n    return connection.executescript(script)\n"
+    },
+    {
+      "review_id": "review-005",
+      "file": "source_005.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def events(cursor, request):\n    owner = request.args[\"owner\"]\n    query = \"SELECT * FROM events WHERE owner = '%s'\" % owner\n    return cursor.execute(query)\n"
+    },
+    {
+      "review_id": "review-006",
+      "file": "source_006.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def run(request):\n    command = request.json[\"command\"]\n    return subprocess.run(command, shell=True, check=True)\n"
+    },
+    {
+      "review_id": "review-007",
+      "file": "source_007.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def restart(request):\n    name = request.args[\"service\"]\n    command = \"service \" + name + \" restart\"\n    return os.system(command)\n"
+    },
+    {
+      "review_id": "review-008",
+      "file": "source_008.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def start(request):\n    report = request.form[\"report\"]\n    command = \"render \" + report\n    return subprocess.Popen(command, shell=True)\n"
+    },
+    {
+      "review_id": "review-009",
+      "file": "source_009.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def maintain(request):\n    option = request.args[\"option\"]\n    command = \"tool --\" + option\n    return subprocess.call(command, shell=True)\n"
+    },
+    {
+      "review_id": "review-010",
+      "file": "source_010.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def sync(request):\n    target = request.args[\"target\"]\n    command = \"sync-tool \" + target\n    return os.popen(command).read()\n"
+    },
+    {
+      "review_id": "review-011",
+      "file": "source_011.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def download(root, request):\n    name = request.args[\"name\"]\n    path = root + \"/\" + name\n    return open(path, \"rb\").read()\n"
+    },
+    {
+      "review_id": "review-012",
+      "file": "source_012.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def artifact(root, request):\n    name = request.json[\"file\"]\n    path = Path(root) / name\n    return path.open(\"rb\").read()\n"
+    },
+    {
+      "review_id": "review-013",
+      "file": "source_013.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def preview(request):\n    path = request.args[\"path\"]\n    return Path(path).read_text()\n"
+    },
+    {
+      "review_id": "review-014",
+      "file": "source_014.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def serve(root, request):\n    name = request.args[\"name\"]\n    target = os.path.join(root, name)\n    return send_file(target)\n"
+    },
+    {
+      "review_id": "review-015",
+      "file": "source_015.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def attachment(request):\n    name = request.form[\"name\"]\n    candidate = Path(\"/srv/attachments\") / name\n    return candidate.read_bytes()\n"
+    },
+    {
+      "review_id": "review-016",
+      "file": "source_016.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def restore(request):\n    payload = request.get_data()\n    return pickle.loads(payload)\n"
+    },
+    {
+      "review_id": "review-017",
+      "file": "source_017.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def import_data(upload):\n    raw = upload.read()\n    return pickle.load(io.BytesIO(raw))\n"
+    },
+    {
+      "review_id": "review-018",
+      "file": "source_018.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def parse(request):\n    document = request.get_data(as_text=True)\n    return yaml.load(document, Loader=yaml.Loader)\n"
+    },
+    {
+      "review_id": "review-019",
+      "file": "source_019.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def import_session(request):\n    encoded = request.json[\"data\"]\n    return jsonpickle.decode(encoded)\n"
+    },
+    {
+      "review_id": "review-020",
+      "file": "source_020.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def unpack(request):\n    blob = request.data\n    return marshal.loads(blob)\n"
+    },
+    {
+      "review_id": "review-021",
+      "file": "source_021.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def delete_account(request):\n    account_id = request.json[\"account_id\"]\n    delete_account_by_id(account_id)\n    return {\"deleted\": True}\n"
+    },
+    {
+      "review_id": "review-022",
+      "file": "source_022.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def set_role(request):\n    user_id = request.json[\"user_id\"]\n    role = request.json[\"role\"]\n    update_user_role(user_id, role)\n    return {\"updated\": True}\n"
+    },
+    {
+      "review_id": "review-023",
+      "file": "source_023.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def refund(request):\n    order_id = request.json[\"order_id\"]\n    issue_refund(order_id)\n    return {\"refunded\": True}\n"
+    },
+    {
+      "review_id": "review-024",
+      "file": "source_024.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def rotate_key(request):\n    account = request.json[\"account\"]\n    rotate_service_key(account)\n    return {\"rotated\": True}\n"
+    },
+    {
+      "review_id": "review-025",
+      "file": "source_025.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def publish_config(request):\n    value = request.json[\"config\"]\n    update_global_config(value)\n    return {\"saved\": True}\n"
+    },
+    {
+      "review_id": "review-026",
+      "file": "source_026.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def config():\n    return {\"service_token\": os.environ[\"SERVICE_TOKEN\"]}\n"
+    },
+    {
+      "review_id": "review-027",
+      "file": "source_027.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def diagnostics(settings):\n    return {\"database_password\": settings.database_password}\n"
+    },
+    {
+      "review_id": "review-028",
+      "file": "source_028.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def details(config):\n    response = {\"signing_secret\": config.signing_secret}\n    return response\n"
+    },
+    {
+      "review_id": "review-029",
+      "file": "source_029.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def support_bundle(secrets):\n    values = {\"api_key\": secrets.api_key, \"region\": \"west\"}\n    return values\n"
+    },
+    {
+      "review_id": "review-030",
+      "file": "source_030.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def key_status(secret_store):\n    result = {\"private_key\": secret_store.current_private_key()}\n    return result\n"
+    },
+    {
+      "review_id": "review-031",
+      "file": "source_031.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def search(cursor, term):\n    return cursor.execute(\"SELECT id FROM items WHERE name = ?\", (term,))\n"
+    },
+    {
+      "review_id": "review-032",
+      "file": "source_032.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def lookup(db, record_id):\n    return db.execute(\"SELECT * FROM records WHERE id = :id\", {\"id\": record_id})\n"
+    },
+    {
+      "review_id": "review-033",
+      "file": "source_033.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def browse(session, term):\n    return session.query(Catalog).filter(Catalog.title == term).all()\n"
+    },
+    {
+      "review_id": "review-034",
+      "file": "source_034.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def report(connection, suffix):\n    return connection.execute(\"SELECT * FROM reports WHERE name = ?\", (suffix,))\n"
+    },
+    {
+      "review_id": "review-035",
+      "file": "source_035.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def events(cursor, owner):\n    return cursor.execute(\"SELECT * FROM events WHERE owner = %s\", (owner,))\n"
+    },
+    {
+      "review_id": "review-036",
+      "file": "source_036.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def run():\n    return subprocess.run([\"/usr/bin/worker\", \"--status\"], shell=False, check=True)\n"
+    },
+    {
+      "review_id": "review-037",
+      "file": "source_037.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def restart(request):\n    services = {\"cache\": \"cache-daemon\", \"queue\": \"queue-daemon\"}\n    name = services[request.args[\"service\"]]\n    return subprocess.run([\"service\", name, \"restart\"], check=True)\n"
+    },
+    {
+      "review_id": "review-038",
+      "file": "source_038.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def maintain():\n    return subprocess.call([\"/usr/bin/tool\", \"--check\"], shell=False)\n"
+    },
+    {
+      "review_id": "review-039",
+      "file": "source_039.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def start():\n    return subprocess.Popen([\"/usr/bin/render\", \"--daily\"], shell=False)\n"
+    },
+    {
+      "review_id": "review-040",
+      "file": "source_040.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def sync():\n    return os.system(\"/usr/bin/sync-tool --status\")\n"
+    },
+    {
+      "review_id": "review-041",
+      "file": "source_041.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def download(root, request):\n    base = Path(root).resolve()\n    target = (base / request.args[\"name\"]).resolve()\n    if base not in target.parents:\n        raise ValueError(\"outside root\")\n    return target.read_bytes()\n"
+    },
+    {
+      "review_id": "review-042",
+      "file": "source_042.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def artifact():\n    return Path(\"/srv/artifacts/current.bin\").read_bytes()\n"
+    },
+    {
+      "review_id": "review-043",
+      "file": "source_043.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def preview(request):\n    allowed = {\"intro.txt\", \"help.txt\"}\n    name = request.args[\"name\"]\n    if name not in allowed:\n        raise ValueError(\"unknown file\")\n    return (Path(\"/srv/docs\") / name).read_text()\n"
+    },
+    {
+      "review_id": "review-044",
+      "file": "source_044.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def serve():\n    return send_file(\"/srv/public/readme.txt\")\n"
+    },
+    {
+      "review_id": "review-045",
+      "file": "source_045.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def attachment(root, name):\n    base = Path(root).resolve()\n    target = (base / name).resolve()\n    if base not in target.parents:\n        raise ValueError(\"outside root\")\n    return target.read_bytes()\n"
+    },
+    {
+      "review_id": "review-046",
+      "file": "source_046.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def restore(request):\n    return json.loads(request.get_data())\n"
+    },
+    {
+      "review_id": "review-047",
+      "file": "source_047.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def parse(request):\n    return yaml.safe_load(request.get_data(as_text=True))\n"
+    },
+    {
+      "review_id": "review-048",
+      "file": "source_048.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def import_data(request):\n    data = json.loads(request.data)\n    return validate_schema(data)\n"
+    },
+    {
+      "review_id": "review-049",
+      "file": "source_049.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def import_session(request):\n    encoded = request.json[\"data\"]\n    return json.loads(encoded)\n"
+    },
+    {
+      "review_id": "review-050",
+      "file": "source_050.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def unpack(request):\n    return json.loads(request.data.decode(\"utf-8\"))\n"
+    },
+    {
+      "review_id": "review-051",
+      "file": "source_051.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "@app.post(\"/account/delete\")\n@login_required\ndef delete_account(request):\n    delete_account_by_id(request.json[\"account_id\"])\n    return {\"deleted\": True}\n"
+    },
+    {
+      "review_id": "review-052",
+      "file": "source_052.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def set_role(request):\n    if not current_user.has_permission(\"manage_roles\"):\n        raise PermissionError()\n    update_user_role(request.json[\"user_id\"], request.json[\"role\"])\n    return {\"updated\": True}\n"
+    },
+    {
+      "review_id": "review-053",
+      "file": "source_053.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def refund(request):\n    order = load_order(request.json[\"order_id\"])\n    if order.owner_id != current_user.id:\n        raise PermissionError()\n    issue_refund(order.id)\n    return {\"refunded\": True}\n"
+    },
+    {
+      "review_id": "review-054",
+      "file": "source_054.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def rotate_key(request):\n    account = load_account(request.json[\"account\"])\n    require_account_admin(current_user, account)\n    rotate_service_key(account.id)\n    return {\"rotated\": True}\n"
+    },
+    {
+      "review_id": "review-055",
+      "file": "source_055.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def publish_config(request):\n    require_permission(current_user, \"config:write\")\n    update_global_config(request.json[\"config\"])\n    return {\"saved\": True}\n"
+    },
+    {
+      "review_id": "review-056",
+      "file": "source_056.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def config():\n    return {\"service_token\": \"[redacted]\", \"ready\": True}\n"
+    },
+    {
+      "review_id": "review-057",
+      "file": "source_057.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def diagnostics(settings):\n    return {\"database_configured\": bool(settings.database_password)}\n"
+    },
+    {
+      "review_id": "review-058",
+      "file": "source_058.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def details(config, client):\n    client.check(config.signing_secret)\n    return {\"healthy\": True}\n"
+    },
+    {
+      "review_id": "review-059",
+      "file": "source_059.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def support_bundle(secrets):\n    return {\"api_key\": \"[redacted]\", \"region\": \"west\"}\n"
+    },
+    {
+      "review_id": "review-060",
+      "file": "source_060.py",
+      "task": "Review the supplied source for security findings. For each finding, record the category, exact source file and line, quoted evidence, attacker preconditions, and impact. If no finding is supported, explain why the source is intentionally safe.",
+      "source": "def key_status(secret_store):\n    return {\"private_key_present\": secret_store.current_private_key() is not None}\n"
+    }
+  ],
+  "source_dataset_sha256": "dee4d7118eb69d2e7042132615456ff6843e22d06d989db11e2ae490c65c9d5b"
+}

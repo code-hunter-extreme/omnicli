@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ def load_security_dataset(path: str) -> List[Dict[str, Any]]:
 
     cases: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
+    paired_cases: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for line_number, line in enumerate(
         dataset_path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -48,6 +50,38 @@ def load_security_dataset(path: str) -> List[Dict[str, Any]]:
             raise ValueError(f"Dataset case {case_id} needs non-empty source.")
         if not isinstance(findings, list):
             raise ValueError(f"Dataset case {case_id} needs expected_findings as a list.")
+        pair_id = case.get("pair_id")
+        pair_role = case.get("pair_role")
+        pair_category = case.get("pair_category")
+        if (pair_id is None) != (pair_role is None):
+            raise ValueError(
+                f"Dataset case {case_id} must provide pair_id and pair_role together."
+            )
+        if pair_id is not None:
+            if not isinstance(pair_id, str) or not pair_id.strip():
+                raise ValueError(f"Dataset case {case_id} has an invalid pair_id.")
+            if pair_role not in {"vulnerable", "fixed"}:
+                raise ValueError(
+                    f"Dataset case {case_id} pair_role must be vulnerable or fixed."
+                )
+            if not isinstance(pair_category, str) or not pair_category.strip():
+                raise ValueError(
+                    f"Paired dataset case {case_id} needs a shared pair_category."
+                )
+            roles = paired_cases.setdefault(pair_id, {})
+            if pair_role in roles:
+                raise ValueError(
+                    f"Paired dataset group {pair_id} has duplicate {pair_role} cases."
+                )
+            roles[pair_role] = case
+            if pair_role == "vulnerable" and len(findings) != 1:
+                raise ValueError(
+                    f"Vulnerable paired case {case_id} must have exactly one expected finding."
+                )
+            if pair_role == "fixed" and findings:
+                raise ValueError(
+                    f"Fixed paired case {case_id} must have no expected findings."
+                )
         split = case.get("split")
         if split is not None and (
             not isinstance(split, str) or split not in {"development", "held_out"}
@@ -135,7 +169,47 @@ def load_security_dataset(path: str) -> List[Dict[str, Any]]:
         raise ValueError("Evaluation dataset needs at least one case with a labeled finding.")
     if not any(not case["expected_findings"] for case in cases):
         raise ValueError("Evaluation dataset needs at least one explicitly clean case.")
+    for pair_id, roles in paired_cases.items():
+        if set(roles) != {"vulnerable", "fixed"}:
+            raise ValueError(
+                f"Paired dataset group {pair_id} must contain one vulnerable and one fixed case."
+            )
+        vulnerable, fixed = roles["vulnerable"], roles["fixed"]
+        if vulnerable["pair_category"].strip().lower() != fixed["pair_category"].strip().lower():
+            raise ValueError(
+                f"Paired dataset group {pair_id} must use the same pair_category for both cases."
+            )
     return cases
+
+
+def create_blinded_review_package(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create a neutral source-only package for independent held-out review."""
+    if not cases or any(case.get("split") != "held_out" for case in cases):
+        raise ValueError("Independent review packages require only held_out cases.")
+
+    review_cases = []
+    for number, case in enumerate(cases, start=1):
+        review_cases.append({
+            "review_id": f"review-{number:03d}",
+            "file": f"source_{number:03d}.py",
+            "task": (
+                "Review the supplied source for security findings. For each finding, "
+                "record the category, exact source file and line, quoted evidence, "
+                "attacker preconditions, and impact. If no finding is supported, "
+                "explain why the source is intentionally safe."
+            ),
+            "source": case["source"],
+        })
+    return {
+        "schema_version": 1,
+        "purpose": "independent_held_out_security_adjudication",
+        "review_instructions": [
+            "Work independently before comparing results with any existing labels.",
+            "Do not infer expected outcomes from filenames, identifiers, or prior reports.",
+            "Record findings or an explicit benign rationale for every review_id.",
+        ],
+        "cases": review_cases,
+    }
 
 
 def _normalize(text: str) -> str:
@@ -192,6 +266,8 @@ def _parse_findings(content: Any) -> List[Dict[str, Any]]:
             or not isinstance(finding["evidence"], str)
         ):
             raise ValueError("A model finding did not match the required JSON schema.")
+        from omnicli.evidence import canonical_finding_category
+        finding["category"] = canonical_finding_category(finding["category"])
     return findings
 
 
@@ -201,6 +277,7 @@ def _evaluate_case(case: Dict[str, Any], predicted: List[Dict[str, Any]]) -> Dic
     true_positives = 0
     false_positives = 0
     false_positive_categories: List[str] = []
+    category_mismatches: List[Dict[str, Any]] = []
     grounded_citations = 0
     matched: List[Dict[str, Any]] = []
     for candidate in predicted:
@@ -218,6 +295,25 @@ def _evaluate_case(case: Dict[str, Any], predicted: List[Dict[str, Any]]) -> Dic
             None,
         )
         if match_index is None:
+            aligned_index = next(
+                (
+                    index for index in sorted(unmatched)
+                    if expected[index]["file"].replace("\\", "/").strip()
+                    == candidate["file"].replace("\\", "/").strip()
+                    and expected[index]["line"] == candidate["line"]
+                    and evidence
+                    and evidence == _normalize(expected[index]["evidence"])
+                ),
+                None,
+            )
+            if aligned_index is not None:
+                category_mismatches.append({
+                    "predicted_category": candidate["category"].strip().lower(),
+                    "expected_category": expected[aligned_index]["category"].strip().lower(),
+                    "file": candidate["file"],
+                    "line": candidate["line"],
+                    "evidence": evidence,
+                })
             false_positives += 1
             false_positive_categories.append(candidate["category"].strip().lower())
             continue
@@ -234,6 +330,8 @@ def _evaluate_case(case: Dict[str, Any], predicted: List[Dict[str, Any]]) -> Dic
         "ungrounded_citations": len(predicted) - grounded_citations,
         "predicted_findings": predicted,
         "matched": matched,
+        "category_mismatches": category_mismatches,
+        "evidence_aligned_findings": len(matched) + len(category_mismatches),
         "false_positive_categories": false_positive_categories,
         "missed": [
             expected[index]
@@ -266,6 +364,137 @@ def _wilson_interval(successes: int, total: int) -> Optional[List[float]]:
         / denominator
     )
     return [round(max(0.0, center - margin), 4), round(min(1.0, center + margin), 4)]
+
+
+def _bootstrap_ci(
+    successes: int,
+    total: int,
+    resamples: int = 2000,
+    seed: int = 0,
+) -> Optional[List[float]]:
+    """Bootstrap 95% CI for a binomial proportion via resampling with replacement.
+
+    Uses a fixed seed so gate reports are reproducible. Returns None when
+    there are no trials.
+    """
+    if total == 0:
+        return None
+    rng = random.Random(seed)
+    outcomes = [1] * successes + [0] * (total - successes)
+    estimates = []
+    for _ in range(resamples):
+        sample = [rng.choice(outcomes) for _ in range(total)]
+        estimates.append(sum(sample) / total)
+    estimates.sort()
+    lower = estimates[int(0.025 * resamples)]
+    upper = estimates[min(resamples - 1, int(0.975 * resamples))]
+    return [round(lower, 4), round(upper, 4)]
+
+
+def _word_ngrams(text: str, n: int = 8) -> set:
+    words = re.findall(r"[a-z0-9_]+", (text or "").lower())
+    if len(words) < n:
+        return set()
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def ngram_overlap_ratio(case_source: str, reference_texts: List[str], n: int = 8) -> float:
+    """Max n-gram overlap of a case source against any reference text.
+
+    Scenario-leakage check: a high ratio suggests the case may have been seen
+    during training, so the gate would measure memorization, not capability.
+    """
+    case_grams = _word_ngrams(case_source, n)
+    if not case_grams:
+        return 0.0
+    best = 0.0
+    for reference in reference_texts or []:
+        ref_grams = _word_ngrams(reference, n)
+        if not ref_grams:
+            continue
+        overlap = len(case_grams & ref_grams) / len(case_grams)
+        best = max(best, overlap)
+    return round(best, 4)
+
+
+def flag_leaked_cases(
+    cases: List[Dict[str, Any]],
+    reference_corpus: List[str],
+    threshold: float = 0.5,
+    n: int = 8,
+) -> Dict[str, Any]:
+    """Flag cases whose source overlaps a reference corpus above threshold."""
+    flagged = []
+    for case in cases:
+        ratio = ngram_overlap_ratio(case.get("source", ""), reference_corpus, n)
+        if ratio >= threshold:
+            flagged.append({"case_id": case.get("id"), "overlap_ratio": ratio})
+    clean_ids = {
+        case.get("id") for case in cases
+    } - {item["case_id"] for item in flagged}
+    return {
+        "threshold": threshold,
+        "ngram_n": n,
+        "leaked_cases": flagged,
+        "leaked_count": len(flagged),
+        "clean_case_ids": sorted(clean_ids),
+        "clean_count": len(clean_ids),
+    }
+
+
+def _paired_change_metrics(
+    cases: List[Dict[str, Any]],
+    case_results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Score whether vulnerable/fixed variants receive the correct distinct outcomes."""
+    pairs: Dict[str, Dict[str, str]] = {}
+    for case in cases:
+        pair_id = case.get("pair_id")
+        role = case.get("pair_role")
+        if isinstance(pair_id, str) and role in {"vulnerable", "fixed"}:
+            pairs.setdefault(pair_id, {})[role] = case["id"]
+
+    results_by_trial = {
+        (result.get("case_id"), result.get("repetition", 1)): result
+        for result in case_results
+    }
+    repetitions = sorted({
+        repetition for _, repetition in results_by_trial
+        if isinstance(repetition, int)
+    }) or [1]
+    vulnerable_detected = fixed_not_flagged = pair_correct = pair_trials = 0
+    for pair in pairs.values():
+        vulnerable_id = pair.get("vulnerable")
+        fixed_id = pair.get("fixed")
+        if not vulnerable_id or not fixed_id:
+            continue
+        for repetition in repetitions:
+            vulnerable = results_by_trial.get((vulnerable_id, repetition))
+            fixed = results_by_trial.get((fixed_id, repetition))
+            if vulnerable is None or fixed is None:
+                continue
+            pair_trials += 1
+            detected = (
+                not vulnerable.get("error")
+                and vulnerable.get("true_positives") == 1
+                and vulnerable.get("false_negatives") == 0
+                and vulnerable.get("false_positives") == 0
+            )
+            clean = (
+                not fixed.get("error")
+                and fixed.get("false_positives") == 0
+            )
+            vulnerable_detected += int(detected)
+            fixed_not_flagged += int(clean)
+            pair_correct += int(detected and clean)
+    return {
+        "unique_pairs": len(pairs),
+        "pair_trials": pair_trials,
+        "vulnerable_detected": vulnerable_detected,
+        "fixed_not_flagged": fixed_not_flagged,
+        "both_correct": pair_correct,
+        "paired_accuracy": round(pair_correct / pair_trials, 4) if pair_trials else None,
+    }
 
 
 def evaluate_security_models(
@@ -301,6 +530,7 @@ def evaluate_security_models(
         tp = fp = fn = errors = 0
         citations = grounded_citations = 0
         true_negative_cases = false_positive_clean_cases = 0
+        failed_clean_trials = 0
         category_counts: Dict[str, Dict[str, int]] = {}
         latencies: List[float] = []
         estimated_cost = 0.0
@@ -318,11 +548,11 @@ def evaluate_security_models(
                 "Perform a conservative security review of the source below. "
                 "Report only findings supported by the supplied source. Return "
                 "JSON only with this shape: "
-                '{"findings":[{"category":"short_snake_case","file":"path from source context",'
+                '{"findings":[{"category":"one of: sql_injection, command_injection, path_traversal, unsafe_deserialization, authentication_authorization, sensitive_data_exposure",'
+                '"file":"path from source context",'
                 '"line":1,"evidence":"exact source quote"}]}. '
                 "Use an empty findings array when no finding is supported. Do not "
                 "include explanations outside JSON.\n\n"
-                f"### Case id\n{case['id']}\n\n"
                 f"### Task\n{case['prompt']}\n\n"
                 f"### File\n{case.get('file', 'source.py')}\n\n"
                 "### Source (line numbers are shown as N:; do not include them in evidence quotes)\n"
@@ -334,6 +564,7 @@ def evaluate_security_models(
                 + "\n```"
             )
             started = time.perf_counter()
+            raw_output = None
             try:
                 response = client.chat_complete(
                     provider_id=provider,
@@ -347,8 +578,10 @@ def evaluate_security_models(
                 content = (
                     ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
                 )
+                raw_output = content if isinstance(content, str) else None
                 predictions = _parse_findings(content)
                 result = _evaluate_case(case, predictions)
+                result["raw_output"] = raw_output
                 if not case["expected_findings"]:
                     if predictions:
                         false_positive_clean_cases += 1
@@ -388,7 +621,7 @@ def evaluate_security_models(
                 errors += 1
                 token_usage_known = False
                 if not case["expected_findings"]:
-                    false_positive_clean_cases += 1
+                    failed_clean_trials += 1
                 result = {
                     "case_id": case["id"],
                     "true_positives": 0,
@@ -400,6 +633,8 @@ def evaluate_security_models(
                     "predicted_findings": [],
                     "missed": case["expected_findings"],
                     "false_positive_categories": [],
+                    "raw_output": raw_output,
+                    "error_type": type(exc).__name__,
                     "error": str(exc)[:240],
                 }
             result["repetition"] = repetition
@@ -437,6 +672,11 @@ def evaluate_security_models(
             "unique_cases": len(cases),
             "repetitions": repetitions,
             "errors": errors,
+            "failed_clean_trials": failed_clean_trials,
+            "category_mismatches": sum(
+                len(result.get("category_mismatches", []))
+                for result in case_results
+            ),
             "true_positives": tp,
             "false_positives": fp,
             "false_negatives": fn,
@@ -480,6 +720,7 @@ def evaluate_security_models(
             "input_tokens": input_tokens_total if token_usage_known else None,
             "output_tokens": output_tokens_total if token_usage_known else None,
             "estimated_cost_usd": round(estimated_cost, 8) if cost_known else None,
+            "paired_change": _paired_change_metrics(cases, case_results),
             "case_results": case_results,
         })
     return {
@@ -550,7 +791,6 @@ def _deterministic_findings(case: Dict[str, Any]) -> List[Dict[str, Any]]:
         if (
             route.get("mutating_calls")
             and not route.get("local_auth_guards")
-            and not route.get("same_module_request_hooks")
         ):
             mutating_names = set(route["mutating_calls"])
             call_site = next(
@@ -755,6 +995,7 @@ def evaluate_deterministic_security(
         "input_tokens": 0,
         "output_tokens": 0,
         "estimated_cost_usd": 0.0,
+        "paired_change": _paired_change_metrics(cases, case_results),
         "case_results": case_results,
     }
 
@@ -793,6 +1034,7 @@ def evaluate_staged_security(
     for provider, model in models:
         tp = fp = fn = errors = gate_failures = citations = grounded_citations = 0
         clean_true_negatives = clean_false_positives = 0
+        failed_clean_trials = 0
         category_counts: Dict[str, Dict[str, int]] = {}
         case_results = []
         latencies: List[float] = []
@@ -817,6 +1059,7 @@ def evaluate_staged_security(
                         synth=False,
                         swarm=[(provider, model)],
                         source_files={path: case["source"]},
+                        temperature=0.0,
                     )
                     raw_outputs = [
                         {
@@ -875,8 +1118,6 @@ def evaluate_staged_security(
                             if identity not in seen_predictions:
                                 seen_predictions.add(identity)
                                 predictions.append(prediction)
-                    citations += case_citations
-                    grounded_citations += case_grounded
                     result = _evaluate_case(case, predictions)
                     result.update({
                         "citations": case_citations,
@@ -893,17 +1134,33 @@ def evaluate_staged_security(
                         gate_failures += 1
                     if trial_failed:
                         errors += 1
+                        result["invalid_trial_observations"] = {
+                            "predicted_findings": predictions,
+                            "false_positives": result["false_positives"],
+                            "category_mismatches": result.get(
+                                "category_mismatches", []
+                            ),
+                            "citations": case_citations,
+                            "grounded_citations": case_grounded,
+                        }
                         result["error"] = (
                             "; ".join(member_errors)[:240]
                             if member_errors
                             else "Staged review evidence gate failed."
                         )
                         result["true_positives"] = 0
+                        result["false_positives"] = 0
                         result["false_negatives"] = len(case["expected_findings"])
                         result["matched"] = []
                         result["missed"] = case["expected_findings"]
+                        result["false_positive_categories"] = []
+                    else:
+                        citations += case_citations
+                        grounded_citations += case_grounded
                     if not case["expected_findings"]:
-                        if predictions or result.get("error"):
+                        if result.get("error"):
+                            failed_clean_trials += 1
+                        elif predictions:
                             clean_false_positives += 1
                         else:
                             clean_true_negatives += 1
@@ -927,7 +1184,7 @@ def evaluate_staged_security(
                         "error": str(exc)[:240],
                     }
                     if not case["expected_findings"]:
-                        clean_false_positives += 1
+                        failed_clean_trials += 1
                 result["repetition"] = repetition
                 for matched in result.get("matched", []):
                     counts = category_counts.setdefault(
@@ -962,6 +1219,11 @@ def evaluate_staged_security(
             "unique_cases": len(cases),
             "repetitions": repetitions,
             "errors": errors,
+            "failed_clean_trials": failed_clean_trials,
+            "category_mismatches": sum(
+                len(result.get("category_mismatches", []))
+                for result in case_results
+            ),
             "evidence_gate_failures": gate_failures,
             "member_calls": member_calls_total,
             "true_positives": tp,
@@ -1011,6 +1273,7 @@ def evaluate_staged_security(
                 if model_rates is not None and tokens_known
                 else round(sum(costs), 8) if cost_known and costs else None
             ),
+            "paired_change": _paired_change_metrics(cases, case_results),
             "case_results": case_results,
         })
     return {
@@ -1024,6 +1287,231 @@ def evaluate_staged_security(
             "Category accuracy depends on the model-provided CATEGORY label; unknown or incorrect categories score as false positives.",
             "Repeated trials on a fixed case set are correlated; Wilson intervals do not model this dependence.",
             "Quote grounding and the fail-closed evidence gate are not proof of exploitability or completeness.",
+        ],
+    }
+
+
+def evaluate_staged_council(
+    cfg: Any,
+    client: Any,
+    cases: List[Dict[str, Any]],
+    models: List[Tuple[str, str]],
+    repetitions: int = 1,
+) -> Dict[str, Any]:
+    """Evaluate the actual multi-member red-team council on labeled cases."""
+    from omnicli.orchestrate import swarm_redteam
+
+    if len(models) < 2:
+        raise ValueError("A staged council evaluation requires at least two models.")
+    if len(set(models)) != len(models):
+        raise ValueError("A staged council cannot contain duplicate provider/model pairs.")
+    if not cases:
+        raise ValueError("At least one evaluation case is required.")
+    if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+        raise ValueError("Repetitions must be a positive integer.")
+
+    case_results: List[Dict[str, Any]] = []
+    tp = fp = fn = errors = gate_failures = citations = grounded_citations = 0
+    clean_true_negatives = clean_false_positives = failed_clean_trials = 0
+    member_calls = input_tokens = output_tokens = 0
+    usage_known = True
+    latencies: List[float] = []
+    for repetition in range(1, repetitions + 1):
+        for case in cases:
+            raw_outputs: List[Dict[str, Any]] = []
+            try:
+                review = swarm_redteam(
+                    cfg,
+                    client,
+                    case["prompt"],
+                    max_tokens=case.get("max_tokens", 1024),
+                    synth=False,
+                    swarm=models,
+                    source_files={
+                        case.get("file", "source.py").replace("\\", "/"): case["source"]
+                    },
+                    temperature=0.0,
+                )
+                raw_outputs = [
+                    {
+                        key: member.get(key)
+                        for key in (
+                            "provider", "model", "family", "answer", "error",
+                            "stage_evidence_status", "usage",
+                        )
+                    }
+                    for member in review.get("members", [])
+                ]
+                metrics = review.get("metrics", {})
+                member_calls += metrics.get("member_calls", 0)
+                if isinstance(metrics.get("elapsed_ms"), (int, float)):
+                    latencies.append(float(metrics["elapsed_ms"]))
+                reported_input = metrics.get("input_tokens_reported")
+                reported_output = metrics.get("output_tokens_reported")
+                if (
+                    isinstance(reported_input, int) and not isinstance(reported_input, bool)
+                    and isinstance(reported_output, int) and not isinstance(reported_output, bool)
+                ):
+                    input_tokens += reported_input
+                    output_tokens += reported_output
+                else:
+                    usage_known = False
+
+                predictions: List[Dict[str, Any]] = []
+                seen = set()
+                case_citations = case_grounded = 0
+                for validation in review.get("attack_validations", []):
+                    if not isinstance(validation, dict):
+                        continue
+                    for finding in validation.get("findings_checked", []):
+                        if not isinstance(finding, dict):
+                            continue
+                        case_citations += 1
+                        case_grounded += int(bool(finding.get("grounded")))
+                typed_judgment = review.get("typed_judgment") or {}
+                for adjudication in typed_judgment.get("verdicts", []):
+                    if not isinstance(adjudication, dict) or adjudication.get("verdict") != "UPHOLD":
+                        continue
+                    candidate = adjudication.get("candidate") or {}
+                    prediction = {
+                        "category": candidate.get("category", "unknown"),
+                        "file": candidate.get("file", ""),
+                        "line": candidate.get("start_line", 0),
+                        "evidence": candidate.get("quote", ""),
+                    }
+                    identity = (
+                        prediction["category"], prediction["file"],
+                        prediction["line"], prediction["evidence"],
+                    )
+                    if identity not in seen:
+                        seen.add(identity)
+                        predictions.append(prediction)
+                result = _evaluate_case(case, predictions)
+                gate = review.get("evidence_gate") or {}
+                member_errors = [
+                    member.get("error") for member in raw_outputs if member.get("error")
+                ]
+                trial_failed = (
+                    gate.get("status") != "PASS_GROUNDING_ONLY"
+                    or bool(member_errors)
+                )
+                result.update({
+                    "citations": case_citations,
+                    "grounded_citations": case_grounded,
+                    "ungrounded_citations": case_citations - case_grounded,
+                    "evidence_gate": gate,
+                    "raw_outputs": raw_outputs,
+                    "review_diagnostics": {
+                        "stage_calls": review.get("stage_calls", []),
+                        "attack_validations": review.get("attack_validations", []),
+                        "challenge_validations": review.get("challenge_validations", []),
+                        "candidate_triage": review.get("candidate_triage", []),
+                        "typed_judgment": typed_judgment,
+                        "scenario_coverage": review.get("scenario_coverage", []),
+                        "evidence_gap_cues": review.get("evidence_gap_cues", []),
+                    },
+                })
+                if trial_failed:
+                    errors += 1
+                    gate_failures += int(gate.get("status") != "PASS_GROUNDING_ONLY")
+                    result["invalid_trial_observations"] = {
+                        "predicted_findings": predictions,
+                        "false_positives": result["false_positives"],
+                        "category_mismatches": result.get("category_mismatches", []),
+                    }
+                    result.update({
+                        "error": (
+                            "; ".join(str(error) for error in member_errors)[:240]
+                            if member_errors else "Council evidence gate failed."
+                        ),
+                        "true_positives": 0,
+                        "false_positives": 0,
+                        "false_negatives": len(case["expected_findings"]),
+                        "matched": [],
+                        "missed": case["expected_findings"],
+                        "false_positive_categories": [],
+                    })
+                else:
+                    citations += case_citations
+                    grounded_citations += case_grounded
+                if not case["expected_findings"]:
+                    if trial_failed:
+                        failed_clean_trials += 1
+                    elif predictions:
+                        clean_false_positives += 1
+                    else:
+                        clean_true_negatives += 1
+            except Exception as exc:
+                errors += 1
+                gate_failures += 1
+                usage_known = False
+                result = {
+                    "case_id": case["id"],
+                    "true_positives": 0,
+                    "false_positives": 0,
+                    "false_negatives": len(case["expected_findings"]),
+                    "citations": 0,
+                    "grounded_citations": 0,
+                    "ungrounded_citations": 0,
+                    "predicted_findings": [],
+                    "matched": [],
+                    "missed": case["expected_findings"],
+                    "false_positive_categories": [],
+                    "raw_outputs": raw_outputs,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:240],
+                }
+                if not case["expected_findings"]:
+                    failed_clean_trials += 1
+            result["repetition"] = repetition
+            tp += result["true_positives"]
+            fp += result["false_positives"]
+            fn += result["false_negatives"]
+            case_results.append(result)
+
+    ordered_latencies = sorted(latencies)
+    known_clean_trials = clean_true_negatives + clean_false_positives
+    return {
+        "schema_version": 1,
+        "method": "staged_redteam_council",
+        "models": [{"provider": provider, "model": model} for provider, model in models],
+        "dataset_cases": len(cases),
+        "repetitions": repetitions,
+        "member_calls": member_calls,
+        "errors": errors,
+        "evidence_gate_failures": gate_failures,
+        "category_mismatches": sum(
+            len(result.get("category_mismatches", [])) for result in case_results
+        ),
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "citations": citations,
+        "grounded_citations": grounded_citations,
+        "ungrounded_citations": citations - grounded_citations,
+        "citation_accuracy": (
+            round(grounded_citations / citations, 4) if citations else None
+        ),
+        **_score(tp, fp, fn),
+        "true_negative_cases": clean_true_negatives,
+        "false_positive_clean_cases": clean_false_positives,
+        "failed_clean_trials": failed_clean_trials,
+        "specificity": (
+            round(clean_true_negatives / known_clean_trials, 4)
+            if known_clean_trials else None
+        ),
+        "p50_latency_ms": (
+            ordered_latencies[(len(ordered_latencies) - 1) // 2]
+            if ordered_latencies else None
+        ),
+        "input_tokens": input_tokens if usage_known else None,
+        "output_tokens": output_tokens if usage_known else None,
+        "estimated_cost_usd": None,
+        "case_results": case_results,
+        "limitations": [
+            "Council detections are the deduplicated union of member citations, not exploitability proof.",
+            "Failed council trials are reported separately and excluded from ordinary finding metrics.",
+            "Cost is unavailable unless provider pricing and complete usage are supplied.",
         ],
     }
 
@@ -1067,7 +1555,31 @@ def assess_redteam_quality_gate(
     staged_by_model = {
         (item.get("provider"), item.get("model")): item for item in staged
     }
+    direct_keys = [(item.get("provider"), item.get("model")) for item in single_pass]
+    staged_keys = [(item.get("provider"), item.get("model")) for item in staged]
+    if len(set(direct_keys)) != len(direct_keys):
+        failures.append("Single-pass results contain duplicate provider/model rows.")
+    if len(set(staged_keys)) != len(staged_keys):
+        failures.append("Staged results contain duplicate provider/model rows.")
+    all_models = set(direct_by_model) | set(staged_by_model)
     paired = sorted(set(direct_by_model).intersection(staged_by_model))
+    for pair in sorted(all_models - set(paired)):
+        failures.append(
+            f"{pair[0]}:{pair[1]} is missing a paired single-pass or staged result."
+        )
+    failed_pairs = [
+        pair for pair in paired
+        if (
+            direct_by_model[pair].get("errors", 0) != 0
+            or staged_by_model[pair].get("errors", 0) != 0
+            or staged_by_model[pair].get("evidence_gate_failures", 0) != 0
+        )
+    ]
+    for pair in failed_pairs:
+        failures.append(
+            f"{pair[0]}:{pair[1]} has provider or evidence-gate failures; "
+            "failed trials cannot be excluded from the quality gate."
+        )
     healthy_pairs = [
         pair for pair in paired
         if (
@@ -1148,8 +1660,18 @@ def assess_redteam_quality_gate(
         }
         return scores
 
+    def by_family(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        families: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            family = classify_family(row["model"])
+            if family != "other":
+                families.setdefault(family, []).append(row)
+        return families
+
     direct_rows = [direct_by_model[pair] for pair in healthy_pairs]
     staged_rows = [staged_by_model[pair] for pair in healthy_pairs]
+    direct_families = by_family(direct_rows)
+    staged_families = by_family(staged_rows)
     direct_scores = pooled(direct_rows)
     staged_scores = pooled(staged_rows)
     for method, scores in (("single-pass", direct_scores), ("staged", staged_scores)):
@@ -1162,6 +1684,35 @@ def assess_redteam_quality_gate(
     if staged_scores["recall"] < direct_scores["recall"]:
         failures.append("Staged mode recall regresses against the single-pass baseline.")
 
+    per_family: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for family in sorted(set(direct_families) | set(staged_families)):
+        family_direct = pooled(direct_families.get(family, []))
+        family_staged = pooled(staged_families.get(family, []))
+        per_family[family] = {
+            "single_pass": family_direct,
+            "staged": family_staged,
+        }
+        for method, scores in (
+            ("single-pass", family_direct),
+            ("staged", family_staged),
+        ):
+            if scores["recall"] < 0.85:
+                failures.append(
+                    f"{family} {method} recall is below 85%."
+                )
+            if scores["specificity"] is None or scores["specificity"] < 0.90:
+                failures.append(
+                    f"{family} {method} specificity is below 90%."
+                )
+            if scores["citation_accuracy"] is None or scores["citation_accuracy"] < 0.95:
+                failures.append(
+                    f"{family} {method} exact citation accuracy is below 95%."
+                )
+        if family_staged["recall"] < family_direct["recall"]:
+            failures.append(
+                f"{family} staged mode recall regresses against the single-pass baseline."
+            )
+
     return {
         "status": "FAIL" if failures else "PASS_BOUNDED_GATE",
         "failures": failures,
@@ -1172,8 +1723,12 @@ def assess_redteam_quality_gate(
         "paired_models": [
             {"provider": provider, "model": model} for provider, model in healthy_pairs
         ],
+        "failed_models": [
+            {"provider": provider, "model": model} for provider, model in failed_pairs
+        ],
         "single_pass": direct_scores,
         "staged": staged_scores,
+        "per_family": per_family,
         "limitations": [
             "Passing qualifies only for this reviewed held-out set, roster, and measured configuration.",
             "Wilson intervals are descriptive and do not account for correlations between repeated trials.",

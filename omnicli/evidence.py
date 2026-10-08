@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 _FINDING_HEADER = re.compile(
@@ -14,7 +15,9 @@ _FINDING_HEADER = re.compile(
     r"\s+LINE:\s*(?P<start>\d+)(?:\s*-\s*(?P<end>\d+))?"
     r"\s+QUOTE:\s*"
 )
-_CODE_QUOTE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```|`([^`\n]+)`", re.DOTALL)
+_QUOTE_DETAIL = re.compile(
+    r"(?im)^\s*(?:ATTACK PATH|PRECONDITIONS|UNVERIFIED):"
+)
 _CLAIM = re.compile(
     r"\b(finding|findings|vulnerabilit(?:y|ies)|security issue|exploitable|"
     r"defect|bug|issue)\b",
@@ -26,12 +29,134 @@ _SOURCE_BLOCK = re.compile(
 )
 
 
+_CANONICAL_CATEGORIES = {
+    "sql_injection",
+    "command_injection",
+    "path_traversal",
+    "unsafe_deserialization",
+    "authentication_authorization",
+    "sensitive_data_exposure",
+}
+
+_CATEGORY_ALIASES = {
+    "missing_authorization": "authentication_authorization",
+    "broken_access_control": "authentication_authorization",
+    "authorization": "authentication_authorization",
+    "authentication": "authentication_authorization",
+    "authz": "authentication_authorization",
+    "authn": "authentication_authorization",
+    "access_control": "authentication_authorization",
+    "idor": "authentication_authorization",
+    "insecure_direct_object_reference": "authentication_authorization",
+    "privilege_escalation": "authentication_authorization",
+    "unauthorized_access": "authentication_authorization",
+    "broken_authentication": "authentication_authorization",
+    "sqli": "sql_injection",
+    "sql": "sql_injection",
+    "os_command_injection": "command_injection",
+    "cmd_injection": "command_injection",
+    "shell_injection": "command_injection",
+    "directory_traversal": "path_traversal",
+    "traversal": "path_traversal",
+    "lfi": "path_traversal",
+    "information_disclosure": "sensitive_data_exposure",
+    "info_disclosure": "sensitive_data_exposure",
+    "data_exposure": "sensitive_data_exposure",
+    "secret_exposure": "sensitive_data_exposure",
+    "hardcoded_secret": "sensitive_data_exposure",
+    "insecure_deserialization": "unsafe_deserialization",
+    "deserialization": "unsafe_deserialization",
+}
+
+
+def canonical_finding_category(category: str) -> str:
+    """Normalize finding categories to the pinned 6-class benchmark taxonomy."""
+    cleaned = (category or "").strip().lower()
+    return _CATEGORY_ALIASES.get(cleaned, cleaned)
+
+
 def extract_sources_from_prompt(prompt: str) -> Dict[str, str]:
     """Extract only explicitly labeled source-file blocks from prompt text."""
     return {
         match.group("path").strip().replace("\\", "/"): match.group("source")
         for match in _SOURCE_BLOCK.finditer(prompt)
     }
+
+
+def candidate_reference_id(
+    path: str,
+    start_line: object,
+    end_line: object,
+    category: str = "unknown",
+    quote: str = "",
+) -> str:
+    """Identify one cited evidence unit independently of model title or category."""
+    identity = "\0".join((
+        path.strip().replace("\\", "/"),
+        str(start_line),
+        str(end_line),
+        " ".join(quote.split()),
+    ))
+    return "CAND-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12].upper()
+
+
+def parse_challenge_triage(answer: str) -> list[Dict[str, str]]:
+    """Extract explicitly structured challenge dispositions without treating them as proof."""
+    parsed = []
+    text = (answer or "").replace("**", "").replace("__", "")
+    candidate_pattern = re.compile(r"CANDIDATE:\s*(CAND-[A-F0-9]{12})", re.I)
+    status_values = r"SUPPORTED|REFUTED|UNRESOLVED|UNVERIFIED"
+    status_pattern = re.compile(
+        rf"(?im)^\s*TRIAGE\s*:?\s*({status_values})\s*$"
+    )
+    direct_status_pattern = re.compile(
+        rf"(?im)^\s*(CAND-[A-F0-9]{{12}})\s*:\s*({status_values})\b",
+        re.I,
+    )
+
+    def normalize_status(status: str) -> str:
+        normalized = status.lower()
+        return "unresolved" if normalized == "unverified" else normalized
+
+    statuses = list(status_pattern.finditer(text))
+    for index, status_match in enumerate(statuses):
+        next_status = statuses[index + 1].start() if index + 1 < len(statuses) else len(text)
+        following = text[status_match.end():next_status]
+        candidate = candidate_pattern.search(following)
+        if not candidate:
+            previous_status_end = statuses[index - 1].end() if index else 0
+            preceding = text[previous_status_end:status_match.start()]
+            previous_ids = list(re.finditer(r"\b(CAND-[A-F0-9]{12})\b", preceding, re.I))
+            if not previous_ids:
+                continue
+            candidate_id = previous_ids[-1].group(1).upper()
+            candidate_start = previous_status_end + previous_ids[-1].start()
+        else:
+            candidate_id = candidate.group(1).upper()
+            candidate_start = status_match.end() + candidate.start()
+        detail = text[candidate_start:next_status]
+        reason = re.search(r"(?im)^\s*REASON:\s*(.+?)\s*$", detail)
+        safe_test = re.search(r"(?im)^\s*SAFE TEST:\s*(.+?)\s*$", detail)
+        parsed.append({
+            "candidate_id": candidate_id,
+            "status": normalize_status(status_match.group(1)),
+            "reason": " ".join(reason.group(1).split()) if reason else "",
+            "safe_test": " ".join(safe_test.group(1).split()) if safe_test else "",
+        })
+    direct_statuses = list(direct_status_pattern.finditer(text))
+    for index, match in enumerate(direct_statuses):
+        end = direct_statuses[index + 1].start() if index + 1 < len(direct_statuses) else len(text)
+        block = text[match.start():end]
+        reason = re.search(r"(?im)^\s*REASON:\s*(.+?)\s*$", block)
+        safe_test = re.search(r"(?im)^\s*SAFE TEST:\s*(.+?)\s*$", block)
+        parsed.append({
+            "candidate_id": match.group(1).upper(),
+            "status": normalize_status(match.group(2)),
+            "reason": " ".join(reason.group(1).split()) if reason else "",
+            "safe_test": " ".join(safe_test.group(1).split()) if safe_test else "",
+        })
+    unique = {item["candidate_id"]: item for item in parsed}
+    return sorted(unique.values(), key=lambda item: text.find(item["candidate_id"]))
 
 
 def analyze_python_security_facts(
@@ -168,11 +293,6 @@ def analyze_python_security_facts(
                     for item in ast.walk(node)
                     if isinstance(item, ast.Call)
                 ]
-                call_sites = [
-                    {"call": dotted_name(item.func), "line": item.lineno}
-                    for item in ast.walk(node)
-                    if isinstance(item, ast.Call)
-                ]
                 decorators = [dotted_name(item) for item in node.decorator_list]
                 names = [dotted_name(item) for item in ast.walk(node)]
                 assignments = [
@@ -212,6 +332,27 @@ def analyze_python_security_facts(
                             request_derived.add(target_name)
                         if value_names.intersection(dynamic_variables):
                             dynamic_variables.add(target_name)
+                call_sites = []
+                for item in ast.walk(node):
+                    if not isinstance(item, ast.Call):
+                        continue
+                    argument_names = sorted({
+                        child.id for argument in [
+                            *item.args,
+                            *(keyword.value for keyword in item.keywords),
+                        ]
+                        for child in ast.walk(argument)
+                        if isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                    })
+                    call_sites.append({
+                        "call": dotted_name(item.func),
+                        "line": item.lineno,
+                        "argument_names": argument_names,
+                        "request_derived_arguments": sorted(
+                            set(argument_names).intersection(request_derived)
+                        ),
+                    })
                 request_inputs = sorted({
                     name for name in names
                     if name.split(".")[0] in {"request", "req"}
@@ -400,13 +541,175 @@ def analyze_python_security_facts(
                 "dynamic_variables": sorted(dynamic_variables),
                 "security_sinks": sinks,
             })
-        reports.append({"file": path, "routes": routes, "functions": functions})
+        reports.append({
+            "file": path,
+            "routes": routes,
+            "functions": functions,
+            "request_hooks": request_hooks,
+        })
+    functions_by_name: Dict[str, list[tuple[str, Mapping[str, object]]]] = {}
+    project_hooks = []
+    for report in reports:
+        path = str(report.get("file", ""))
+        for hook in report.get("request_hooks", []):
+            if isinstance(hook, Mapping):
+                project_hooks.append({"file": path, **hook})
+        for function in report.get("functions", []):
+            if isinstance(function, Mapping) and isinstance(function.get("name"), str):
+                functions_by_name.setdefault(function["name"], []).append((path, function))
+
+    for report in reports:
+        path = str(report.get("file", ""))
+        for route in report.get("routes", []):
+            if not isinstance(route, dict):
+                continue
+            helper_context = []
+            for call_site in route.get("call_sites", []):
+                if not isinstance(call_site, Mapping):
+                    continue
+                call_name = str(call_site.get("call", ""))
+                function_name = call_name.rsplit(".", 1)[-1]
+                matches = functions_by_name.get(function_name, [])
+                for helper_path, helper in matches:
+                    if helper_path == path:
+                        continue
+                    helper_context.append({
+                        "call": call_name,
+                        "call_line": call_site.get("line"),
+                        "file": helper_path,
+                        "function": function_name,
+                        "start_line": helper.get("start_line"),
+                        "end_line": helper.get("end_line"),
+                        "local_auth_guards": helper.get("local_auth_guards", [])[:8],
+                        "mutating_calls": helper.get("mutating_calls", [])[:8],
+                        "request_derived_variables": helper.get(
+                            "request_derived_variables", []
+                        )[:8],
+                        "security_sinks": helper.get("security_sinks", [])[:8],
+                    })
+                    if len(helper_context) >= 8:
+                        break
+                if len(helper_context) >= 8:
+                    break
+            route["cross_file_helpers"] = helper_context
+            route["project_request_hooks"] = [
+                hook for hook in project_hooks if hook.get("file") != path
+            ][:8]
+
     return reports
+
+
+def anchor_auth_candidate_to_mutation(
+    candidate: Mapping[str, Any],
+    sources: Mapping[str, str],
+    source_facts: list[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Sharpen an existing auth candidate to one unique route mutation call."""
+    anchored = dict(candidate)
+    if str(candidate.get("category", "")).strip().lower() != "authentication_authorization":
+        return anchored
+
+    path = str(candidate.get("file", "")).strip().replace("\\", "/")
+    source = next(
+        (
+            text for source_path, text in sources.items()
+            if str(source_path).replace("\\", "/").strip() == path
+        ),
+        None,
+    )
+    if not isinstance(source, str):
+        return anchored
+    try:
+        candidate_start = int(candidate.get("start_line", 0) or 0)
+        candidate_end = int(
+            candidate.get("end_line", candidate_start) or candidate_start
+        )
+    except (TypeError, ValueError):
+        return anchored
+    if candidate_start < 1 or candidate_end < candidate_start:
+        return anchored
+
+    report = next(
+        (
+            item for item in source_facts
+            if str(item.get("file", "")).replace("\\", "/").strip() == path
+        ),
+        None,
+    )
+    if report is None:
+        return anchored
+    matching_routes = []
+    for route in report.get("routes", []):
+        if not isinstance(route, Mapping):
+            continue
+        try:
+            route_start = int(route.get("start_line", 0) or 0)
+            route_end = int(route.get("end_line", route_start) or route_start)
+        except (TypeError, ValueError):
+            continue
+        if candidate_start <= route_end and candidate_end >= route_start:
+            matching_routes.append(route)
+    if len(matching_routes) != 1:
+        return anchored
+
+    route = matching_routes[0]
+    if route.get("local_auth_guards") or any(
+        isinstance(hook, Mapping) and hook.get("enforces_auth")
+        for hook in route.get("same_module_request_hooks", [])
+    ):
+        return anchored
+    mutating_calls = set(route.get("mutating_calls") or [])
+    sites = {
+        int(site["line"]): str(site["call"])
+        for site in route.get("call_sites", [])
+        if isinstance(site, Mapping)
+        and site.get("call") in mutating_calls
+        and isinstance(site.get("line"), int)
+        and not isinstance(site.get("line"), bool)
+    }
+    if not sites:
+        return anchored
+    in_range = {
+        line: call for line, call in sites.items()
+        if candidate_start <= line <= candidate_end
+    }
+    if len(in_range) == 1:
+        line, call = next(iter(in_range.items()))
+    elif len(sites) == 1:
+        line, call = next(iter(sites.items()))
+    else:
+        return anchored
+
+    source_lines = source.splitlines()
+    if line < 1 or line > len(source_lines):
+        return anchored
+    exact_quote = source_lines[line - 1].strip()
+    if not exact_quote:
+        return anchored
+    anchored["citation_reanchored"] = {
+        "method": "unique_route_mutation_call",
+        "from": {
+            "start_line": candidate.get("start_line"),
+            "end_line": candidate.get("end_line"),
+            "quote": candidate.get("quote"),
+            "grounded": candidate.get("grounded"),
+        },
+        "call": call,
+    }
+    anchored.update({
+        "start_line": line,
+        "end_line": line,
+        "quote": exact_quote,
+        "grounded": True,
+    })
+    anchored.pop("reason", None)
+    return anchored
 
 
 def triage_grounded_findings(
     validations: list[Mapping[str, object]],
     source_facts: list[Mapping[str, object]],
+    challenge_outcomes: Optional[list[Mapping[str, object]]] = None,
 ) -> list[Dict[str, object]]:
     """Deduplicate citations and screen claims against conservative AST route facts."""
     routes_by_file: Dict[str, list[Mapping[str, object]]] = {}
@@ -419,6 +722,27 @@ def triage_grounded_findings(
             ]
 
     findings: Dict[tuple[object, ...], Dict[str, object]] = {}
+    challenge_by_id: Dict[str, list[Dict[str, str]]] = {}
+    for outcome in challenge_outcomes or []:
+        candidate_id = outcome.get("candidate_id")
+        status = outcome.get("status")
+        if (
+            isinstance(candidate_id, str)
+            and status in {"supported", "refuted", "unresolved"}
+        ):
+            challenge_by_id.setdefault(candidate_id, []).append({
+                "status": str(status),
+                "reason": str(outcome.get("reason", "")),
+                "safe_test": str(outcome.get("safe_test", "")),
+                **(
+                    {"provider": str(outcome["provider"])}
+                    if outcome.get("provider") else {}
+                ),
+                **(
+                    {"model": str(outcome["model"])}
+                    if outcome.get("model") else {}
+                ),
+            })
     auth_claim = re.compile(
         r"\b(unauth|unauthor|authentic|authorization|access control|privilege)\w*\b",
         re.I,
@@ -435,17 +759,40 @@ def triage_grounded_findings(
             path = str(item.get("file", "")).replace("\\", "/")
             start = item.get("start_line")
             end = item.get("end_line")
-            key = (title.strip().lower(), path, start, end)
+            category = str(item.get("category", "unknown")).strip().lower()
+            quote = " ".join(str(item.get("quote", "")).split())
+            key = (path, start, end, quote)
             grounded = bool(item.get("grounded"))
+            candidate_id = candidate_reference_id(
+                path, start, end, category, quote
+            )
             candidate: Dict[str, object] = {
                 "title": title,
                 "file": path,
                 "start_line": start,
                 "end_line": end,
+                "category": category,
+                "quote": quote,
+                **{
+                    field: str(item[field])
+                    for field in ("attack_path", "preconditions", "unverified")
+                    if item.get(field)
+                },
                 "quote_grounded": grounded,
                 "status": "unverified_candidate",
                 "reason": "Static source patterns do not establish the complete security behavior.",
+                "reported_categories": [category],
+                "candidate_id": candidate_id,
             }
+            reviews = challenge_by_id.get(candidate_id, [])
+            if reviews:
+                challenge_statuses = {review["status"] for review in reviews}
+                candidate["challenge_status"] = (
+                    next(iter(challenge_statuses))
+                    if len(challenge_statuses) == 1
+                    else "mixed"
+                )
+                candidate["challenge_reviews"] = reviews
             if not grounded:
                 candidate.update({
                     "status": "unsupported_citation",
@@ -512,7 +859,19 @@ def triage_grounded_findings(
                                         "source-supported sink."
                                     ),
                                 })
-            findings.setdefault(key, candidate)
+            existing = findings.get(key)
+            if existing is None:
+                findings[key] = candidate
+            else:
+                categories = existing["reported_categories"]
+                if category not in categories:
+                    categories.append(category)
+                titles = existing.setdefault("alternate_titles", [])
+                if title != existing["title"] and title not in titles:
+                    titles.append(title)
+                if not existing.get("challenge_reviews") and candidate.get("challenge_reviews"):
+                    existing["challenge_reviews"] = candidate["challenge_reviews"]
+                    existing["challenge_status"] = candidate.get("challenge_status")
     return list(findings.values())
 
 
@@ -540,6 +899,18 @@ def assess_evidence_gate(
         status = validation.get("status")
         if status in bad_validation_statuses:
             failures.append(f"Review output {index} failed grounding: {status}.")
+        if validation.get("review_complete") is False:
+            failures.append(
+                f"Review output {index} did not complete its assigned review stage."
+            )
+        elif (
+            status == "no_structured_findings"
+            and not validation.get("review_complete")
+            and not validation.get("explicit_no_findings")
+        ):
+            failures.append(
+                f"Review output {index} returned no findings without an explicit no-finding result."
+            )
 
     for candidate in candidate_triage:
         if candidate.get("status") == "unsupported_citation":
@@ -562,6 +933,97 @@ def assess_evidence_gate(
             "completeness, or safety."
         ),
     }
+
+
+def _extract_quoted_source(quote_tail: str) -> tuple[str, int]:
+    """Extract a source excerpt and its answer-text span before review details."""
+    detail = _QUOTE_DETAIL.search(quote_tail)
+    excerpt = quote_tail[:detail.start()] if detail else quote_tail
+    excerpt = excerpt.strip()
+    offset = len(quote_tail) - len(quote_tail.lstrip())
+
+    fenced = re.match(r"```[^\n`]*\n?(.*?)```", excerpt, re.DOTALL)
+    if fenced:
+        quote = fenced.group(1)
+        consumed = offset + fenced.end()
+    elif excerpt.startswith("`"):
+        quote_lines = excerpt.splitlines()
+        if len(quote_lines) > 1 and all(
+            line.strip().startswith("`") and line.strip().endswith("`")
+            for line in quote_lines if line.strip()
+        ):
+            quote = "\n".join(
+                line.strip()[1:-1] if line.strip() else ""
+                for line in quote_lines
+            )
+            consumed = offset + len(excerpt)
+        else:
+            wrapped = re.match(
+                r"`(?P<quote>.*)`[ \t]*(?:\r?\n)?\Z",
+                excerpt,
+                re.DOTALL,
+            )
+            if wrapped:
+                quote = wrapped.group("quote")
+                consumed = offset + wrapped.end()
+            else:
+                quote = excerpt
+                consumed = offset + len(excerpt)
+    else:
+        if detail:
+            quote = excerpt
+            consumed = offset + len(excerpt)
+        else:
+            quote = next((line.strip() for line in excerpt.splitlines() if line.strip()), "")
+            consumed = offset + len(quote)
+
+    # Some providers serialize a multiline citation using visible escapes.
+    decoded = quote.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    if decoded != quote:
+        quote = decoded
+    return quote, consumed
+
+
+def _structured_detail_span(detail_tail: str) -> int:
+    """Cover only explicitly labeled review fields and their list continuations."""
+    consumed = 0
+    active_field = False
+    for line in detail_tail.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or re.match(
+            r"(?i)^\s*(?:ATTACK PATH|PRECONDITIONS|UNVERIFIED):", line
+        ):
+            active_field = True if stripped else active_field
+            consumed += len(line)
+            continue
+        if re.match(r"^\s*(?:[-*]\s+|```)", line) or (
+            active_field and line[:1].isspace()
+        ):
+            consumed += len(line)
+            continue
+        break
+    return consumed
+
+
+def _has_unstructured_claim(text: str) -> bool:
+    for match in _CLAIM.finditer(text):
+        sentence_start = max(
+            text.rfind("\n", 0, match.start()),
+            text.rfind(".", 0, match.start()),
+            text.rfind("!", 0, match.start()),
+            text.rfind("?", 0, match.start()),
+        )
+        prefix = text[sentence_start + 1:match.start()]
+        if re.search(
+            r"\b(?:no|not|never|without|none|neither|cannot|can't|"
+            r"doesn't|isn't|does\s+not|is\s+not)\b"
+            r"(?:\W+\w+){0,5}\W*$",
+            prefix,
+            re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
 
 
 def validate_quoted_findings(
@@ -589,42 +1051,81 @@ def validate_quoted_findings(
         end = int(match.group("end") or start)
         quote_end = findings[index + 1].start() if index + 1 < len(findings) else len(answer_text)
         quote_tail = answer_text[match.end():quote_end].lstrip()
-        code_quote = _CODE_QUOTE.search(quote_tail)
-        if code_quote:
-            quote = (
-                code_quote.group(1)
-                if code_quote.group(1) is not None
-                else code_quote.group(2)
-            )
-            covered_claim_spans.append((match.start(), match.end() + code_quote.end()))
-        else:
-            quote = next(
-                (line.strip() for line in quote_tail.splitlines() if line.strip()),
-                "",
-            )
-            covered_claim_spans.append((match.start(), match.end() + len(quote)))
+        quote, quote_span = _extract_quoted_source(quote_tail)
+        detail_tail = quote_tail[quote_span:]
+        detail_span = _structured_detail_span(detail_tail)
+        covered_claim_spans.append((
+            match.start(),
+            match.end() + quote_span + detail_span,
+        ))
+        quote_lines = quote.strip("\r\n").splitlines()
+        display_prefix_pattern = re.compile(r"^(?P<line>\d{5}) \| (?P<code>.*)$")
+        prefixed_quotes = [
+            display_prefix_pattern.fullmatch(line) for line in quote_lines
+        ]
+        display_line_prefix_removed = bool(quote_lines) and all(
+            match is not None
+            and int(match.group("line")) == start + index
+            for index, match in enumerate(prefixed_quotes)
+        )
+        if display_line_prefix_removed:
+            quote_lines = [
+                match.group("code")
+                for match in prefixed_quotes
+                if match is not None
+            ]
+        quote_is_multiline = len(quote_lines) > 1
+        quote_first_line = " ".join(quote_lines[0].split()) if quote_lines else ""
         quote = " ".join(quote.split())
+        if display_line_prefix_removed:
+            quote = " ".join(" ".join(quote_lines).split())
         reason = None
         if source is None:
             reason = "cited file was not among the supplied source files"
         elif end < start or start < 1 or end > len(source.splitlines()):
             reason = "cited line range is outside the supplied file"
+        elif end - start > 7:
+            reason = "cited line range is too broad; cite at most eight lines"
         elif not quote:
             reason = "citation did not include a source quote"
         else:
             source_lines = source.splitlines()[start - 1:end]
+            first_line = " ".join(source_lines[0].split())
             cited_text = " ".join(
                 " ".join(" ".join(line.split()) for line in source_lines).split()
             )
-            if quote not in cited_text:
+            normalized_quote = " ".join(quote.split())
+            if quote_is_multiline:
+                grounded_quote = (
+                    len(quote_lines) == end - start + 1
+                    and normalized_quote in cited_text
+                    and quote_first_line in first_line
+                )
+            else:
+                grounded_quote = end == start and normalized_quote in first_line
+            if not grounded_quote:
                 reason = "quoted lines do not exactly match the cited source range"
+        raw_cat = (match.group("category") or "unknown").strip().lower()
         checked.append({
             "finding": match.group("title").strip(),
-            "category": (match.group("category") or "unknown").strip().lower(),
+            "category": canonical_finding_category(raw_cat),
+            "raw_category": raw_cat,
             "file": path,
             "start_line": start,
             "end_line": end,
             "quote": quote,
+            "display_line_prefix_removed": display_line_prefix_removed,
+            **{
+                field: " ".join(found.group(1).split())
+                for field, label in (
+                    ("attack_path", "ATTACK PATH"),
+                    ("preconditions", "PRECONDITIONS"),
+                    ("unverified", "UNVERIFIED"),
+                )
+                if (found := re.search(
+                    rf"(?im)^\s*{label}:\s*(.+?)\s*$", detail_tail
+                ))
+            },
             "grounded": reason is None,
             **({"reason": reason} if reason else {}),
         })
@@ -636,7 +1137,12 @@ def validate_quoted_findings(
         previous = end
     unstructured_parts.append(answer_text[previous:])
     unstructured_text = "\n".join(unstructured_parts)
-    unstructured_claim = bool(_CLAIM.search(unstructured_text))
+    unstructured_claim = _has_unstructured_claim(unstructured_text)
+    explicit_no_findings = bool(re.search(
+        r"\bNO ACTIONABLE CANDIDATE\b|\bNO FINDINGS?\b",
+        answer_text,
+        re.IGNORECASE,
+    ))
     if not source_map:
         status = "no_source_provided"
     elif findings and (
@@ -654,5 +1160,7 @@ def validate_quoted_findings(
         "source_files_checked": len(source_map),
         "findings_checked": checked,
         "candidate_claims_unstructured": unstructured_claim,
+        "explicit_no_findings": explicit_no_findings,
+        "review_complete": bool(findings) or explicit_no_findings,
         "security_conclusion": "not_assessed",
     }

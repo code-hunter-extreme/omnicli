@@ -11,3 +11,8 @@ dist/
 build/
 .history
 .pytest_cache/
+reports/redteam_audit_*.md
+reports/redteam_live_*.json
+reports/redteam_development_pilot.json
+reports/redteam_review_packet_*.jsonl
+reports/redteam_review_packet_*.md

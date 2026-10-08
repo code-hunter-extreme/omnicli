@@ -118,13 +118,16 @@ concurrently; a synthesis pass merges agreements and flags disagreements.
 `--redteam` runs a staged review: each member performs separate passes over
 authentication/authorization, tainted-input sinks, sensitive-data handling, and
 state/concurrency/resource risks (even when only one member is configured).
-The challenge stage cross-examines the combined candidate list, then OmniCLI
-uses deterministic source/route facts to deduplicate and screen cited model
-hypotheses. A generic missing-auth claim on a literal-only public health route
+The challenge stage assigns concise, source-grounded candidate cards across
+independent reviewers instead of sending the entire multi-model transcript to
+every challenger. Each assignment must be dispositioned; challenge results are
+retained as model opinions, not proof. OmniCLI then uses deterministic
+source/route facts to deduplicate and screen cited model hypotheses. A generic
+missing-auth claim on a literal-only public health route
 is not treated as actionable; a missing local guard on a mutating route remains
 unverified until middleware, reachability, and impact are checked. Members
-challenge the combined candidate list for unsupported paths, missing
-preconditions, and false positives. When only one model is configured, this is
+challenge assigned candidates for unsupported paths, missing preconditions,
+and false positives. When only one model is configured, this is
 explicitly labeled self-critique, not independent corroboration. The final
 red-team report itself is deterministic; it does not ask another model to vote
 on or amplify the same claims. Every stage and provider failure is shown in the
@@ -134,11 +137,30 @@ run tests or HTTP probes, and model agreement alone is never proof. Use
 `omni agent --redteam` when tool-driven inspection and deterministic checks are
 needed; HTTP checks still require an explicit host allowlist.
 For source grounding, supply files explicitly with repeatable `--source-file`
-options. Red-team answers are asked for structured `FINDING` / `FILE` / `LINE` /
-`QUOTE` blocks; OmniCLI checks those lines and quotes against supplied files and
-reports `quotes_grounded`, `unsupported_citations`, `unstructured_claims`,
-`no_structured_findings`, or `no_source_provided`. Malformed citation syntax and
-additional unstructured claims are not treated as an empty finding set.
+options. Unlike general-purpose swarm modes, red-team mode does not search
+prompt-mentioned paths or attach local project files implicitly. Selected
+source files are sent to configured model providers and are listed before the
+calls begin. Red-team answers are asked for structured `FINDING` / `FILE` /
+`LINE` / `QUOTE` blocks; OmniCLI checks quotes against the cited starting line
+and the full cited range, and rejects ranges wider than eight lines. Empty
+replies and silent no-finding replies fail the evidence gate; a completed
+negative review must explicitly say `NO ACTIONABLE CANDIDATE` (and an empty
+challenge stage must say `NO CANDIDATES TO CHALLENGE`).
+For Python files explicitly supplied to the review, deterministic facts also
+link route call sites to same-named helper definitions and list request hooks
+found in other supplied files. These bounded links are investigation context,
+not proof that a helper is reachable or a hook protects a route. If a reviewer
+omits an assigned challenge disposition, OmniCLI makes one bounded recovery
+call for only the missing candidate IDs; a failed or still-incomplete recovery
+keeps the evidence gate closed.
+The pipeline also executes four objective-labeled source-security scenarios
+(authorization, taint-to-sink, sensitive-data exposure, and state/resilience),
+then checks AST-derived route/sink observations against grounded first-pass
+citations. If a security-relevant observation was not cited, it runs one
+bounded adaptive evidence-gap follow-up per model, asks the model to inspect
+those exact locations, and reports which cues received grounded citations.
+Scenario completion and cue coverage are review telemetry—not vulnerability
+proof or a measure of total code coverage.
 Quote grounding confirms only that text exists at that location—it does not
 prove reachability, exploitability, impact, or bounty eligibility. Unstructured
 model claims remain ungrounded hypotheses.
@@ -148,6 +170,9 @@ that do not match the supplied file cause a prominent `EVIDENCE GATE: FAIL`
 and CLI exit code `2`. `PASS_GROUNDING_ONLY` means only that the supplied
 outputs passed these citation checks; it is not a security verdict. A red-team
 result without a gate is itself treated as a failure.
+The offline staged evaluator uses temperature 0, matching the direct baseline;
+the interactive red-team command retains provider defaults unless configured
+otherwise.
 Deliberate mode costs at least two member calls per selected model plus
 synthesis when more than one member response is available, and currently does
 not support checkpoint/resume. Member and chair outputs are checked for quoted
@@ -165,8 +190,17 @@ and the category/severity metadata pattern in
 These are design references, not runtime dependencies. OmniCLI's regression
 fixtures are purpose-built source-security cases; it does not import the
 separate dataset's harmful-content prompt payloads or copy the playground app.
-All four repositories currently expose MIT top-level licenses; check nested or
-upstream third-party materials separately before reusing their code or assets.
+The four AI-safety repositories currently expose MIT top-level licenses; check
+nested or upstream third-party materials separately before reusing their code
+or assets. OWASP BenchmarkJava is GPL-2.0, so its app and fixtures are not
+copied.
+For source-review benchmarking, cases may also carry `pair_id`,
+`pair_role` (`vulnerable` or `fixed`), and a shared `pair_category`. The
+evaluator reports whether it finds the vulnerable version and leaves its fixed
+counterpart unflagged. The development SQL fixture contains one such pair as a
+smoke check; that single pair is not independent quality evidence. This adopts
+the paired vulnerable/fixed and labeled expected-result patterns from PrimeVul
+and OWASP BenchmarkJava without importing their code or datasets.
 
 ### Dependency-aware workflows
 
@@ -273,6 +307,10 @@ recorded, never fatal.
 `/file <path>` · `/save` · `/clear` (session) · `/forget` (persisted history) ·
 `/ping` · `/help` · `/exit`
 
+In red-team mode, `/file` attaches that file only to the next prompt, lists it
+before provider calls, and enforces a 200,000-character combined source limit.
+`/clear` also removes pending attachments.
+
 ## Proxy mode
 
 ```bash
@@ -377,14 +415,40 @@ source-line quote accuracy, per-category scores, 95% Wilson intervals, request
 errors, p50 latency, and cost only when an optional `--pricing` JSON file
 supplies per-model `input_per_million` / `output_per_million` rates and provider
 responses include token usage. The JSON report preserves each case's
-normalized predicted findings and citation quotes for adjudication.
-`--staged-redteam` adds the actual four-focus attack plus challenge pipeline for
-every case and model, reported beside the single-pass and optional static
-results. This uses at least five model calls per case per repetition; request
-it deliberately and include its latency/cost in comparisons. Stage or
-evidence-gate failures count as failed trials and expected findings are scored
-as missed. Staged results are not eligible for the single-pass model
-recommendation.
+normalized predicted findings, raw direct-model response, and citation quotes
+for adjudication. Staged council reports also retain per-stage raw outputs and
+validation diagnostics, including candidate assignments and challenge
+completeness. Exact scoring still requires category, file, line, and
+evidence; separately reported evidence-aligned category mismatches identify
+claims citing the expected location and quote with a different category, but
+do not silently count as exact matches. Failed staged trials remain explicit
+failures and their candidate observations are retained separately rather than
+being scored as ordinary false positives or valid citations.
+`--staged-redteam` runs the actual selected multi-model council through the
+four-scenario attack, cross-model challenge, and optional adaptive evidence-gap
+follow-up for every case. An attack response with grounded citations but
+uncited prose may receive one format-only correction; it is accepted only if
+the correction passes validation, preserves the exact original cited findings,
+and retains every required structured field including `CATEGORY`. Otherwise
+the stage and evidence gate remain failed. If `--model` is
+omitted, it uses the same active default swarm as `omni swarm`; repeat
+`--model provider:model` to choose a specific roster. It runs at least five
+model calls per member per case and may run an additional adaptive follow-up
+per member plus corrections for affected responses; estimate call volume and
+cost before a large run. Stage or evidence-gate failures remain explicit, and
+observations from failed stages are not scored as valid findings.
+
+Held-out `--quality-gate` additionally runs the per-model staged comparisons
+needed for per-family thresholds and recall non-regression. Those per-model
+stages are diagnostics, not independent council corroboration.
+
+```bash
+omni evaluate-security --dataset security-cases.jsonl \
+  --staged-redteam
+```
+
+This still performs multiple staged calls per case and can be costly; provider
+usage and explicit pricing are required for a cost estimate.
 `--static-baseline` adds a local deterministic pattern baseline using the same
 cases; its candidates are heuristics, not security verdicts or model
 recommendations. `--repetitions` repeats every model/case pair (default 1);
@@ -403,6 +467,21 @@ The candidate 60-case held-out set in
 approved for scoring. A second reviewer must independently verify every gold
 label, line, rationale, and precondition before updating its adjudication
 metadata; the gate refuses to call providers on provisional labels.
+The gate reports model-family scores separately and requires each qualifying
+family to meet the configured thresholds, so pooled results cannot hide a weak
+family. Missing paired results, provider errors, and staged evidence-gate
+failures remain explicit gate failures. Cross-examination outcomes are linked
+to stable source-evidence IDs and shown as model opinions, not as proof;
+category disagreements are preserved while duplicate citations to the same
+exact evidence are challenged once. Each candidate is assigned to up to two
+non-reporting reviewers, preferring different model families; those challenge
+reviewers' `UNVERIFIED` dispositions count as completed `UNRESOLVED` opinions,
+not confirmation. Challenge opinions do not independently confirm or refute a
+finding. Same-module request hooks are context only and do not suppress
+deterministic authorization candidates. Python project facts include bounded
+cross-file helper and request-hook links among explicitly supplied files;
+incomplete challenge assignments get one missing-ID-only recovery attempt and
+remain gate failures if recovery does not complete.
 
 To run the transition check after assembling a held-out JSONL set:
 
