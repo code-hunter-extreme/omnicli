@@ -239,6 +239,8 @@ def _citation_grounded(case: Dict[str, Any], finding: Dict[str, Any]) -> bool:
         finding["evidence"].splitlines(), finding["line"]
     )
     evidence_lines = cleaned_lines
+    if not _normalize("\n".join(evidence_lines)):
+        return False
     if start < 0 or start >= len(source_lines):
         return False
     cited_excerpt = "\n".join(source_lines[start:start + max(1, len(evidence_lines))])
@@ -556,6 +558,10 @@ def evaluate_security_models(
                 '{"findings":[{"category":"one of: sql_injection, command_injection, path_traversal, unsafe_deserialization, authentication_authorization, sensitive_data_exposure",'
                 '"file":"path from source context",'
                 '"line":1,"evidence":"exact source quote"}]}. '
+                "Cite the line where the finding materializes: the execute, query, "
+                "eval, open, or loads call for injection; the unguarded privileged "
+                "operation for authorization; the exposure statement or secret "
+                "definition for sensitive data. "
                 "Use an empty findings array when no finding is supported. Do not "
                 "include explanations outside JSON.\n\n"
                 f"### Task\n{case['prompt']}\n\n"

@@ -1032,21 +1032,26 @@ def strip_display_prefixes(
 ) -> Tuple[List[str], bool]:
     """Remove echoed source-display line prefixes from a quoted excerpt.
 
-    Supplied source is rendered with `<line> | <code>` display prefixes and
-    models are told not to copy them, but echoes (`00003 | code`, `3 | code`,
-    `| code`) are our own rendering artifact coming back — not forged
-    evidence. Numbered prefixes strip only when every line carries one AND
-    the numbers run sequentially from the cited start (which positively
-    validates the range); a stray leading bare `| ` strips unconditionally
-    since it is never valid leading code in a quoted excerpt and the
-    remainder must still match source verbatim. Returns cleaned lines plus
-    whether anything was removed.
+    Supplied source is rendered with strictly `%05d | <code>` display
+    prefixes and models are told not to copy them, but echoes come back in
+    model-normalized forms (`00003 | code`, `3 | code`, `| code`) — rendering
+    artifacts, not forged evidence. Assurance rests on the sequential and
+    verbatim checks below, not on exact artifact provenance. Numbered
+    prefixes strip only when every line carries one AND the numbers run
+    sequentially from the cited start (which positively validates the
+    range); digit runs over 10 never strip (no real file needs them, and
+    unbounded int() can throw). A stray bare `| ` on any line strips
+    unconditionally since it is never valid leading code in a quoted excerpt
+    and the remainder must still match source verbatim. Returns cleaned
+    lines plus whether anything was removed.
     """
     if not quote_lines:
         return quote_lines, False
     numbered = [_NUMBERED_DISPLAY_PREFIX.fullmatch(line) for line in quote_lines]
     if all(
-        match is not None and int(match.group("line")) == start + index
+        match is not None
+        and len(match.group("line")) <= 10
+        and int(match.group("line")) == start + index
         for index, match in enumerate(numbered)
     ):
         return (

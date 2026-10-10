@@ -1408,6 +1408,97 @@ class TestEvidenceGrounding(unittest.TestCase):
             )
         )
 
+    def test_multiline_sequential_prefix_is_grounded(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2-3\nQUOTE:\n"
+            "```\n2 | query = f\"SELECT {value}\"\n3 | cursor.execute(query)\n```"
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def go(value):\nquery = f\"SELECT {value}\"\ncursor.execute(query)\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertEqual(result["status"], "quotes_grounded")
+        self.assertTrue(finding["grounded"])
+        self.assertTrue(finding["display_line_prefix_removed"])
+
+    def test_multiline_nonsequential_prefix_is_rejected(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2-3\nQUOTE:\n"
+            "```\n2 | query = f\"SELECT {value}\"\n4 | cursor.execute(query)\n```"
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def go(value):\nquery = f\"SELECT {value}\"\ncursor.execute(query)\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertFalse(finding["grounded"])
+        self.assertFalse(finding["display_line_prefix_removed"])
+
+    def test_mixed_prefixed_and_plain_lines_are_not_stripped(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2-3\nQUOTE:\n"
+            "```\n2 | query = f\"SELECT {value}\"\ncursor.execute(query)\n```"
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def go(value):\nquery = f\"SELECT {value}\"\ncursor.execute(query)\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertFalse(finding["grounded"])
+        self.assertFalse(finding["display_line_prefix_removed"])
+
+    def test_citation_grounded_rejects_prefix_only_evidence(self):
+        from omnicli.evaluation import _citation_grounded
+
+        case = {
+            "file": "app.py",
+            "source": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n",
+        }
+        for evidence in ("2 | ", "| ", "2 | \n3 | "):
+            self.assertFalse(
+                _citation_grounded(
+                    case, {"file": "app.py", "line": 2, "evidence": evidence}
+                ),
+                f"prefix-only evidence must not ground: {evidence!r}",
+            )
+
+    def test_citation_grounded_strips_bare_pipe(self):
+        from omnicli.evaluation import _citation_grounded
+
+        case = {
+            "file": "app.py",
+            "source": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n",
+        }
+        self.assertTrue(
+            _citation_grounded(
+                case,
+                {
+                    "file": "app.py",
+                    "line": 2,
+                    "evidence": '| cursor.execute(f"SELECT {value}")',
+                },
+            )
+        )
+
+    def test_giant_digit_prefix_never_throws(self):
+        from omnicli.evidence import strip_display_prefixes
+
+        lines, removed = strip_display_prefixes(
+            ["9" * 5000 + " | cursor.execute(query)"], 2
+        )
+        self.assertFalse(removed)
+        self.assertEqual(lines, ["9" * 5000 + " | cursor.execute(query)"])
+
     def test_grounded_finding_retains_unverified_review_details(self):
         from omnicli.evidence import validate_quoted_findings
 
