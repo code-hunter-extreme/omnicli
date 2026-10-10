@@ -1328,6 +1328,86 @@ class TestEvidenceGrounding(unittest.TestCase):
         )
         self.assertFalse(rejected["findings_checked"][0]["grounded"])
 
+    def test_short_display_prefix_is_stripped_and_grounded(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2\nQUOTE:\n"
+            '`2 | cursor.execute(f"SELECT {value}")`'
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertEqual(result["status"], "quotes_grounded")
+        self.assertTrue(finding["grounded"])
+        self.assertTrue(finding["display_line_prefix_removed"])
+        self.assertEqual(
+            finding["quote"], 'cursor.execute(f"SELECT {value}")'
+        )
+
+    def test_bare_pipe_prefix_is_stripped_and_grounded(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2\nQUOTE:\n"
+            '`| cursor.execute(f"SELECT {value}")`'
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertTrue(finding["grounded"])
+        self.assertTrue(finding["display_line_prefix_removed"])
+
+    def test_mismatched_prefix_numbers_are_not_stripped(self):
+        from omnicli.evidence import validate_quoted_findings
+
+        answer = (
+            "FINDING: SQL injection\nCATEGORY: sql_injection\n"
+            "FILE: app.py\nLINE: 2\nQUOTE:\n"
+            '`9 | cursor.execute(f"SELECT {value}")`'
+        )
+        result = validate_quoted_findings(
+            answer,
+            {"app.py": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n"},
+        )
+        finding = result["findings_checked"][0]
+        self.assertFalse(finding["grounded"])
+        self.assertFalse(finding["display_line_prefix_removed"])
+
+    def test_citation_grounded_strips_display_prefix(self):
+        from omnicli.evaluation import _citation_grounded
+
+        case = {
+            "file": "app.py",
+            "source": "def query(value):\n    cursor.execute(f\"SELECT {value}\")\n",
+        }
+        self.assertTrue(
+            _citation_grounded(
+                case,
+                {
+                    "file": "app.py",
+                    "line": 2,
+                    "evidence": '2 | cursor.execute(f"SELECT {value}")',
+                },
+            )
+        )
+        self.assertFalse(
+            _citation_grounded(
+                case,
+                {
+                    "file": "app.py",
+                    "line": 2,
+                    "evidence": '9 | cursor.execute(f"SELECT {value}")',
+                },
+            )
+        )
+
     def test_grounded_finding_retains_unverified_review_details(self):
         from omnicli.evidence import validate_quoted_findings
 

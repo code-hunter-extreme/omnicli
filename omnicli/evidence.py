@@ -1023,6 +1023,40 @@ def assess_evidence_gate(
     }
 
 
+_NUMBERED_DISPLAY_PREFIX = re.compile(r"^(?P<line>\d+) \| (?P<code>.*)$")
+_BARE_PIPE_PREFIX = re.compile(r"^\| (?P<code>.*)$")
+
+
+def strip_display_prefixes(
+    quote_lines: List[str], start: int
+) -> Tuple[List[str], bool]:
+    """Remove echoed source-display line prefixes from a quoted excerpt.
+
+    Supplied source is rendered with `<line> | <code>` display prefixes and
+    models are told not to copy them, but echoes (`00003 | code`, `3 | code`,
+    `| code`) are our own rendering artifact coming back — not forged
+    evidence. Numbered prefixes strip only when every line carries one AND
+    the numbers run sequentially from the cited start (which positively
+    validates the range); a stray leading bare `| ` strips unconditionally
+    since it is never valid leading code in a quoted excerpt and the
+    remainder must still match source verbatim. Returns cleaned lines plus
+    whether anything was removed.
+    """
+    if not quote_lines:
+        return quote_lines, False
+    numbered = [_NUMBERED_DISPLAY_PREFIX.fullmatch(line) for line in quote_lines]
+    if all(
+        match is not None and int(match.group("line")) == start + index
+        for index, match in enumerate(numbered)
+    ):
+        return (
+            [match.group("code") for match in numbered if match is not None],
+            True,
+        )
+    cleaned = [_BARE_PIPE_PREFIX.sub(r"\g<code>", line) for line in quote_lines]
+    return cleaned, cleaned != quote_lines
+
+
 def _extract_quoted_source(quote_tail: str) -> tuple[str, int]:
     """Extract a source excerpt and its answer-text span before review details."""
     detail = _QUOTE_DETAIL.search(quote_tail)
@@ -1147,21 +1181,9 @@ def validate_quoted_findings(
             match.end() + quote_span + detail_span,
         ))
         quote_lines = quote.strip("\r\n").splitlines()
-        display_prefix_pattern = re.compile(r"^(?P<line>\d{5}) \| (?P<code>.*)$")
-        prefixed_quotes = [
-            display_prefix_pattern.fullmatch(line) for line in quote_lines
-        ]
-        display_line_prefix_removed = bool(quote_lines) and all(
-            match is not None
-            and int(match.group("line")) == start + index
-            for index, match in enumerate(prefixed_quotes)
+        quote_lines, display_line_prefix_removed = strip_display_prefixes(
+            quote_lines, start
         )
-        if display_line_prefix_removed:
-            quote_lines = [
-                match.group("code")
-                for match in prefixed_quotes
-                if match is not None
-            ]
         quote_is_multiline = len(quote_lines) > 1
         quote_first_line = " ".join(quote_lines[0].split()) if quote_lines else ""
         quote = " ".join(quote.split())

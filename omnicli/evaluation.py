@@ -231,13 +231,18 @@ def _citation_grounded(case: Dict[str, Any], finding: Dict[str, Any]) -> bool:
         != case.get("file", "source.py").replace("\\", "/").strip()
     ):
         return False
+    from omnicli.evidence import strip_display_prefixes
+
     source_lines = case["source"].splitlines()
     start = finding["line"] - 1
-    evidence_lines = finding["evidence"].splitlines()
+    cleaned_lines, _ = strip_display_prefixes(
+        finding["evidence"].splitlines(), finding["line"]
+    )
+    evidence_lines = cleaned_lines
     if start < 0 or start >= len(source_lines):
         return False
     cited_excerpt = "\n".join(source_lines[start:start + max(1, len(evidence_lines))])
-    return _normalize(finding["evidence"]) in _normalize(cited_excerpt)
+    return _normalize("\n".join(evidence_lines)) in _normalize(cited_excerpt)
 
 
 def _parse_findings(content: Any) -> List[Dict[str, Any]]:
