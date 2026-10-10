@@ -75,6 +75,98 @@ class CandidateJudgeGraphTests(unittest.TestCase):
         self.assertEqual(verdict["provider_error"], "rate limited")
         self.assertEqual(result["calls"][0]["parsed_judgment"]["judgment"], "UNPARSEABLE")
 
+    def test_judge_fails_over_to_surviving_member(self):
+        calls = []
+
+        def model_call(provider, model, _messages, _tokens):
+            calls.append(provider)
+            if provider == "dead":
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "answer": "",
+                    "error": "429 Rate limit reached",
+                }
+            return {
+                "provider": provider,
+                "model": model,
+                "answer": (
+                    "JUDGMENT: UPHOLD\n"
+                    "REASONING: the cited code supports the candidate."
+                ),
+                "error": None,
+            }
+
+        result = run_candidate_judge_graph(
+            [self.candidate],
+            self.sources,
+            [],
+            [("dead", "m1"), ("alive", "m2")],
+            model_call,
+            256,
+        )
+
+        self.assertEqual(calls, ["dead", "alive"])
+        self.assertEqual(len(result["calls"]), 2)
+        verdict = result["verdicts"][0]
+        self.assertEqual(verdict["verdict"], "UPHOLD")
+        self.assertEqual(verdict["provider"], "alive")
+        self.assertTrue(any("failed over" in note for note in verdict["flip_notes"]))
+        self.assertEqual(len(result["failures"]), 1)
+        self.assertIn("dead", result["failures"][0])
+
+    def test_judge_failover_preserves_unjudged_when_all_fail(self):
+        result = run_candidate_judge_graph(
+            [self.candidate],
+            self.sources,
+            [],
+            [("dead-a", "m1"), ("dead-b", "m2")],
+            lambda provider, model, _messages, _tokens: {
+                "provider": provider,
+                "model": model,
+                "answer": "",
+                "error": "429 Rate limit reached",
+            },
+            256,
+        )
+
+        verdict = result["verdicts"][0]
+        self.assertEqual(verdict["verdict"], "UNJUDGED")
+        self.assertEqual(len(result["calls"]), 2)
+        self.assertEqual(len(result["failures"]), 2)
+
+    def test_judge_fails_over_on_unparseable_answer(self):
+        calls = []
+
+        def model_call(provider, model, _messages, _tokens):
+            calls.append(provider)
+            if provider == "vague":
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "answer": "looks bad, not sure",
+                    "error": None,
+                }
+            return {
+                "provider": provider,
+                "model": model,
+                "answer": "JUDGMENT: KILL\nREASONING: quote is benign.",
+                "error": None,
+            }
+
+        result = run_candidate_judge_graph(
+            [self.candidate],
+            self.sources,
+            [],
+            [("vague", "m1"), ("crisp", "m2")],
+            model_call,
+            256,
+        )
+
+        self.assertEqual(calls, ["vague", "crisp"])
+        self.assertEqual(result["calls"][1]["parsed_judgment"]["judgment"], "KILL")
+        self.assertNotEqual(result["verdicts"][0]["verdict"], "UNJUDGED")
+
     def test_empty_candidate_set_skips_judge_and_preserves_graph_audit(self):
         result = run_candidate_judge_graph(
             [],

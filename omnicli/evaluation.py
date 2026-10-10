@@ -8,7 +8,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 _REQUIRED_FINDING_FIELDS = {"category", "file", "line", "evidence"}
@@ -1000,6 +1000,33 @@ def evaluate_deterministic_security(
     }
 
 
+def staged_trial_failed(
+    gate_status: str,
+    raw_outputs: list,
+    verdicts: Optional[Iterable[object]] = (),
+) -> bool:
+    """A staged trial fails when the gate fails or zero members survived.
+
+    One throttled member must not invalidate survivors' grounded output;
+    member errors are recorded on the trial, but only total failure —
+    gate FAIL or every member errored — invalidates it. Staged predictions
+    require judge verdicts, so emitted verdicts with zero adjudicated
+    (UPHOLD/KILL/CONTESTED) outcomes also invalidate the trial:
+    adjudication was attempted but produced nothing scorable. A CONTESTED
+    deadlock counts as adjudicated — the council completed with no
+    consensus, which scores on the merits (zero predictions), unlike an
+    outage (UNJUDGED), which invalidates.
+    """
+    if gate_status != "PASS_GROUNDING_ONLY":
+        return True
+    judged = [v for v in (verdicts or []) if isinstance(v, dict)]
+    if judged and not any(
+        v.get("verdict") in ("UPHOLD", "KILL", "CONTESTED") for v in judged
+    ):
+        return True
+    return not any(isinstance(m, dict) and not m.get("error") for m in raw_outputs)
+
+
 def evaluate_staged_security(
     cfg: Any,
     client: Any,
@@ -1129,7 +1156,9 @@ def evaluate_staged_security(
                     evidence_gate = review.get("evidence_gate") or {}
                     member_errors = [item.get("error") for item in raw_outputs if item.get("error")]
                     gate_failed = evidence_gate.get("status") == "FAIL"
-                    trial_failed = gate_failed or bool(member_errors)
+                    trial_failed = staged_trial_failed(
+                        evidence_gate.get("status", ""), raw_outputs
+                    )
                     if gate_failed:
                         gate_failures += 1
                     if trial_failed:
@@ -1391,9 +1420,10 @@ def evaluate_staged_council(
                 member_errors = [
                     member.get("error") for member in raw_outputs if member.get("error")
                 ]
-                trial_failed = (
-                    gate.get("status") != "PASS_GROUNDING_ONLY"
-                    or bool(member_errors)
+                trial_failed = staged_trial_failed(
+                    gate.get("status", ""),
+                    raw_outputs,
+                    verdicts=typed_judgment.get("verdicts", []),
                 )
                 result.update({
                     "citations": case_citations,

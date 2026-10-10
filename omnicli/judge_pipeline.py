@@ -180,7 +180,11 @@ def run_candidate_judge_graph(
                 and review.get("model")
             }
             independent_pairs = [pair for pair in pairs if pair not in review_pairs]
-            provider, model = (independent_pairs or pairs)[0]
+            roster = list(independent_pairs) + [
+                pair for pair in pairs if pair not in independent_pairs
+            ]
+            ordered = list(dict.fromkeys(roster))
+            max_attempts = min(3, len(ordered))
             prompt = (
                 "### CANDIDATE FINDING UNDER REVIEW\n"
                 f"FINDING: {candidate['finding']}\n"
@@ -197,27 +201,46 @@ def run_candidate_judge_graph(
                 "Return one JUDGMENT: UPHOLD or JUDGMENT: KILL block and "
                 "concise REASONING grounded in the supplied code."
             )
-            call = model_call(
-                provider,
-                model,
-                [
-                    {"role": "system", "content": judge_system_prompt()},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens,
-            )
-            parsed = parse_judgment(str(call.get("answer", "")))
-            call_record = {
-                **call,
-                "stage": "typed_candidate_judge",
-                "focus": candidate["id"],
-                "role": f"JUDGE — {provider}:{model}",
-                "parsed_judgment": parsed,
-            }
+            provider, model = ordered[0]
+            parsed: Dict[str, Any] = {"judgment": "UNPARSEABLE"}
+            call_record: Dict[str, Any] = {}
+            attempts = 0
+            for attempt_pair in ordered:
+                if attempts >= max_attempts:
+                    break
+                provider, model = attempt_pair
+                call = model_call(
+                    provider,
+                    model,
+                    [
+                        {"role": "system", "content": judge_system_prompt()},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens,
+                )
+                parsed = parse_judgment(str(call.get("answer", "")))
+                call_record = {
+                    **call,
+                    "stage": "typed_candidate_judge",
+                    "focus": candidate["id"],
+                    "role": f"JUDGE — {provider}:{model}",
+                    "parsed_judgment": parsed,
+                }
+                call_records.append(call_record)
+                attempts += 1
+                if not call.get("error") and parsed.get("judgment") in {
+                    "UPHOLD",
+                    "KILL",
+                }:
+                    break
             judgment_results.append(call_record)
-            call_records.append(call_record)
             vote = parsed["judgment"]
             notes: List[str] = []
+            if attempts > 1:
+                notes.append(
+                    f"Judge failed over after {attempts - 1} unsuccessful "
+                    f"attempt(s); final judge {provider}:{model}."
+                )
             ballots: List[Ballot] = []
             all_parseable = all_parseable and vote in {"UPHOLD", "KILL"}
             if vote in {"UPHOLD", "KILL"}:

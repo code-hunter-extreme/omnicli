@@ -447,7 +447,11 @@ class TestHeartbeatEngines(unittest.TestCase):
         self.assertIn("python_web", by_name)
         for rec in by_name.values():
             self.assertTrue(rec["ok"], f"canary failed for {rec['engine']}: {rec}")
-            self.assertEqual(rec["staleness_days"], 0)
+            # rule_set_date is release metadata, not a daily heartbeat: a
+            # hardcoded date can only be 0 days old on release day. Health
+            # is the canary; staleness must just be sane (parsed, past).
+            self.assertIsInstance(rec["staleness_days"], int)
+            self.assertGreaterEqual(rec["staleness_days"], 0)
             self.assertTrue(rec["version"])
 
 

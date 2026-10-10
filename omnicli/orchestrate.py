@@ -17,7 +17,7 @@ import concurrent.futures as cf
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from omnicli.evidence import (
     assess_evidence_gate,
@@ -826,6 +826,44 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
     return {"members": members, "final": final}
 
 
+def _is_throttle_error(message: object) -> bool:
+    """True when a member-call error is rate-limit exhaustion, not a verdict."""
+    text = str(message or "").lower()
+    return (
+        "429" in text
+        or "rate limit" in text
+        or "rate_limit" in text
+        or "quota exceeded" in text
+    )
+
+
+def partition_judge_failures(failures: object) -> list:
+    """Reframe supplemental judge errors as gate warnings, never gate failures.
+
+    The typed judge is supplemental by contract: it reuses candidates from the
+    attack/cross-examination stages and never produces scored evidence. Its
+    failures degrade the report but must not fail the evidence gate.
+    """
+    items = failures if isinstance(failures, list) else []
+    return [f"Judge supplemental verdict degraded: {failure}" for failure in items]
+
+
+def challenge_review_complete(
+    assigned_ids: Optional[Iterable[str]], reviewed_ids: Optional[Iterable[str]]
+) -> bool:
+    """True when a cross-examination review covered its assignment.
+
+    An empty assignment is vacuously complete: the member had nothing to
+    review, so no model utterance is required. A non-empty assignment is
+    complete only when every assigned candidate was reviewed.
+    """
+    assigned = set(assigned_ids or [])
+    reviewed = set(reviewed_ids or [])
+    if not assigned:
+        return True
+    return reviewed == assigned
+
+
 def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                   max_tokens: int = 512, synth: bool = True,
                   judge: Optional[Tuple[str, str]] = None,
@@ -936,14 +974,28 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                 for provider, model, tag in pending
             }
             for future in cf.as_completed(futures):
-                result = future.result()
                 provider, model, tag = futures[future]
+                try:
+                    result = future.result()
+                except cf.CancelledError:
+                    result = {
+                        "provider": provider,
+                        "model": model,
+                        "answer": "",
+                        "error": "shed: provider throttled (429 cooldown)",
+                        "latency_ms": 0.0,
+                        "usage": None,
+                    }
                 result.update({
                     "stage": stage, "focus": tag,
                     "role": role_for(provider, model, tag),
                 })
                 results.append(result)
                 call_records.append(result)
+                if _is_throttle_error(result.get("error")):
+                    for pending_future, meta in futures.items():
+                        if meta[0] == provider:
+                            pending_future.cancel()
         return results
 
     attack_pending = []
@@ -1543,10 +1595,8 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             outcome["candidate_id"] for outcome in outcomes
             if outcome["candidate_id"] in assigned_ids
         }
-        challenge_validation["review_complete"] = (
-            reviewed_ids == assigned_ids
-            if assigned_ids
-            else bool(re.search(r"\bNO CANDIDATES TO CHALLENGE\b", answer, re.IGNORECASE))
+        challenge_validation["review_complete"] = challenge_review_complete(
+            assigned_ids, reviewed_ids
         )
         challenge_validation["assigned_candidate_ids"] = sorted(assigned_ids)
         challenge_validation["reviewed_candidate_ids"] = sorted(reviewed_ids)
@@ -1616,13 +1666,22 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             provider_errors.append(
                 f"{provider}:{model} (cross_examination): {state['challenge_error']}"
             )
-    provider_errors.extend(typed_judgment["failures"])
+    # The typed judge is supplemental by contract (see report header below):
+    # its errors degrade the report, they must not fail the evidence gate.
+    judge_degraded = partition_judge_failures(typed_judgment["failures"])
     evidence_gate = assess_evidence_gate(
         sources,
         [*attack_validations, *challenge_validations],
         provider_errors,
         candidate_triage,
     )
+    provider_warnings = evidence_gate["provider_warnings"]
+    if not isinstance(provider_warnings, list):
+        raise TypeError(
+            "evidence gate contract broken: provider_warnings is "
+            f"{type(provider_warnings).__name__}, not a list"
+        )
+    provider_warnings.extend(judge_degraded)
     scenario_coverage = []
     for scenario in _REDTEAM_SCENARIOS:
         reviews = [

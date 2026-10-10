@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 _FINDING_HEADER = re.compile(
@@ -881,27 +881,82 @@ def assess_evidence_gate(
     provider_errors: list[str],
     candidate_triage: list[Mapping[str, object]],
 ) -> Dict[str, object]:
-    """Fail closed when red-team claims cannot be grounded to supplied evidence."""
-    failures: list[str] = []
+    """Fail closed when red-team claims cannot be grounded to supplied evidence.
+
+    The council is redundant: any fully-clean member carries the trial.
+    Provider errors fail the gate only when they leave zero usable review
+    outputs. Surviving members are judged on grounding merit; members with
+    failures are demoted to warnings (never silently dropped) while at
+    least one member passes. Sources, vacuous-input, triage, and
+    unattributed failures always fail closed.
+    """
+    failures: list = []  # (member-key-or-None, message) pairs
+    warnings: list[str] = []
     if not sources:
-        failures.append("No source files were supplied; claims cannot be grounded.")
+        failures.append(
+            (None, "No source files were supplied; claims cannot be grounded.")
+        )
     elif not any(isinstance(text, str) and text.strip() for text in sources.values()):
-        failures.append("Supplied source files are empty; claims cannot be grounded.")
-    if provider_errors:
-        failures.extend(f"Review stage failed: {error}" for error in provider_errors)
+        failures.append(
+            (None, "Supplied source files are empty; claims cannot be grounded.")
+        )
+    # Per-member all-or-nothing: a member with zero usable output is fully
+    # throttled — its errors degrade to warnings and its vacuous validations
+    # are skipped. A member with partial output stays under full judgment:
+    # its errors fail and every validation is looped. Unparseable errors
+    # fail closed.
+    member_usable: dict = {}
+    for entry in validations:
+        if isinstance(entry, dict) and (
+            entry.get("review_complete") or entry.get("explicit_no_findings")
+        ):
+            member_usable[(entry.get("provider"), entry.get("model"))] = True
+
+    def _error_member(message: object):
+        match = re.match(r"(\S+):(\S+)\s", str(message or ""))
+        return (match.group(1), match.group(2)) if match else None
+
+    judged = []
+    for entry in validations:
+        if not isinstance(entry, dict):
+            continue
+        key = (entry.get("provider"), entry.get("model"))
+        if key == (None, None) or key in member_usable:
+            judged.append(entry)
+    if not judged:
+        failures.append(
+            (
+                None,
+                "No usable review outputs to judge — "
+                "the gate cannot pass on vacuous input.",
+            )
+        )
+    for error in provider_errors:
+        member = _error_member(error)
+        if member is not None and member not in member_usable:
+            warnings.append(f"Review degraded, survivors judged: {error}")
+        else:
+            failures.append((member, f"Review stage failed: {error}"))
 
     bad_validation_statuses = {
         "no_source_provided",
         "unsupported_citations",
         "unstructured_claims",
     }
-    for index, validation in enumerate(validations, start=1):
+    for index, validation in enumerate(judged, start=1):
+        key = (validation.get("provider"), validation.get("model"))
+        owner = key if key != (None, None) else None
         status = validation.get("status")
         if status in bad_validation_statuses:
-            failures.append(f"Review output {index} failed grounding: {status}.")
+            failures.append(
+                (owner, f"Review output {index} failed grounding: {status}.")
+            )
         if validation.get("review_complete") is False:
             failures.append(
-                f"Review output {index} did not complete its assigned review stage."
+                (
+                    owner,
+                    f"Review output {index} did not complete its assigned review stage.",
+                )
             )
         elif (
             status == "no_structured_findings"
@@ -909,28 +964,61 @@ def assess_evidence_gate(
             and not validation.get("explicit_no_findings")
         ):
             failures.append(
-                f"Review output {index} returned no findings without an explicit no-finding result."
+                (
+                    owner,
+                    f"Review output {index} returned no findings without an explicit "
+                    "no-finding result.",
+                )
             )
 
     for candidate in candidate_triage:
         if candidate.get("status") == "unsupported_citation":
             failures.append(
-                "Candidate citation is not grounded: "
-                f"{candidate.get('title', 'unnamed candidate')} "
-                f"({candidate.get('file', 'unknown file')}:{candidate.get('start_line', '?')})."
+                (
+                    None,
+                    "Candidate citation is not grounded: "
+                    f"{candidate.get('title', 'unnamed candidate')} "
+                    f"({candidate.get('file', 'unknown file')}:"
+                    f"{candidate.get('start_line', '?')}).",
+                )
             )
 
+    global_failures = [message for owner, message in failures if owner is None]
+    member_failures: Dict[Tuple[object, object], List[str]] = {}
+    for owner, message in failures:
+        if owner is not None:
+            member_failures.setdefault(owner, []).append(message)
+    passing_members = sorted(
+        member for member in member_usable if member not in member_failures
+    )
+    if global_failures or not passing_members:
+        failed_checks = [message for _, message in failures]
+        status = "FAIL"
+    else:
+        for owner in sorted(member_failures, key=str):
+            provider, model = owner
+            warnings.extend(
+                f"Non-passing member {provider}:{model}: {message}"
+                for message in member_failures[owner]
+            )
+        failed_checks = []
+        status = "PASS_GROUNDING_ONLY"
+
     return {
-        "status": "FAIL" if failures else "PASS_GROUNDING_ONLY",
-        "failed_checks": failures,
+        "status": status,
+        "failed_checks": failed_checks,
+        "provider_warnings": warnings,
+        "passing_members": [
+            f"{provider}:{model}" for provider, model in passing_members
+        ],
         "source_files_checked": len(sources),
         "review_outputs_checked": len(validations),
         "candidate_count": len(candidate_triage),
         "security_conclusion": "NOT_ASSESSED",
         "meaning": (
-            "PASS_GROUNDING_ONLY means the supplied review outputs did not fail "
-            "the source-grounding checks. It does not prove exploitability, "
-            "completeness, or safety."
+            "PASS_GROUNDING_ONLY means at least one member's review outputs "
+            "passed the source-grounding checks. It does not prove "
+            "exploitability, completeness, or safety."
         ),
     }
 

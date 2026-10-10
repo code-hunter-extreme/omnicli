@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 CONFIG_DIR = Path.home() / ".config" / "omnicli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history"
+TRIO_KEYS_FILE = Path.home() / ".config" / "trio" / "keys.env"
 
 # Model family keywords used by `omni scan` to classify discovered models.
 # Order matters: first match wins. Extend here to recognise new families.
@@ -124,6 +125,20 @@ DEFAULT_PROVIDERS = {
         "verification_panel": [
             {"model": "zai-org/GLM-5.3-Flash", "family": "glm"},
             {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "family": "deepseek"},
+        ],
+    },
+    "llm7": {
+        "name": "LLM7 Gateway",
+        "base_url": "https://api.llm7.io/v1",
+        "env_key": "LLM7_API_KEY",
+        "default_model": "default",
+        "description": "LLM7 multi-provider gateway (free tier selectors)",
+        "requires_auth_for_models": False,
+        "fallback_models": [
+            "fast",
+        ],
+        "verification_panel": [
+            {"model": "default", "family": "other"},
         ],
     },
     "groq": {
@@ -282,6 +297,7 @@ class ConfigManager:
     def _read_env_files(self) -> Dict[str, str]:
         env_dict: Dict[str, str] = {}
         candidate_paths = [
+            TRIO_KEYS_FILE,
             Path("/home/phantomcore/oracle/.env"),
             Path("/home/phantomcore/oracle-fresh/.env"),
             Path.home() / ".aider" / "oauth-keys.env",
