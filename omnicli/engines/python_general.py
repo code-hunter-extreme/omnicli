@@ -303,14 +303,7 @@ class PythonGeneralEngine(Engine):
 
     # ------------------------------------------------------------------
     def _vote(self, candidate_id: str, vote: str,
-              facts: List[EngineFact], reason: str,
-              confidence: Optional[float] = None) -> EngineVote:
-        if confidence is None:
-            # Decisive votes with supporting facts carry high confidence;
-            # abstentions (not_covered) carry none.
-            confidence = 0.85 if (facts and vote != NOT_COVERED) else (
-                0.6 if vote != NOT_COVERED else 0.0
-            )
+              facts: List[EngineFact], reason: str) -> EngineVote:
         reasons = [reason] if reason else []
         reasons.extend(f.claim for f in facts[:3])
         return EngineVote(
@@ -320,7 +313,6 @@ class PythonGeneralEngine(Engine):
             vote=vote,
             facts=facts,
             reason=reason,
-            confidence=confidence,
             reasons=reasons,
         )
 

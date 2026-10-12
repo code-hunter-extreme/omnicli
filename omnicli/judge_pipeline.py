@@ -11,6 +11,7 @@ from omnicli.engines.global_engine import (
 )
 from omnicli.evidence import anchor_auth_candidate_to_mutation
 from omnicli.redteam import (
+    JUDGE_BALLOT_WEIGHT,
     Ballot,
     aggregate_ballots,
     ballot_margin,
@@ -247,6 +248,7 @@ def run_candidate_judge_graph(
                 ballots.append(Ballot(
                     voter=f"judge:{provider}:{model}",
                     verdict=adjusted,
+                    weight=JUDGE_BALLOT_WEIGHT,
                     reason=note or f"judge voted {vote}",
                 ))
             judge_ballots[candidate["id"]] = ballots

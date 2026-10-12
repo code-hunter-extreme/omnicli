@@ -99,6 +99,10 @@ class TestEngineRegistry(unittest.TestCase):
             class _Empty:
                 name = ""
 
+    def test_dead_confidence_field_removed(self):
+        from omnicli.engines import EngineVote
+        self.assertNotIn("confidence", EngineVote.__dataclass_fields__)
+
 
 class TestPythonGeneral(unittest.TestCase):
     def setUp(self):

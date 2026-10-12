@@ -8,6 +8,8 @@ rules, and only genuine claim-vs-fact contradiction flips a ballot.
 import unittest
 
 from omnicli.redteam import (
+    ENGINE_BALLOT_WEIGHT,
+    JUDGE_BALLOT_WEIGHT,
     Ballot,
     aggregate_ballots,
     ballot_margin,
@@ -95,6 +97,39 @@ class TestVoterAggregation(unittest.TestCase):
         self.assertEqual(aggregate_ballots(ballots), "CONTESTED")
         ballots.append(Ballot("e2", "KILL"))
         self.assertEqual(aggregate_ballots(ballots), "KILL")
+
+    def test_weighted_judge_decides_against_single_engine(self):
+        # The judge counts double: alone with one opposing engine it
+        # carries the verdict instead of deadlocking.
+        self.assertEqual(JUDGE_BALLOT_WEIGHT, 2.0 * ENGINE_BALLOT_WEIGHT)
+        ballots = [
+            Ballot("judge:p:m", "UPHOLD", weight=JUDGE_BALLOT_WEIGHT),
+            Ballot("e1", "KILL", weight=ENGINE_BALLOT_WEIGHT),
+        ]
+        self.assertEqual(aggregate_ballots(ballots), "UPHOLD")
+        ballots = [
+            Ballot("judge:p:m", "KILL", weight=JUDGE_BALLOT_WEIGHT),
+            Ballot("e1", "UPHOLD", weight=ENGINE_BALLOT_WEIGHT),
+        ]
+        self.assertEqual(aggregate_ballots(ballots), "KILL")
+
+    def test_weighted_judge_deadlocks_only_against_unanimous_engines(self):
+        ballots = [
+            Ballot("judge:p:m", "UPHOLD", weight=JUDGE_BALLOT_WEIGHT),
+            Ballot("e1", "KILL", weight=ENGINE_BALLOT_WEIGHT),
+            Ballot("e2", "KILL", weight=ENGINE_BALLOT_WEIGHT),
+        ]
+        # 2.0 vs 2.0: the single deadlock — human review required.
+        self.assertEqual(aggregate_ballots(ballots), "CONTESTED")
+        # Any one engine siding with the judge breaks the deadlock.
+        ballots[2] = Ballot("e2", "UPHOLD", weight=ENGINE_BALLOT_WEIGHT)
+        self.assertEqual(aggregate_ballots(ballots), "UPHOLD")
+
+    def test_engine_ballots_carry_unit_weight(self):
+        ballot = engine_vote_to_ballot("e", {"vote": "supported"})
+        self.assertEqual(ballot.weight, ENGINE_BALLOT_WEIGHT)
+        ballot = engine_vote_to_ballot("e", {"vote": "not_supported"})
+        self.assertEqual(ballot.weight, ENGINE_BALLOT_WEIGHT)
 
     def test_engine_vote_to_ballot(self):
         self.assertEqual(

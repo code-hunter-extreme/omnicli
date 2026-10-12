@@ -39,7 +39,8 @@ class EngineVote:
     """One engine's verdict on one candidate finding.
 
     Engines are VOTERS, not executioners: a vote feeds the ballot
-    aggregation (majority wins) and may never unilaterally KILL a candidate.
+    aggregation (weighted judge over unit-weight engine ballots) and may
+    never unilaterally KILL a candidate.
     """
 
     candidate_id: str
@@ -48,7 +49,6 @@ class EngineVote:
     vote: str
     facts: List[EngineFact] = field(default_factory=list)
     reason: str = ""
-    confidence: float = 0.5  # 0.0-1.0; weight hint for aggregation/reporting
     reasons: List[str] = field(default_factory=list)  # human-readable reasons
 
 

@@ -44,6 +44,12 @@ class CandidateJudgeGraphTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["verdicts"][0]["verdict"], "UPHOLD")
+        judge_ballots = [
+            ballot for ballot in result["verdicts"][0]["ballots"]
+            if ballot["voter"].startswith("judge:")
+        ]
+        self.assertEqual(len(judge_ballots), 1)
+        self.assertEqual(judge_ballots[0]["weight"], 2.0)
         self.assertEqual(
             result["verdicts"][0]["original_status"],
             "unverified_candidate",

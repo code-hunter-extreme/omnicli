@@ -735,51 +735,63 @@ class SpendLedger:
 
 
 # ---------------------------------------------------------------------------
-# 9. Voter aggregation: engines and judge as ballots, contradiction flips.
+# 9. Voter aggregation: weighted judge over engine ballots, contradiction flips.
 #
-# Replaces the veto architecture (Sections 5/8 as enforced in the pipeline):
-# engines are VOTERS, not executioners. No engine, rule, or format check may
-# unilaterally KILL a candidate. Deterministic facts feed INTO the judge
-# prompt as an EVIDENCE section; the judge's verdict is then combined with
-# engine ballots by majority vote (PyRIT composite pattern). The ONLY
-# post-judge adjustment is the contradiction flip: a genuine claim-vs-fact
-# contradiction flips a single ballot — never format, never phrasing.
+# Decision rule (exactly one): the typed judge counts double
+# (JUDGE_BALLOT_WEIGHT); each covering engine counts single
+# (ENGINE_BALLOT_WEIGHT); weighted majority wins. The judge already weighs
+# every engine fact in its EVIDENCE section, so it is the decider: alone, or
+# with any one engine, it carries the verdict. The single deadlock is a judge
+# opposed by unanimous engines (2.0 vs 2.0 with two engines) -> CONTESTED,
+# meaning a human or stronger judge must review. No engine, rule, or format
+# check may unilaterally KILL a candidate. The ONLY post-judge adjustment is
+# the contradiction flip: a genuine claim-vs-fact contradiction flips a
+# single ballot — never format, never phrasing.
 #
 # The veto architecture of Sections 5/8 was removed (P4): its four helpers had
 # zero pipeline callers, and their fail-closed behavior is subsumed by the
 # evidence gate (ungrounded candidates fail globally) plus the flip above.
 # ---------------------------------------------------------------------------
 
+# Ballot weights for the single decision rule. Live values, not knobs: the
+# judge's double weight is what makes it the decider instead of a minority
+# voter in its own court.
+ENGINE_BALLOT_WEIGHT = 1.0
+JUDGE_BALLOT_WEIGHT = 2.0
+
+
 @dataclass
 class Ballot:
     """One voter's verdict on one candidate."""
 
-    voter: str            # engine name, "judge:<seat>", or "adjudication_memory"
+    voter: str            # engine name or "judge:<provider>:<model>"
     verdict: str          # "UPHOLD" | "KILL"
-    weight: float = 1.0
+    weight: float = ENGINE_BALLOT_WEIGHT
     reason: str = ""
 
 
 def engine_vote_to_ballot(engine_name: str, vote: Mapping[str, Any]) -> Optional[Ballot]:
-    """Map one EngineVote to a ballot. NOT_COVERED abstains (no ballot)."""
+    """Map one EngineVote to a unit-weight ballot. NOT_COVERED abstains (no ballot)."""
     signal = str(vote.get("vote", "")).strip().lower() if isinstance(vote, Mapping) else ""
     if signal == "supported":
         return Ballot(
-            voter=str(engine_name), verdict="UPHOLD", weight=1.0,
+            voter=str(engine_name), verdict="UPHOLD", weight=ENGINE_BALLOT_WEIGHT,
             reason=str(vote.get("reason", ""))[:200] if isinstance(vote, Mapping) else "",
         )
     if signal == "not_supported":
         return Ballot(
-            voter=str(engine_name), verdict="KILL", weight=1.0,
+            voter=str(engine_name), verdict="KILL", weight=ENGINE_BALLOT_WEIGHT,
             reason=str(vote.get("reason", ""))[:200] if isinstance(vote, Mapping) else "",
         )
     return None  # not_covered / unknown: abstain
 
 
 def aggregate_ballots(ballots: List[Ballot]) -> str:
-    """Majority vote across ballots. Tie or empty ballot box -> CONTESTED.
+    """Weighted-majority vote across ballots. Tie or empty ballot box -> CONTESTED.
 
     CONTESTED means "no majority": a human (or stronger judge) must review.
+    Under the weighted-judge rule the only reachable tie is a judge
+    deadlocked against unanimous engines.
     """
     uphold = sum(b.weight for b in ballots if b.verdict == "UPHOLD")
     kill = sum(b.weight for b in ballots if b.verdict == "KILL")

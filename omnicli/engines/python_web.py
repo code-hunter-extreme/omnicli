@@ -8,7 +8,7 @@ Original engine-shaped code; route and hook facts come from omnicli.evidence.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping
 
 from omnicli.evidence import analyze_python_security_facts
 
@@ -77,12 +77,7 @@ class PythonWebEngine(Engine):
 
     # ------------------------------------------------------------------
     def _vote(self, candidate_id: str, vote: str,
-              facts: List[EngineFact], reason: str,
-              confidence: Optional[float] = None) -> EngineVote:
-        if confidence is None:
-            confidence = 0.85 if (facts and vote != NOT_COVERED) else (
-                0.6 if vote != NOT_COVERED else 0.0
-            )
+              facts: List[EngineFact], reason: str) -> EngineVote:
         reasons = [reason] if reason else []
         reasons.extend(f.claim for f in facts[:3])
         return EngineVote(
@@ -92,7 +87,6 @@ class PythonWebEngine(Engine):
             vote=vote,
             facts=facts,
             reason=reason,
-            confidence=confidence,
             reasons=reasons,
         )
 
