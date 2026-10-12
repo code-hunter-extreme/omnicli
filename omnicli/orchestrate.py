@@ -920,14 +920,31 @@ def generate_redteam_report(
     final_findings: str,
     members: List[Dict[str, Any]],
     evidence_gate: Optional[Dict[str, Any]] = None,
+    output_path: Optional[Any] = None,
 ) -> Path:
-    """Generate a formal markdown report for red-team audits and write to reports/."""
+    """Generate a formal markdown report for red-team audits and write it.
+
+    output_path is caller-chosen: a directory (a timestamped
+    redteam_audit_<ts>.md is placed inside) or a full file path. When
+    omitted the report goes to ./reports (standalone CLI default).
+    Library flows that pass no path through run_orchestration write
+    nothing — calling this function directly is itself the choice to write.
+    """
     from datetime import datetime
     from pathlib import Path
-    reports_dir = Path.cwd() / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_file = reports_dir / f"redteam_audit_{ts}.md"
+    if output_path is None:
+        reports_dir = Path.cwd() / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_file = reports_dir / f"redteam_audit_{ts}.md"
+    else:
+        target = Path(output_path)
+        if target.suffix == "" or target.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            report_file = target / f"redteam_audit_{ts}.md"
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            report_file = target
 
     member_lines = "\n".join(
         f"- **{r.get('family', 'other').upper()}** ({r.get('provider')}:{r.get('model')})"
@@ -2161,6 +2178,7 @@ def run_orchestration(
     source_files: Optional[Dict[str, str]] = None,
     synth_method: str = "structured",
     enrich_files: bool = False,
+    report_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2168,6 +2186,10 @@ def run_orchestration(
     prompt proved nothing (no build step, no test step, no tool use). It
     stays out until it can actually build and test. Requesting it raises
     instead of silently running something else.
+
+    report_path (redteam only): caller-chosen report destination — a file
+    path or a directory for a timestamped file. None (default) writes
+    nothing: library runs have no CWD side effects.
     """
     normalized = (mode or "collaborate").lower().strip()
     if normalized in ("builder", "build", "b"):
@@ -2242,10 +2264,11 @@ def run_orchestration(
                 )
                 result["run_id"] = checkpoint.run_id
                 result["events"] = checkpoint.events()
-                if synth and result.get("final"):
+                if synth and result.get("final") and report_path is not None:
                     report = generate_redteam_report(
                         prompt, result["final"], result.get("members", []),
                         evidence_gate=result.get("evidence_gate"),
+                        output_path=report_path,
                     )
                     result["report_path"] = str(report)
                 return result
@@ -2268,10 +2291,11 @@ def run_orchestration(
                 synth=synth, judge=judge, checkpoint=checkpoint,
                 swarm=selected_swarm, source_files=sources_for_validation,
             )
-            if synth and res.get("final"):
+            if synth and res.get("final") and report_path is not None:
                 rep_path = generate_redteam_report(
                     prompt, res["final"], res.get("members", []),
                     evidence_gate=res.get("evidence_gate"),
+                    output_path=report_path,
                 )
                 res["report_path"] = str(rep_path)
         else:

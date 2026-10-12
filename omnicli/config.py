@@ -195,10 +195,17 @@ DEFAULT_HEARTBEAT = {
 
 
 class ConfigManager:
-    def __init__(self) -> None:
-        self.config_dir = CONFIG_DIR
-        self.config_file = CONFIG_FILE
-        self.history_file = HISTORY_FILE
+    """Provider/key settings rooted at a caller-chosen directory.
+
+    config_dir defaults to ~/.config/omnicli (standalone CLI use). Library
+    consumers pass their own root (e.g. a tmp dir or the host app's config
+    dir) so importing and driving OmniCLI never touches the user's home.
+    """
+
+    def __init__(self, config_dir: Optional[Any] = None) -> None:
+        self.config_dir = Path(config_dir) if config_dir else CONFIG_DIR
+        self.config_file = self.config_dir / "config.json"
+        self.history_file = self.config_dir / "history"
         self._ensure_dir()
         self.data: Dict[str, Any] = self._load()
 
@@ -296,12 +303,13 @@ class ConfigManager:
 
     def _read_env_files(self) -> Dict[str, str]:
         env_dict: Dict[str, str] = {}
+        home = Path.home()
         candidate_paths = [
             TRIO_KEYS_FILE,
-            Path("/home/phantomcore/oracle/.env"),
-            Path("/home/phantomcore/oracle-fresh/.env"),
-            Path.home() / ".aider" / "oauth-keys.env",
-            Path.home() / ".config" / "smallcode" / ".env",
+            home / "oracle" / ".env",
+            home / "oracle-fresh" / ".env",
+            home / ".aider" / "oauth-keys.env",
+            home / ".config" / "smallcode" / ".env",
         ]
         for path in candidate_paths:
             if path.exists():
@@ -337,7 +345,7 @@ class ConfigManager:
             if os.getenv(alt):
                 return os.getenv(alt, "").strip()
 
-        # 4. Check known .env files (e.g., /home/phantomcore/oracle/.env)
+        # 4. Check known .env files (e.g., ~/oracle/.env)
         env_dict = self._read_env_files()
         if env_key and env_key in env_dict:
             return env_dict[env_key]

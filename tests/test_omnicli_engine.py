@@ -2847,24 +2847,146 @@ class TestScopeGateSSRF(unittest.TestCase):
         client_cls.assert_not_called()
 
 
-# ── DNS-rebind pin resolver ────────────────────────────────────────────────────
+# ── DNS-rebind pin transport ───────────────────────────────────────────────────
 
-class TestPinResolver(unittest.TestCase):
-    def test_pin_forces_resolution_then_restores(self):
+class TestPinTransport(unittest.TestCase):
+    def _captured(self, transport, url):
+        import httpx
+        captured = {}
+
+        def fake_handle(self, request):
+            captured["url"] = str(request.url)
+            captured["host"] = request.url.host
+            captured["host_header"] = request.headers.get("host")
+            captured["extensions"] = dict(request.extensions)
+            return httpx.Response(200, content=b"ok")
+
+        with unittest.mock.patch.object(
+            httpx.HTTPTransport, "handle_request", fake_handle
+        ):
+            transport.handle_request(httpx.Request("GET", url))
+        return captured
+
+    def test_pinned_transport_connects_to_ip_with_original_host(self):
+        from omnicli.deterministic import PinnedHostTransport
+        captured = self._captured(
+            PinnedHostTransport("example.com", "1.2.3.4"),
+            "http://example.com:8080/path",
+        )
+        self.assertEqual(captured["url"], "http://1.2.3.4:8080/path")
+        self.assertEqual(captured["host_header"], "example.com:8080")
+        self.assertEqual(captured["extensions"]["sni_hostname"], "example.com")
+
+    def test_pinned_transport_leaves_other_hosts_alone(self):
+        from omnicli.deterministic import PinnedHostTransport
+        captured = self._captured(
+            PinnedHostTransport("example.com", "1.2.3.4"),
+            "http://other.test/path",
+        )
+        self.assertEqual(captured["url"], "http://other.test/path")
+        self.assertNotIn("sni_hostname", captured["extensions"])
+
+    def test_pinned_transport_handles_ipv6(self):
+        from omnicli.deterministic import PinnedHostTransport
+        captured = self._captured(
+            PinnedHostTransport("example.com", "::1"),
+            "http://example.com/path",
+        )
+        self.assertEqual(captured["host"], "::1")
+        self.assertEqual(captured["host_header"], "example.com")
+
+    def test_global_resolver_never_patched(self):
         import socket
-        from omnicli.deterministic import _pin_getaddrinfo
+        import omnicli.deterministic as deterministic
+        self.assertFalse(hasattr(deterministic, "_pin_getaddrinfo"))
         real = socket.getaddrinfo
-        with _pin_getaddrinfo("example.com", "1.2.3.4"):
-            infos = socket.getaddrinfo("example.com", 80)
-            self.assertTrue(any(i[4][0] == "1.2.3.4" for i in infos))
-        # resolver restored on exit
+        self._captured(
+            deterministic.PinnedHostTransport("example.com", "1.2.3.4"),
+            "http://example.com/path",
+        )
         self.assertIs(socket.getaddrinfo, real)
+
+    def test_http_verifier_pins_localhost_without_global_patch(self):
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from omnicli.deterministic import HTTPVerifier, ScopeGate
+
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["host"] = self.headers.get("Host")
+                seen["peer"] = self.client_address[0]
+                body = b"hello-pin"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            real = socket.getaddrinfo
+            gate = ScopeGate(
+                allowed_hosts=["127.0.0.1"],
+                allow_localhost=True,
+                allow_private=True,
+            )
+            result = HTTPVerifier.verify(
+                url=f"http://127.0.0.1:{port}/",
+                expected_str='status 200, body contains "hello-pin"',
+                scope_gate=gate,
+            )
+            self.assertEqual(result["verdict"], "CONFIRMED")
+            self.assertEqual(seen["peer"], "127.0.0.1")
+            self.assertIs(socket.getaddrinfo, real)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
     def test_screen_returns_pin_ip_for_public(self):
         from omnicli.deterministic import ScopeGate
         ok, _, pin = ScopeGate().screen("http://8.8.8.8/x")
         self.assertTrue(ok)
         self.assertEqual(pin, "8.8.8.8")
+
+
+# ── Injectable config root ────────────────────────────────────────────────────
+
+class TestInjectableConfigRoot(unittest.TestCase):
+    def test_config_root_is_caller_chosen(self):
+        from omnicli.config import CONFIG_DIR, ConfigManager
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "myapp-config"
+            cfg = ConfigManager(config_dir=root)
+            self.assertEqual(cfg.config_dir, root)
+            self.assertEqual(cfg.config_file, root / "config.json")
+            self.assertTrue((root / "config.json").is_file())
+            self.assertTrue((root / "history").is_file())
+            self.assertIn("groq", cfg.data["providers"])
+            cfg.set_api_key("groq", "test-key-123")
+            reloaded = ConfigManager(config_dir=root)
+            self.assertEqual(reloaded.get_api_key("groq"), "test-key-123")
+            self.assertNotEqual(cfg.config_dir.resolve(), CONFIG_DIR.resolve())
+
+    def test_default_config_root_unchanged(self):
+        from omnicli.config import CONFIG_DIR, ConfigManager
+        cfg = ConfigManager.__new__(ConfigManager)
+        ConfigManager.__init__(cfg)
+        self.assertEqual(cfg.config_dir, CONFIG_DIR)
+
+    def test_env_file_paths_are_home_relative(self):
+        import inspect
+        from omnicli import config as config_module
+        source = inspect.getsource(config_module.ConfigManager._read_env_files)
+        self.assertNotIn("/home/", source)
+        self.assertNotIn("phantomcore", source)
 
 
 # ── Chat red-team + family rotation ────────────────────────────────────────────
@@ -5081,6 +5203,58 @@ class TestEnrichPromptAndReports(unittest.TestCase):
                 self.assertIn("Agreement between models is not proof", content)
                 self.assertIn("EVIDENCE GATE: FAIL", content)
                 self.assertIn("Unsupported citation at app.py:4.", content)
+
+    def test_generate_redteam_report_honors_caller_path(self):
+        from omnicli.orchestrate import generate_redteam_report
+        members = [{"family": "meta", "provider": "groq", "model": "m"}]
+        with tempfile.TemporaryDirectory() as td:
+            exact = Path(td) / "custom" / "audit.md"
+            rep = generate_redteam_report(
+                task="t", final_findings="f", members=members,
+                output_path=exact,
+            )
+            self.assertEqual(rep, exact)
+            self.assertTrue(exact.is_file())
+            out_dir = Path(td) / "dir-reports"
+            rep = generate_redteam_report(
+                task="t", final_findings="f", members=members,
+                output_path=out_dir,
+            )
+            self.assertEqual(rep.parent, out_dir)
+            self.assertTrue(rep.name.startswith("redteam_audit_"))
+            self.assertTrue(rep.is_file())
+
+    def test_run_orchestration_writes_no_report_by_default(self):
+        import os
+        from omnicli.orchestrate import run_orchestration
+
+        class QuietClient:
+            def chat_complete(self, provider_id, messages, model=None, **kw):
+                return {"choices": [{"message": {"content": "NO ACTIONABLE CANDIDATE"}}]}
+
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                out = run_orchestration(
+                    "redteam", MagicMock(), QuietClient(), "task",
+                    size=1, synth=True,
+                    swarm=[("p", "openai/test")],
+                    source_files={"app.py": "safe()"},
+                )
+                self.assertNotIn("report_path", out)
+                self.assertFalse((Path(td) / "reports").exists())
+                out = run_orchestration(
+                    "redteam", MagicMock(), QuietClient(), "task",
+                    size=1, synth=True,
+                    swarm=[("p", "openai/test")],
+                    source_files={"app.py": "safe()"},
+                    report_path=str(Path(td) / "chosen"),
+                )
+                self.assertIn("report_path", out)
+                self.assertTrue(Path(out["report_path"]).is_file())
+            finally:
+                os.chdir(old)
 
 
 class TestScannerFilters(unittest.TestCase):

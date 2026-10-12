@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures as cf
-import contextlib
 import ipaddress
 import re
 import socket
@@ -275,29 +274,32 @@ def parse_expected_predicates(expected_str: str) -> Dict[str, Any]:
     return out
 
 
-@contextlib.contextmanager
-def _pin_getaddrinfo(hostname: str, ip: str):
-    """Force `hostname` to resolve to `ip` for the duration of the block.
+class PinnedHostTransport(httpx.HTTPTransport):
+    """httpx transport pinned to one validated IP — no second DNS lookup.
 
-    The ScopeGate already resolved and validated the host; pinning the connection
-    to that exact IP means httpx cannot trigger a second DNS lookup that rebinds
-    to an internal address. Single-threaded use only (patches the global
-    resolver), which matches the agent's sequential request loop.
+    The ScopeGate already resolved and validated the host; this transport
+    connects the TCP socket to that exact IP so httpx cannot trigger a
+    second DNS lookup that rebinds to an internal address (TOCTOU). The
+    original Host header is preserved and the original hostname travels as
+    the TLS SNI / certificate hostname via httpcore's sni_hostname
+    extension. All state is per-connection (no global resolver patch),
+    so parallel callers cannot race each other.
     """
-    real_getaddrinfo = socket.getaddrinfo
 
-    def patched(host, port, family=0, socktype=0, proto=0, flags=0):
-        if host == hostname:
-            if ":" in ip:
-                return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ip, port or 0, 0, 0))]
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
-        return real_getaddrinfo(host, port, family, socktype, proto, flags)
+    def __init__(self, hostname: str, ip: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._hostname = hostname.lower()
+        self._ip = ip
 
-    socket.getaddrinfo = patched
-    try:
-        yield
-    finally:
-        socket.getaddrinfo = real_getaddrinfo
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        if url.host.lower() == self._hostname:
+            # The Host header was built from the original URL at request
+            # construction and is intentionally left untouched: the server
+            # still sees the real hostname while TCP connects to the IP.
+            request.url = url.copy_with(host=self._ip)
+            request.extensions["sni_hostname"] = self._hostname
+        return super().handle_request(request)
 
 
 class HTTPVerifier:
@@ -345,15 +347,20 @@ class HTTPVerifier:
         req_headers = headers or {}
 
         pin_host = ScopeGate.extract_host(url) if pin_ip else None
-        pin_ctx = _pin_getaddrinfo(pin_host, pin_ip) if (pin_host and pin_ip) else contextlib.nullcontext()
+        transport = (
+            PinnedHostTransport(pin_host, pin_ip)
+            if (pin_host and pin_ip)
+            else None
+        )
 
         try:
-            with pin_ctx:
-                with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-                    res = client.request(method=method.upper(), url=url, headers=req_headers, content=body)
-                    obs_status = res.status_code
-                    obs_body = res.text
-                    obs_headers = {k.lower(): v for k, v in res.headers.items()}
+            with httpx.Client(
+                timeout=timeout, follow_redirects=False, transport=transport
+            ) as client:
+                res = client.request(method=method.upper(), url=url, headers=req_headers, content=body)
+                obs_status = res.status_code
+                obs_body = res.text
+                obs_headers = {k.lower(): v for k, v in res.headers.items()}
         except Exception as e:
             return {
                 "verdict": "REJECTED",

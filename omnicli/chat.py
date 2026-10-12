@@ -595,6 +595,7 @@ class ChatSession:
                     synth=True,
                     judge=(self.provider, self.model),
                     source_files=source_files,
+                    report_path="reports",
                 )
             total_time = time.perf_counter() - t0
 

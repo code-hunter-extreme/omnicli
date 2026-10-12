@@ -953,11 +953,13 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--source-file", "source_paths", multiple=True,
               type=click.Path(exists=True, dir_okay=False),
               help="Supply source for exact quote/line grounding; repeat as needed")
+@click.option("--report-path", type=click.Path(), default="reports",
+              help="Red-team report destination: file path or directory (default: ./reports)")
 @click.argument("prompt", nargs=-1, required=True)
 def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
               redteam: bool, raw: bool, enrich_files: bool, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
-              prompt: tuple) -> None:
+              report_path: str, prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
@@ -1023,7 +1025,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
                 active_mode, cfg, client, task, size=size, synth=not raw,
                 checkpoint_path=checkpoint, resume=resume,
                 provider=provider, swarm=swarm, source_files=source_files,
-                enrich_files=enrich_files,
+                enrich_files=enrich_files, report_path=report_path,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc
