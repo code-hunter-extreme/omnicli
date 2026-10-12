@@ -35,6 +35,13 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 | `omni serve` | OpenAI-compatible proxy, route by prefix | **multi** |
 | `omni config ...` | Keys, account id, settings | — |
 
+> **Terms, not commands:** there is no `omni talk|council|judge|build|orchestration`
+> command (`omni --help` lists the real set). `council` is chat/swarm terminology
+> for the multi-model member set; `judge` is a pipeline stage (synthesis/
+> adjudication role); `builder` is a swarm mode (`--builder`, `/builder`), not a
+> command; `orchestration` is the dispatcher (`run_orchestration`, modes at
+> `cli.py --mode`, dispatched from `chat.py`).
+
 ---
 
 ## Quick start
