@@ -402,12 +402,16 @@ class FakeClient:
     """Controllable fake client for consensus tests."""
     def __init__(self, responses):
         # responses: list of str | Exception, one per call in order
+        import threading
         self._queue = list(responses)
         self._idx = 0
+        self._lock = threading.Lock()
 
     def chat_complete(self, provider_id, messages, model=None, max_tokens=None, **kw):
-        resp = self._queue[self._idx % len(self._queue)]
-        self._idx += 1
+        # Panel calls run in parallel; the queue stays exact under threads.
+        with self._lock:
+            resp = self._queue[self._idx % len(self._queue)]
+            self._idx += 1
         if isinstance(resp, Exception):
             raise resp
         return {"choices": [{"message": {"content": resp}}]}
@@ -469,6 +473,67 @@ class TestConsensusVoteMath(unittest.TestCase):
         r = v.verify_finding("claim", "evidence", models=self._panel(4))
         self.assertEqual(r["total_queried"], 4)
         self.assertAlmostEqual(r["tp_ratio"], 0.25)
+
+    def test_echoed_verdict_in_body_does_not_vote(self):
+        from omnicli.deterministic import parse_trailing_verdict
+        # Verdict string quoted mid-output (e.g. repeated from evidence text)
+        # with trailing prose after it casts no vote.
+        self.assertIsNone(parse_trailing_verdict(
+            "The evidence says VERDICT: TRUE_POSITIVE but I disagree.\n"
+            "On reflection this looks benign."
+        ))
+        self.assertIsNone(parse_trailing_verdict(
+            "VERDICT: TRUE_POSITIVE\nActually, let me reconsider: harmless."
+        ))
+        self.assertIsNone(parse_trailing_verdict(""))
+        self.assertIsNone(parse_trailing_verdict("no verdict here"))
+        # Only an exact trailing verdict line votes.
+        self.assertEqual(
+            parse_trailing_verdict("analysis...\nVERDICT: TRUE_POSITIVE"),
+            "TRUE_POSITIVE",
+        )
+        self.assertEqual(
+            parse_trailing_verdict("analysis...\nverdict: false_positive\n\n"),
+            "FALSE_POSITIVE",
+        )
+
+    def test_echoed_verdict_yields_inconclusive_consensus(self):
+        client = FakeClient([
+            "Quoting the claim: VERDICT: TRUE_POSITIVE.\nI find this unconvincing."
+        ] * 3)
+        v = CrossModelConsensusVerifier(client)
+        r = v.verify_finding("claim", "evidence", models=self._panel(3))
+        self.assertEqual(r["verdict"], "INCONCLUSIVE")
+        self.assertEqual(r["true_positives"], 0)
+
+    def test_panel_queries_run_in_parallel(self):
+        import threading
+        entered = threading.Barrier(3, timeout=10)
+
+        class BlockingClient:
+            def chat_complete(self, provider_id, messages, model=None, **kw):
+                entered.wait()  # deadlocks unless all 3 calls overlap
+                return {"choices": [{"message": {"content": "VERDICT: TRUE_POSITIVE"}}]}
+
+        v = CrossModelConsensusVerifier(BlockingClient())
+        r = v.verify_finding("claim", "evidence", models=self._panel(3))
+        self.assertEqual(r["verdict"], "CONSENSUS_CONFIRMED")
+
+    def test_fallback_panel_spans_distinct_families(self):
+        from omnicli.deterministic import CrossModelConsensusVerifier
+        from omnicli.scanner import classify_family
+
+        class EmptyCfg:
+            data = {"providers": {}}
+
+            def get_verification_panel(self, _provider):
+                return []
+
+        panel = CrossModelConsensusVerifier._default_panel(EmptyCfg())
+        families = [classify_family(model) for _provider, model in panel]
+        self.assertGreaterEqual(len(panel), 3)
+        self.assertEqual(len(set(families)), len(families))
+        self.assertNotIn("other", families)
 
 
 # ── CodeVerifier path guard ───────────────────────────────────────────────────

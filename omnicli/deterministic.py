@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import ast
+import concurrent.futures as cf
 import contextlib
 import ipaddress
 import re
@@ -790,6 +791,27 @@ class PythonSecurityAnalyzer:
         }
 
 
+_TRAILING_VERDICT_RE = re.compile(
+    r"^VERDICT:\s*(TRUE_POSITIVE|FALSE_POSITIVE)\s*$", re.IGNORECASE
+)
+
+
+def parse_trailing_verdict(content: str) -> Optional[str]:
+    """Return the panel vote, or None when the response casts none.
+
+    Only the LAST non-empty line votes, and only when it is exactly a
+    verdict line. Substring matches anywhere else (a verdict quoted from
+    the evidence, a "not a VERDICT: ..." hedge, trailing prose after the
+    verdict) are INCONCLUSIVE, not votes.
+    """
+    lines = [line.strip() for line in str(content or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    match = _TRAILING_VERDICT_RE.match(lines[-1])
+    return match.group(1).upper() if match else None
+
+
 class CrossModelConsensusVerifier:
     """Blind multi-model, multi-family consensus verifier.
 
@@ -839,10 +861,13 @@ class CrossModelConsensusVerifier:
                 return panel
         except Exception:
             pass
-        # Fallback: minimal 2-provider panel (works before first scan)
+        # Fallback: minimal 3-provider panel (works before first scan).
+        # One model per family (openai/meta/qwen mirrors of the configured
+        # provider defaults) — a same-family panel cannot corroborate.
         return [
-            ("nvidia",     "meta/llama-3.2-11b-vision-instruct"),
+            ("groq",       "openai/gpt-oss-120b"),
             ("cloudflare", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+            ("xkiro",      "qwen/qwen3.6-27b:free"),
         ]
 
     def verify_finding(
@@ -856,6 +881,12 @@ class CrossModelConsensusVerifier:
         models: explicit [(provider, model_id), ...] list, or None to use
                 the panel from config (built by `omni scan`).
 
+        Panel members are queried IN PARALLEL (model calls are I/O-bound).
+        A vote counts only when the response's last non-empty line is
+        exactly `VERDICT: TRUE_POSITIVE` or `VERDICT: FALSE_POSITIVE` —
+        a verdict string quoted or echoed anywhere earlier in the output
+        (e.g. repeated from the evidence text) does not vote.
+
         Returns consensus vote, per-model critiques, and honest ratios.
         """
         model_panel = models or self._default_panel()
@@ -867,8 +898,9 @@ class CrossModelConsensusVerifier:
             "Evaluate whether the claim is a TRUE POSITIVE vulnerability or "
             "a FALSE POSITIVE / NON-ISSUE. "
             "Be strict: reject speculative or non-state-mutating issues. "
-            "Your output MUST end with a final line: "
-            "'VERDICT: TRUE_POSITIVE' or 'VERDICT: FALSE_POSITIVE'."
+            "Your output MUST end with a final line containing ONLY: "
+            "'VERDICT: TRUE_POSITIVE' or 'VERDICT: FALSE_POSITIVE'. "
+            "Do not write those strings anywhere else in your output."
         )
         user_prompt = (
             f"### CLAIM:\n{claim_description}\n\n"
@@ -876,10 +908,7 @@ class CrossModelConsensusVerifier:
             "Analyze the vulnerability mechanics and provide your final verdict."
         )
 
-        votes: Dict[str, str] = {}
-        critiques: Dict[str, str] = {}
-
-        for provider, model_id in model_panel:
+        def query_member(provider: str, model_id: Optional[str]) -> Tuple[str, str, str]:
             label = f"{provider}:{model_id or 'default'}"
             try:
                 res = self.client.chat_complete(
@@ -893,17 +922,22 @@ class CrossModelConsensusVerifier:
                 )
                 choices = res.get("choices", [])
                 content = choices[0]["message"]["content"] if choices else ""
-                critiques[label] = content
-                upper = content.upper()
-                if "VERDICT: TRUE_POSITIVE" in upper:
-                    votes[label] = "TRUE_POSITIVE"
-                elif "VERDICT: FALSE_POSITIVE" in upper:
-                    votes[label] = "FALSE_POSITIVE"
-                else:
-                    votes[label] = "INCONCLUSIVE"
+                vote = parse_trailing_verdict(content)
+                return label, vote or "INCONCLUSIVE", content
             except Exception as e:
-                critiques[label] = f"Error: {e}"
-                votes[label] = "ERROR"
+                return label, "ERROR", f"Error: {e}"
+
+        votes: Dict[str, str] = {}
+        critiques: Dict[str, str] = {}
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(model_panel))) as ex:
+            futures = {
+                ex.submit(query_member, provider, model_id): (provider, model_id)
+                for provider, model_id in model_panel
+            }
+            for fut in cf.as_completed(futures):
+                label, vote, critique = fut.result()
+                votes[label] = vote
+                critiques[label] = critique
 
         tp_count  = sum(1 for v in votes.values() if v == "TRUE_POSITIVE")
         fp_count  = sum(1 for v in votes.values() if v == "FALSE_POSITIVE")
