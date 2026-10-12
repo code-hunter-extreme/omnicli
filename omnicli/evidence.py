@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 _FINDING_HEADER = re.compile(
@@ -875,11 +875,143 @@ def triage_grounded_findings(
     return list(findings.values())
 
 
+def _verdict_evidence_entry(verdict: Mapping[str, Any]) -> Dict[str, object]:
+    """Extract the cited evidence for one judged verdict record.
+
+    Tolerates hand-built verdict shapes: missing fields stay None rather
+    than raising, so a malformed record degrades to an explicit unjudged
+    entry instead of crashing the gate.
+    """
+    candidate = verdict.get("candidate")
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    provider = verdict.get("provider")
+    model = verdict.get("model")
+    entry: Dict[str, object] = {
+        "verdict": str(verdict.get("verdict", "UNJUDGED")).upper(),
+        "category": candidate.get("category"),
+        "file": candidate.get("file"),
+        "line": candidate.get("start_line"),
+        "quote": candidate.get("quote"),
+        "grounded": bool(candidate.get("grounded")),
+        "judge": (
+            f"{provider}:{model}"
+            if provider is not None or model is not None
+            else None
+        ),
+        "margin": verdict.get("margin"),
+    }
+    provider_error = verdict.get("provider_error")
+    if provider_error:
+        entry["provider_error"] = provider_error
+    return entry
+
+
+def _assess_council_verdict(
+    verdicts: Optional[Sequence[Mapping[str, Any]]],
+    gate_status: str,
+) -> Dict[str, object]:
+    """Derive the council's security conclusion from its judged verdicts.
+
+    Staged scoring counts exactly the UPHOLD verdicts as predictions, so the
+    gate conclusion is drawn from the same verdict set: UPHELD_FINDINGS with
+    cited evidence when any candidate is upheld, NO_UPHELD_FINDINGS when the
+    council judged candidates and killed every one, CONTESTED when verdicts
+    exist but none were upheld and some deadlocked, UNJUDGED when verdicts
+    exist but none were adjudicated (judge outage or unparseable judgment).
+    NOT_ASSESSED is returned only when there are zero verdict records —
+    nothing was judged, so no conclusion is claimed.
+    """
+    judged = [v for v in (verdicts or []) if isinstance(v, Mapping)]
+    if not judged:
+        return {
+            "security_conclusion": "NOT_ASSESSED",
+            "security_evidence": [],
+            "verdict_counts": {
+                "uphold": 0,
+                "kill": 0,
+                "contested": 0,
+                "unjudged": 0,
+            },
+            "meaning": (
+                "PASS_GROUNDING_ONLY means at least one member's review outputs "
+                "passed the source-grounding checks. It does not prove "
+                "exploitability, completeness, or safety."
+            ),
+        }
+    upheld = [v for v in judged if str(v.get("verdict", "")).upper() == "UPHOLD"]
+    contested = [v for v in judged if str(v.get("verdict", "")).upper() == "CONTESTED"]
+    kills = sum(1 for v in judged if str(v.get("verdict", "")).upper() == "KILL")
+    unjudged = [
+        v
+        for v in judged
+        if str(v.get("verdict", "")).upper() not in ("UPHOLD", "KILL", "CONTESTED")
+    ]
+    counts = {
+        "uphold": len(upheld),
+        "kill": kills,
+        "contested": len(contested),
+        "unjudged": len(unjudged),
+    }
+    trial_note = (
+        ""
+        if gate_status == "PASS_GROUNDING_ONLY"
+        else " The evidence gate FAILED, so this trial is invalid for scoring; "
+        "treat these verdicts as diagnostic leads, not a qualified assessment."
+    )
+    if upheld:
+        return {
+            "security_conclusion": "UPHELD_FINDINGS",
+            "security_evidence": [_verdict_evidence_entry(v) for v in upheld],
+            "verdict_counts": counts,
+            "meaning": (
+                f"The council judged {len(judged)} candidate(s) and UPHELD "
+                f"{len(upheld)} with the cited source evidence below. Upheld "
+                "findings are evidence-backed leads, not exploitability proof, "
+                "completeness, or safety." + trial_note
+            ),
+        }
+    if contested:
+        return {
+            "security_conclusion": "CONTESTED",
+            "security_evidence": [_verdict_evidence_entry(v) for v in contested],
+            "verdict_counts": counts,
+            "meaning": (
+                f"The council judged {len(judged)} candidate(s), upheld none, "
+                f"and deadlocked on {len(contested)}: no consensus, so no "
+                "finding is established and no clean bill is given. Human or "
+                "stronger-judge review is required." + trial_note
+            ),
+        }
+    if unjudged:
+        return {
+            "security_conclusion": "UNJUDGED",
+            "security_evidence": [_verdict_evidence_entry(v) for v in unjudged],
+            "verdict_counts": counts,
+            "meaning": (
+                f"The council judged {len(judged)} candidate(s), upheld none, "
+                f"and left {len(unjudged)} unadjudicated (judge outage or "
+                "unparseable judgment). No finding is established and no clean "
+                "bill is given." + trial_note
+            ),
+        }
+    return {
+        "security_conclusion": "NO_UPHELD_FINDINGS",
+        "security_evidence": [],
+        "verdict_counts": counts,
+        "meaning": (
+            f"The council judged {len(judged)} candidate(s) and upheld none: "
+            "every judged candidate was KILLed. This is an assessed negative "
+            "over the judged candidates only, not proof of safety." + trial_note
+        ),
+    }
+
+
 def assess_evidence_gate(
     sources: Mapping[str, str],
     validations: list[Mapping[str, object]],
     provider_errors: list[str],
     candidate_triage: list[Mapping[str, object]],
+    verdicts: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, object]:
     """Fail closed when red-team claims cannot be grounded to supplied evidence.
 
@@ -889,6 +1021,11 @@ def assess_evidence_gate(
     failures are demoted to warnings (never silently dropped) while at
     least one member passes. Sources, vacuous-input, triage, and
     unattributed failures always fail closed.
+
+    When the typed-judge verdicts are supplied, the gate also reports the
+    council's assessed security conclusion drawn from those verdicts (the
+    same UPHOLD set that staged scoring counts as predictions). Without
+    verdicts no conclusion is claimed and the conclusion stays NOT_ASSESSED.
     """
     failures: list = []  # (member-key-or-None, message) pairs
     warnings: list[str] = []
@@ -1004,6 +1141,7 @@ def assess_evidence_gate(
         failed_checks = []
         status = "PASS_GROUNDING_ONLY"
 
+    conclusion = _assess_council_verdict(verdicts, status)
     return {
         "status": status,
         "failed_checks": failed_checks,
@@ -1014,12 +1152,10 @@ def assess_evidence_gate(
         "source_files_checked": len(sources),
         "review_outputs_checked": len(validations),
         "candidate_count": len(candidate_triage),
-        "security_conclusion": "NOT_ASSESSED",
-        "meaning": (
-            "PASS_GROUNDING_ONLY means at least one member's review outputs "
-            "passed the source-grounding checks. It does not prove "
-            "exploitability, completeness, or safety."
-        ),
+        "security_conclusion": conclusion["security_conclusion"],
+        "security_evidence": conclusion["security_evidence"],
+        "verdict_counts": conclusion["verdict_counts"],
+        "meaning": conclusion["meaning"],
     }
 
 

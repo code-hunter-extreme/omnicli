@@ -2,9 +2,8 @@
 
 Declarative vuln x attack coverage matrix, probe/detector plugin registries,
 an orthogonal payload-transform layer, a council-as-judge stage with
-reasoning-chain validation and deterministic cross-checking, a per-run spend
-ledger with retry and token budgets, and the mandatory red-team exercise
-contract.
+reasoning-chain validation and deterministic cross-checking, and a per-run
+spend ledger with retry and token budgets.
 
 Design ideas were adapted from the public-repository survey
 (~/workspace/research/redteam-survey/SURVEY.md); every line of code below is
@@ -312,9 +311,10 @@ def apply_transforms(text: str, names: List[str]) -> str:
 # UPHOLD (the judge must explicitly rebut it). One combination is a hard kill:
 # an UNGROUNDED candidate with a NOT_SUPPORTED signal is auto-killed —
 # neither the quote nor the analyzer supports the claim, so no judge UPHOLD
-# may stand (see unsafe_override_kill). In all other cases the signal never
-# auto-kills, because the deterministic analyzer is conservative and can miss
-# true positives.
+# may stand: ungrounded candidates fail the evidence gate globally and the
+# contradiction flip (Section 9) KILLs any UPHOLD that contradicts the
+# evidence. In all other cases the signal never auto-kills, because the
+# deterministic analyzer is conservative and can miss true positives.
 # ---------------------------------------------------------------------------
 
 _JUDGE_SYSTEM = (
@@ -605,75 +605,11 @@ def deterministic_cross_check(
     }
 
 
-def unsafe_override_kill(
-    item: Mapping[str, Any],
-    cross_check: Mapping[str, Any],
-) -> Optional[str]:
-    """Hard safety override for the council-as-judge stage.
-
-    .. deprecated::
-        The pipeline no longer consults this veto. Its signal is subsumed by
-        the contradiction flip (Section 9): a judge UPHOLD that contradicts
-        the evidence flips to KILL, and engines vote instead of executing.
-        Kept as a pure function for backward compatibility.
-    """
-    grounded = bool((item or {}).get("grounded"))
-    signal = str((cross_check or {}).get("signal", "")).strip().lower()
-    if not grounded and signal == "not_supported":
-        return (
-            "ungrounded + deterministic cross-check not_supported; "
-            "judge override disallowed"
-        )
-    return None
-
-
-def ungrounded_not_covered_cap(
-    item: Mapping[str, Any],
-    cross_check: Mapping[str, Any],
-) -> Optional[str]:
-    """Cap the verdict at CONTESTED for ungrounded findings no engine covers.
-
-    When the quote does not check out AND no deterministic engine covers the
-    finding's category, there is no independent support for the claim — but
-    unlike not_supported, no engine contradicts it either. UPHOLD is
-    disallowed (nothing supports it); the verdict caps at CONTESTED so a
-    human or stronger judge can review. Returns a cap-reason string when the
-    cap applies, else None.
-    """
-    grounded = bool((item or {}).get("grounded"))
-    signal = str((cross_check or {}).get("signal", "")).strip().lower()
-    if not grounded and signal == "not_covered":
-        return (
-            "ungrounded + no engine covers this category; "
-            "UPHOLD disallowed, capped at CONTESTED"
-        )
-    return None
-
-
-def decide_council_verdict(
-    votes: List[str],
-    hard_kill_reason: Optional[str] = None,
-    contested_cap_reason: Optional[str] = None,
-) -> str:
-    """Aggregate judge votes into a final council verdict.
-
-    A hard-kill override always wins: the candidate is KILLed regardless of
-    how the panel voted. A contested cap demotes a would-be UPHOLD to
-    CONTESTED (used when nothing supports the claim but nothing contradicts
-    it either). Otherwise majority rules; ties are CONTESTED and an empty
-    ballot is UNJUDGED.
-    """
-    if hard_kill_reason is not None:
-        return "KILL"
-    upholds = sum(1 for v in votes if v == "UPHOLD")
-    kills = sum(1 for v in votes if v == "KILL")
-    if upholds > kills:
-        return "CONTESTED" if contested_cap_reason is not None else "UPHOLD"
-    if kills > upholds:
-        return "KILL"
-    if votes:
-        return "CONTESTED"
-    return "UNJUDGED"
+# NOTE (P4): the veto helpers unsafe_override_kill, ungrounded_not_covered_cap,
+# and decide_council_verdict were removed here. They had zero pipeline callers:
+# ungrounded candidates already fail the evidence gate globally (triage
+# unsupported_citation -> gate FAIL -> invalid trial), and the contradiction
+# flip plus ballot aggregation below subsume the rest.
 
 
 # ---------------------------------------------------------------------------
@@ -759,164 +695,27 @@ class SpendLedger:
 
 
 # ---------------------------------------------------------------------------
-# 7. Red-team exercise contract.
+# 7. Red-team exercise contract: REMOVED (P4).
 #
-# Every staged run declares target, authorization scope, boundaries, and a
-# payload budget up front. swarm_redteam refuses to run without one.
+# RedTeamContract, RedTeamContractError, require_contract, evaluation_contract,
+# and local_analysis_contract had zero callers in any repo: no staged run ever
+# presented a contract. Staged runs are offline model-call-only evaluations --
+# they do not execute target code or emit payloads -- so a payload-budget /
+# authorization enforcement guarded no executable capability. The live safety
+# boundary is the read-only static-analysis prompt plus the no-execution tool
+# policy. Section number kept so later section references stay stable.
 # ---------------------------------------------------------------------------
-
-class RedTeamContractError(ValueError):
-    """Raised when a staged red-team run is attempted without a contract."""
-
-
-@dataclass
-class RedTeamContract:
-    """Pre-engagement contract for a staged red-team run."""
-
-    target: str
-    authorization_scope: str
-    boundaries: str
-    payload_budget: int
-    notes: str = ""
-
-    def validate(self) -> "RedTeamContract":
-        for field_name in ("target", "authorization_scope", "boundaries"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise RedTeamContractError(
-                    f"Red-team contract field {field_name!r} must be a non-empty string."
-                )
-        budget = self.payload_budget
-        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
-            raise RedTeamContractError(
-                "Red-team contract payload_budget must be a positive integer."
-            )
-        return self
-
-
-def require_contract(contract: Any) -> RedTeamContract:
-    """Validate a staged run's contract or refuse to run."""
-    if not isinstance(contract, RedTeamContract):
-        raise RedTeamContractError(
-            "Staged red-team runs require a RedTeamContract "
-            "(target, authorization_scope, boundaries, payload_budget); "
-            f"got {type(contract).__name__}."
-        )
-    return contract.validate()
-
-
-def evaluation_contract(
-    target: str = "red-team evaluation corpus",
-    payload_budget: int = 10_000,
-) -> RedTeamContract:
-    """Build the standard contract for offline fixture evaluations."""
-    return RedTeamContract(
-        target=target,
-        authorization_scope=(
-            "Offline evaluation against supplied fixture sources only. No live "
-            "systems, no network targets, no destructive actions."
-        ),
-        boundaries=(
-            "Read-only static analysis of the provided source text. Do not "
-            "attempt execution, exfiltration, or contact with external systems."
-        ),
-        payload_budget=payload_budget,
-        notes="Auto-generated evaluation contract.",
-    )
-
-
-def local_analysis_contract(
-    target: str,
-    payload_budget: int = 1_000,
-) -> RedTeamContract:
-    """Build a read-only local-analysis contract for interactive CLI runs.
-
-    The CLI operator is the authorizing party; the contract is declared,
-    recorded in the run result, and limited to local source analysis.
-    """
-    return RedTeamContract(
-        target=target,
-        authorization_scope=(
-            "Local source analysis authorized by the CLI operator. No live "
-            "systems, no network targets, no destructive actions."
-        ),
-        boundaries=(
-            "Read-only static analysis of the provided source text. Do not "
-            "attempt execution, exfiltration, or contact with external systems."
-        ),
-        payload_budget=payload_budget,
-        notes="Operator-declared local-analysis contract.",
-    )
 
 
 # ---------------------------------------------------------------------------
-# 8. Case-file ruling contract: deterministic enforcement that the judge
-# actually judges.
+# 8. Case-file ruling contract: REMOVED (P4).
 #
-# The LLM judge receives a deterministic case file (per-engine facts +
-# global verdict + precedents) and must rule on EVERY fact. Enforcement is
-# deterministic, not prompt-wishing:
-#   (a) any fact left unaddressed invalidates an UPHOLD;
-#   (b) a DISAGREE with a fact is only valid when it quotes contradictory
-#       code verbatim from the supplied sources.
-# Callers must treat a failed validation as a KILL.
+# _quote_in_sources and validate_judgment_against_casefile were removed. The
+# FACT-ruling enforcement was deprecated by its own docstring (it killed true
+# positives) and had zero pipeline callers; facts now feed the judge as an
+# EVIDENCE section and only genuine claim-vs-fact contradiction flips a ballot
+# (Section 9). Section number kept so references stay stable.
 # ---------------------------------------------------------------------------
-
-def _quote_in_sources(quote: str, sources: Mapping[str, str]) -> bool:
-    """True when the quote appears verbatim (whitespace-normalized) in sources."""
-    needle = " ".join(str(quote).split())
-    if len(needle) < 3:
-        return False
-    for text in (sources or {}).values():
-        if not isinstance(text, str):
-            continue
-        if needle in " ".join(text.split()):
-            return True
-    return False
-
-
-def validate_judgment_against_casefile(
-    judgment: Mapping[str, Any],
-    case_file: Mapping[str, Any],
-    sources: Mapping[str, str],
-) -> Tuple[bool, str]:
-    """Enforce the case-file ruling contract deterministically.
-
-    .. deprecated::
-        The pipeline no longer enforces FACT-ruling format compliance; it
-        was the veto that killed true positives (0/12 calibration). The
-        judge now receives facts as an EVIDENCE section and only genuine
-        claim-vs-fact contradiction flips a ballot (Section 9). Kept as a
-        pure function for backward compatibility.
-
-    Returns (ok, reason). An UPHOLD whose judgment fails this check must be
-    converted to KILL by the caller.
-    """
-    facts = (case_file or {}).get("facts", []) or []
-    rulings: Dict[str, Mapping[str, Any]] = {}
-    for ruling in (judgment or {}).get("fact_rulings", []) or []:
-        if isinstance(ruling, Mapping) and ruling.get("fact_id"):
-            rulings[str(ruling["fact_id"])] = ruling
-    for fact in facts:
-        if not isinstance(fact, Mapping):
-            continue
-        fid = str(fact.get("id", ""))
-        ruling = rulings.get(fid)
-        if ruling is None:
-            return False, f"judge left deterministic fact '{fid}' unaddressed"
-        if str(ruling.get("stance", "")).upper() == "DISAGREE":
-            quote = str(ruling.get("contradictory_quote", "") or "")
-            if not quote.strip():
-                return False, (
-                    f"judge disagrees with deterministic fact '{fid}' without "
-                    "quoting contradictory code"
-                )
-            if not _quote_in_sources(quote, sources):
-                return False, (
-                    f"judge's contradictory quote for fact '{fid}' does not "
-                    "appear verbatim in the supplied sources"
-                )
-    return True, "all deterministic facts addressed"
 
 
 # ---------------------------------------------------------------------------
@@ -930,10 +729,9 @@ def validate_judgment_against_casefile(
 # post-judge adjustment is the contradiction flip: a genuine claim-vs-fact
 # contradiction flips a single ballot — never format, never phrasing.
 #
-# The legacy veto helpers (unsafe_override_kill, ungrounded_not_covered_cap,
-# validate_judgment_against_casefile, decide_council_verdict) remain as pure
-# functions for backward compatibility but are no longer consulted by the
-# pipeline.
+# The veto architecture of Sections 5/8 was removed (P4): its four helpers had
+# zero pipeline callers, and their fail-closed behavior is subsumed by the
+# evidence gate (ungrounded candidates fail globally) plus the flip above.
 # ---------------------------------------------------------------------------
 
 @dataclass

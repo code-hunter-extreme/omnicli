@@ -781,6 +781,33 @@ def generate_redteam_report(
     failed_checks = "\n".join(
         f"- {item}" for item in gate.get("failed_checks", [])
     ) or "- None."
+    verdict_counts = gate.get("verdict_counts")
+    if isinstance(verdict_counts, dict):
+        counts_line = (
+            f"Upheld {verdict_counts.get('uphold', 0)} / "
+            f"killed {verdict_counts.get('kill', 0)} / "
+            f"contested {verdict_counts.get('contested', 0)} / "
+            f"unjudged {verdict_counts.get('unjudged', 0)}"
+        )
+    else:
+        counts_line = "No verdicts recorded."
+    security_evidence = gate.get("security_evidence") or []
+    council_lines = (
+        "\n".join(
+            f"- {item.get('verdict')}: {item.get('category')} "
+            f"(`{item.get('file')}:{item.get('line')}`) "
+            f"`{item.get('quote')}`"
+            + (f" — judge {item.get('judge')}" if item.get("judge") else "")
+            + (
+                f" (margin {item.get('margin')})"
+                if item.get("margin") is not None
+                else ""
+            )
+            for item in security_evidence
+            if isinstance(item, dict)
+        )
+        or "- None: no upheld, contested, or unjudged candidates with cited evidence."
+    )
     report_content = f"""# Red-Team Security Assessment & Audit Report
 
 **Date / Timestamp:** {datetime.now().isoformat()}  
@@ -797,6 +824,10 @@ def generate_redteam_report(
 **Security conclusion:** {gate.get('security_conclusion', 'NOT_ASSESSED')}
 **Source files checked:** {gate.get('source_files_checked', 0)}
 **Review outputs checked:** {gate.get('review_outputs_checked', 0)}
+**Council verdicts:** {counts_line}
+
+**Cited verdict evidence:**
+{council_lines}
 
 **Failed checks:**
 {failed_checks}
@@ -1693,6 +1724,7 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         [*attack_validations, *challenge_validations],
         provider_errors,
         candidate_triage,
+        verdicts=typed_judgment["verdicts"],
     )
     provider_warnings = evidence_gate["provider_warnings"]
     if not isinstance(provider_warnings, list):

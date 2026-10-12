@@ -1778,6 +1778,234 @@ def assess_redteam_quality_gate(
     }
 
 
+# Binding Transition-Gate bars (docs/REDTEAM_QUALITY_PLAN.md phase 5, as
+# enforced by assess_redteam_quality_gate). These are stricter than the
+# looser numbers in the roadmap's Task-3 checklist; the plan and the code
+# are authoritative. If assess_redteam_quality_gate ever changes its bars,
+# this validator must be updated in the same edit — silent drift between
+# the gate and its artifact check would let a stale artifact pass.
+_TRANSITION_BAR_RECALL = 0.85
+_TRANSITION_BAR_SPECIFICITY = 0.90
+_TRANSITION_BAR_CITATION = 0.95
+_TRANSITION_MINIMUM_PER_CLASS = 30
+_TRANSITION_MINIMUM_FAMILIES = 3
+_TRANSITION_MINIMUM_REPETITIONS = 2
+
+
+def validate_qualifying_run(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a claimed Transition-Gate qualifying-run artifact.
+
+    Takes the parsed JSON written by ``omni evaluate-security ... --split
+    held_out --staged-redteam --quality-gate --output <artifact>`` and
+    re-derives the gate anatomy independently instead of trusting the
+    artifact's own summary strings: model families are recomputed from the
+    paired rows, pooled and per-family bars are re-checked, and every
+    paired model must show both a single-pass and a staged row with enough
+    repetitions and zero excluded failures.
+
+    Returns ``{"valid": bool, "failures": [...], "summary": {...}}``. A
+    hand-edited or partial artifact fails with explicit reasons; only a
+    genuine PASS_BOUNDED_GATE report validates.
+    """
+    from omnicli.scanner import classify_family
+
+    failures: List[str] = []
+    if not isinstance(report, dict):
+        return {
+            "valid": False,
+            "failures": ["Qualifying-run artifact must be a JSON object."],
+            "summary": {},
+        }
+    gate = report.get("quality_gate")
+    if not isinstance(gate, dict):
+        failures.append("Artifact is missing its quality_gate section.")
+        gate = {}
+    elif gate.get("status") != "PASS_BOUNDED_GATE":
+        failures.append(
+            "quality_gate.status is "
+            f"{gate.get('status')!r}, not PASS_BOUNDED_GATE."
+        )
+    if isinstance(gate, dict) and gate.get("failures"):
+        failures.append(
+            "quality_gate.failures is not empty; a qualifying run has none."
+        )
+    positive_cases = gate.get("positive_cases", 0) if isinstance(gate, dict) else 0
+    benign_cases = gate.get("benign_cases", 0) if isinstance(gate, dict) else 0
+    if not isinstance(positive_cases, int) or positive_cases < _TRANSITION_MINIMUM_PER_CLASS:
+        failures.append(
+            f"Need at least {_TRANSITION_MINIMUM_PER_CLASS} held-out positive "
+            f"cases; artifact claims {positive_cases}."
+        )
+    if not isinstance(benign_cases, int) or benign_cases < _TRANSITION_MINIMUM_PER_CLASS:
+        failures.append(
+            f"Need at least {_TRANSITION_MINIMUM_PER_CLASS} held-out benign "
+            f"cases; artifact claims {benign_cases}."
+        )
+    if isinstance(gate, dict) and gate.get("failed_models"):
+        failures.append("Artifact lists failed models; a qualifying run has none.")
+
+    paired = gate.get("paired_models", []) if isinstance(gate, dict) else []
+    if not isinstance(paired, list) or not paired:
+        failures.append("Artifact lists no paired single-pass/staged models.")
+        paired = []
+    rederived_families = set()
+    for entry in paired:
+        if not isinstance(entry, dict) or not entry.get("provider") or not entry.get("model"):
+            failures.append(f"Paired-model entry is malformed: {entry!r}.")
+            continue
+        family = classify_family(str(entry["model"]))
+        if family != "other":
+            rederived_families.add(family)
+    if len(rederived_families) < _TRANSITION_MINIMUM_FAMILIES:
+        failures.append(
+            f"Need {_TRANSITION_MINIMUM_FAMILIES} distinct model families "
+            f"re-derived from paired rows; found {len(rederived_families)}."
+        )
+    claimed_families = gate.get("healthy_model_families") if isinstance(gate, dict) else None
+    if not isinstance(claimed_families, list) or set(claimed_families) != rederived_families:
+        failures.append(
+            "Artifact's healthy_model_families does not match the families "
+            "re-derived from its paired rows."
+        )
+
+    rows = report.get("models", [])
+    rows = rows if isinstance(rows, list) else []
+    for entry in paired:
+        if not isinstance(entry, dict):
+            continue
+        pair = (entry.get("provider"), entry.get("model"))
+        direct = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, dict)
+                and (row.get("provider"), row.get("model")) == pair
+                and row.get("method") == "single_pass_model"
+            ),
+            None,
+        )
+        staged = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, dict)
+                and (row.get("provider"), row.get("model")) == pair
+                and row.get("method") == "staged_redteam"
+            ),
+            None,
+        )
+        if direct is None or staged is None:
+            failures.append(
+                f"{pair[0]}:{pair[1]} is missing a paired single-pass or "
+                "staged row in the artifact."
+            )
+            continue
+        for method, row in (("single-pass", direct), ("staged", staged)):
+            repetitions = row.get("repetitions", 0)
+            if (
+                not isinstance(repetitions, int)
+                or isinstance(repetitions, bool)
+                or repetitions < _TRANSITION_MINIMUM_REPETITIONS
+            ):
+                failures.append(
+                    f"{pair[0]}:{pair[1]} {method} shows fewer than "
+                    f"{_TRANSITION_MINIMUM_REPETITIONS} repetitions."
+                )
+            if row.get("errors", 0) != 0:
+                failures.append(
+                    f"{pair[0]}:{pair[1]} {method} shows provider errors; "
+                    "failed trials cannot be excluded from the quality gate."
+                )
+        if staged.get("evidence_gate_failures", 0) != 0:
+            failures.append(
+                f"{pair[0]}:{pair[1]} staged shows evidence-gate failures."
+            )
+
+    def _check_bars(scores: Any, label: str) -> None:
+        if not isinstance(scores, dict):
+            failures.append(f"{label} scores are missing from the artifact.")
+            return
+        recall = scores.get("recall")
+        specificity = scores.get("specificity")
+        citation = scores.get("citation_accuracy")
+        if not isinstance(recall, (int, float)) or recall < _TRANSITION_BAR_RECALL:
+            failures.append(f"{label} recall is below 85%.")
+        if (
+            not isinstance(specificity, (int, float))
+            or specificity < _TRANSITION_BAR_SPECIFICITY
+        ):
+            failures.append(f"{label} specificity is below 90%.")
+        if (
+            not isinstance(citation, (int, float))
+            or citation < _TRANSITION_BAR_CITATION
+        ):
+            failures.append(f"{label} exact citation accuracy is below 95%.")
+
+    direct_scores = gate.get("single_pass") if isinstance(gate, dict) else None
+    staged_scores = gate.get("staged") if isinstance(gate, dict) else None
+    _check_bars(direct_scores, "single-pass pooled")
+    _check_bars(staged_scores, "staged pooled")
+    if (
+        isinstance(direct_scores, dict)
+        and isinstance(staged_scores, dict)
+        and isinstance(staged_scores.get("recall"), (int, float))
+        and isinstance(direct_scores.get("recall"), (int, float))
+        and staged_scores["recall"] < direct_scores["recall"]
+    ):
+        failures.append(
+            "Staged mode recall regresses against the single-pass baseline."
+        )
+    per_family = gate.get("per_family") if isinstance(gate, dict) else None
+    if not isinstance(per_family, dict) or not per_family:
+        failures.append("Artifact is missing per-family scores.")
+    else:
+        for family in sorted(per_family):
+            scores = per_family[family]
+            if not isinstance(scores, dict):
+                failures.append(f"{family} family scores are malformed.")
+                continue
+            _check_bars(scores.get("single_pass"), f"{family} single-pass")
+            _check_bars(scores.get("staged"), f"{family} staged")
+            family_direct = scores.get("single_pass")
+            family_staged = scores.get("staged")
+            if (
+                isinstance(family_direct, dict)
+                and isinstance(family_staged, dict)
+                and isinstance(family_staged.get("recall"), (int, float))
+                and isinstance(family_direct.get("recall"), (int, float))
+                and family_staged["recall"] < family_direct["recall"]
+            ):
+                failures.append(
+                    f"{family} staged mode recall regresses against the "
+                    "single-pass baseline."
+                )
+
+    limitations = gate.get("limitations") if isinstance(gate, dict) else None
+    if not isinstance(limitations, list) or not limitations:
+        failures.append(
+            "Artifact omits the bounded-gate limitations; the qualified claim "
+            "must travel with the artifact."
+        )
+    council = report.get("staged_council")
+    if not isinstance(council, dict):
+        failures.append("Artifact is missing its staged_council section.")
+    else:
+        if council.get("method") != "staged_redteam_council":
+            failures.append("staged_council section is malformed.")
+        if not isinstance(council.get("member_calls"), int) or council["member_calls"] <= 0:
+            failures.append("staged_council shows no member calls.")
+        if council.get("errors", 0) != 0:
+            failures.append("staged_council shows invalid case trials.")
+
+    summary = {
+        "positive_cases": positive_cases,
+        "benign_cases": benign_cases,
+        "families": sorted(rederived_families),
+        "paired_models": len(paired),
+    }
+    return {"valid": not failures, "failures": failures, "summary": summary}
+
+
 def recommend_model(report: Dict[str, Any], minimum_cases: int = 10) -> Optional[Dict[str, Any]]:
     """Recommend only among models evaluated on the minimum number of cases."""
     eligible = [

@@ -22,7 +22,7 @@ from omnicli.engines.global_engine import (
     build_case_file,
     location_plausibility_fact,
 )
-from omnicli.redteam import parse_judgment, validate_judgment_against_casefile
+from omnicli.redteam import parse_judgment
 
 
 def _cand(cid="c1", category="sql_injection", file="app.py", line=2, quote="x"):
@@ -340,64 +340,48 @@ class TestAdjudications(unittest.TestCase):
         self.assertIsNone(self.store.check_auto_kill(cand, "python"))
 
 
-def _case_file(*facts):
-    return {
-        "candidate_id": "c1",
-        "facts": [
-            {"id": fid, "kind": "sink", "claim": f"claim {fid}", "line": 1,
-             "code": "x", "supports_finding": supports, "engine": "python_general"}
-            for fid, supports in facts
-        ],
-    }
+class TestUngroundedFailsClosedWithoutVetoes(unittest.TestCase):
+    """P4: the removed veto helpers' fail-closed behavior is subsumed.
 
+    unsafe_override_kill used to hard-kill ungrounded + not_supported
+    candidates. The live pipeline instead fails the evidence gate globally
+    on any unsupported_citation triage entry and invalidates the trial.
+    These tests prove the property survives the removal without the helpers.
+    """
 
-class TestJudgmentValidation(unittest.TestCase):
-    SOURCES = {"app.py": 'def get(name):\n    cursor.execute("SELECT " + name)\n'}
+    def test_ungrounded_candidate_fails_gate(self):
+        from omnicli.evidence import assess_evidence_gate
 
-    def test_unaddressed_fact_fails(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": []}
-        ok, reason = validate_judgment_against_casefile(
-            judgment, _case_file(("sink_present", True)), self.SOURCES)
-        self.assertFalse(ok)
-        self.assertIn("sink_present", reason)
+        gate = assess_evidence_gate(
+            {"app.py": "def get(name):\n    return name\n"},
+            [{
+                "provider": "p",
+                "model": "m",
+                "status": "unsupported_citations",
+                "review_complete": True,
+                "findings_checked": [],
+            }],
+            [],
+            [{
+                "title": "SQL injection",
+                "status": "unsupported_citation",
+                "reason": "Citation did not match supplied source.",
+            }],
+            verdicts=[{"verdict": "UPHOLD"}],
+        )
+        self.assertEqual(gate["status"], "FAIL")
+        self.assertTrue(gate["failed_checks"])
 
-    def test_disagree_without_quote_fails(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": [
-            {"fact_id": "sink_present", "stance": "DISAGREE", "contradictory_quote": ""}]}
-        ok, reason = validate_judgment_against_casefile(
-            judgment, _case_file(("sink_present", True)), self.SOURCES)
-        self.assertFalse(ok)
-        self.assertIn("without", reason)
+    def test_failed_gate_invalidates_trial_despite_uphold(self):
+        from omnicli.evaluation import staged_trial_failed
 
-    def test_disagree_with_invented_quote_fails(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": [
-            {"fact_id": "sink_present", "stance": "DISAGREE",
-             "contradictory_quote": "cursor.execute('SELECT 1')"}]}
-        ok, _ = validate_judgment_against_casefile(
-            judgment, _case_file(("sink_present", True)), self.SOURCES)
-        self.assertFalse(ok)
-
-    def test_disagree_with_verbatim_quote_passes(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": [
-            {"fact_id": "sink_present", "stance": "DISAGREE",
-             "contradictory_quote": 'cursor.execute("SELECT " + name)'}]}
-        ok, _ = validate_judgment_against_casefile(
-            judgment, _case_file(("sink_present", True)), self.SOURCES)
-        self.assertTrue(ok)
-
-    def test_full_agreement_passes(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": [
-            {"fact_id": "sink_present", "stance": "AGREE", "contradictory_quote": ""},
-            {"fact_id": "guard_absent", "stance": "AGREE", "contradictory_quote": ""}]}
-        ok, _ = validate_judgment_against_casefile(
-            judgment, _case_file(("sink_present", True), ("guard_absent", False)),
-            self.SOURCES)
-        self.assertTrue(ok)
-
-    def test_empty_facts_passes(self):
-        judgment = {"judgment": "UPHOLD", "fact_rulings": []}
-        ok, _ = validate_judgment_against_casefile(judgment, _case_file(), self.SOURCES)
-        self.assertTrue(ok)
+        self.assertTrue(
+            staged_trial_failed(
+                "FAIL",
+                [{"provider": "p", "error": None}],
+                verdicts=[{"verdict": "UPHOLD"}],
+            )
+        )
 
 
 class TestFactRulingParsing(unittest.TestCase):
