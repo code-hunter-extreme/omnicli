@@ -622,13 +622,21 @@ class ChatSession:
                     ],
                 }
 
-            # Display final synthesized answer
+            # Display final merged answer
             final_ans = out.get("final") or "All swarm members failed to respond."
-            title_mode = {
-                "collaborate": "[bold green]SYNTHESIZED CONSENSUS (All Models Reasoning Together)[/bold green]",
-                "builder": "[bold green]HARDENED BUILD (Builders Fortified Against Red-Team)[/bold green]",
-                "redteam": "[bold yellow]EVIDENCE-LED RED-TEAM TRIAGE (NOT A SECURITY VERDICT)[/bold yellow]",
-            }.get(self.mode, "[bold green]ORCHESTRATED CONSENSUS[/bold green]")
+            from omnicli.orchestrate import swarm_final_title
+            if self.mode == "builder":
+                title_text = "HARDENED BUILD (Builders Fortified Against Red-Team)"
+            elif self.mode == "redteam":
+                title_text = (
+                    "EVIDENCE-LED RED-TEAM TRIAGE (NOT A SECURITY VERDICT)"
+                )
+            else:
+                title_text = swarm_final_title(
+                    self.mode, out.get("synthesis")
+                )
+            title_style = "bold yellow" if self.mode == "redteam" else "bold green"
+            title_mode = f"[{title_style}]{title_text}[/{title_style}]"
             final_border = (
                 "red"
                 if evidence_gate and evidence_gate.get("status") != "PASS_GROUNDING_ONLY"

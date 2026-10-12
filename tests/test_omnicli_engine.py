@@ -4232,13 +4232,112 @@ class TestSwarm(unittest.TestCase):
             {"provider": "openrouter", "model": "a", "family": "openai", "answer": "A", "error": None},
             {"provider": "nvidia", "model": "b", "family": "meta", "answer": "B", "error": None},
         ]
-        self.assertEqual(synthesize(self._cfg(), self.FakeClient(), "task", results), "ans:a")
+        telemetry = {}
+        merged = synthesize(
+            self._cfg(), self.FakeClient(), "task", results, telemetry=telemetry,
+        )
+        self.assertTrue(telemetry["performed"])
+        self.assertEqual(telemetry["method"], "structured")
+        self.assertIn("Deterministic claim-merge", merged)
+        self.assertIn("A", merged)
+        self.assertIn("B", merged)
+
+    def test_synthesize_judge_method_uses_single_member_draft(self):
+        from omnicli.orchestrate import synthesize
+        results = [
+            {"provider": "openrouter", "model": "a", "family": "openai", "answer": "A", "error": None},
+            {"provider": "nvidia", "model": "b", "family": "meta", "answer": "B", "error": None},
+        ]
+        telemetry = {}
+        out = synthesize(
+            self._cfg(), self.FakeClient(), "task", results,
+            telemetry=telemetry, method="judge",
+        )
+        self.assertEqual(out, "ans:a")
+        self.assertTrue(telemetry["performed"])
+        self.assertEqual(telemetry["method"], "judge")
 
     def test_synthesize_single_returns_it(self):
         from omnicli.orchestrate import synthesize
         results = [{"provider": "p", "model": "m", "family": "f", "answer": "ONLY", "error": None},
                    {"provider": "p2", "model": "m2", "family": "g", "answer": "", "error": "boom"}]
-        self.assertEqual(synthesize(self._cfg(), self.FakeClient(), "t", results), "ONLY")
+        telemetry = {}
+        self.assertEqual(
+            synthesize(self._cfg(), self.FakeClient(), "t", results, telemetry=telemetry),
+            "ONLY",
+        )
+        self.assertFalse(telemetry["performed"])
+        self.assertEqual(telemetry["reason"], "only one successful member output")
+
+    def test_merge_claims_dedups_and_preserves_disagreement(self):
+        from omnicli.orchestrate import merge_claims, render_claim_merge
+        results = [
+            {"provider": "p1", "model": "m1", "answer": "- Shared point\n- Only from one", "error": None},
+            {"provider": "p2", "model": "m2", "answer": "Shared point\nShared point\nOnly from two", "error": None},
+            {"provider": "p3", "model": "m3", "answer": "", "error": "boom"},
+        ]
+        merged = merge_claims(results)
+        self.assertEqual(merged["member_count"], 2)
+        # Case-insensitive dedup; self-repetition counts once.
+        self.assertEqual(len(merged["supported"]), 1)
+        self.assertEqual(merged["supported"][0]["claim"], "Shared point")
+        self.assertEqual(
+            merged["supported"][0]["supporters"], ["p1:m1", "p2:m2"]
+        )
+        # Disagreement preserved, never dropped or upgraded.
+        single = {item["claim"]: item["supporter"] for item in merged["single_source"]}
+        self.assertEqual(single, {"Only from one": "p1:m1", "Only from two": "p2:m2"})
+        self.assertEqual(len(merged["failed_members"]), 1)
+        rendered = render_claim_merge(merged)
+        self.assertIn("Claims with multi-member support (1)", rendered)
+        self.assertIn("Single-source claims (2)", rendered)
+        self.assertIn("Only from one", rendered)
+        self.assertIn("Failed members (1)", rendered)
+
+    def test_merge_claims_skips_code_and_empty(self):
+        from omnicli.orchestrate import merge_claims
+        results = [
+            {"provider": "p", "model": "m", "answer": "Real claim\n```\ncode()\n```\n\n", "error": None},
+        ]
+        merged = merge_claims(results)
+        self.assertEqual(len(merged["single_source"]), 1)
+        self.assertEqual(merged["single_source"][0]["claim"], "Real claim")
+
+    def test_swarm_final_title_never_claims_consensus(self):
+        from omnicli.orchestrate import swarm_final_title
+        self.assertEqual(
+            swarm_final_title("collaborate", {"performed": True, "method": "structured"}),
+            "MERGED (deterministic claim-merge)",
+        )
+        self.assertEqual(
+            swarm_final_title("collaborate", {"performed": True, "method": "judge"}),
+            "JUDGE DRAFT (single-model paraphrase — not consensus)",
+        )
+        self.assertEqual(
+            swarm_final_title(
+                "collaborate",
+                {"performed": False, "reason": "only one successful member output"},
+            ),
+            "SINGLE MEMBER (no merge — one output)",
+        )
+        self.assertEqual(
+            swarm_final_title(
+                "collaborate", {"performed": False, "failed_attempts": [{"error": "x"}]}
+            ),
+            "MERGE FAILED (raw member outputs)",
+        )
+        deliberate_title = swarm_final_title("deliberate", {"performed": True})
+        self.assertEqual(
+            deliberate_title,
+            "CHAIR SUMMARY (single-model summary — transcript is the record)",
+        )
+        self.assertNotIn("consensus", deliberate_title.lower())
+        for title in (
+            swarm_final_title("collaborate", {"performed": True, "method": "structured"}),
+            swarm_final_title("collaborate", {"performed": True, "method": "judge"}),
+            swarm_final_title("collaborate", {"performed": False, "reason": "only one successful member output"}),
+        ):
+            self.assertNotIn("consensus", title.lower().replace("not consensus", ""))
 
     def test_redteam_swarm_uses_adversarial_system(self):
         from omnicli.orchestrate import swarm_redteam

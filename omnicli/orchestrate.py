@@ -365,29 +365,171 @@ def run_swarm(
     return results
 
 
+_CLAIM_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d{1,3}[.)])\s+")
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+")
+
+
+def _split_claims(answer: str) -> List[str]:
+    """Split a member answer into candidate claims, one per content line.
+
+    List markers and markdown headings are stripped so that `- X` and `X`
+    dedup; fenced-code markers are skipped (code blocks are not claims).
+    """
+    claims = []
+    in_fence = False
+    for line in str(answer or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not stripped:
+            continue
+        text = _HEADING_RE.sub("", stripped)
+        text = _CLAIM_BULLET_RE.sub("", text).strip()
+        if text:
+            claims.append(text)
+    return claims
+
+
+def _claim_key(claim: str) -> str:
+    return " ".join(claim.lower().split())
+
+
+def merge_claims(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministically merge member answers with dedup + disagreement preservation.
+
+    Every member answer is split into claims; claims are deduplicated
+    case-insensitively (a member repeating itself counts once) and grouped
+    by support: claims made by 2+ members vs claims with exactly one
+    source. Single-source claims are PRESERVED under their own heading —
+    never dropped, never upgraded — because one member's unique point is
+    unresolved disagreement, not consensus. No model calls; pure function
+    of the member records.
+    """
+    good = [
+        r for r in results
+        if not r.get("error") and (r.get("answer") or "").strip()
+    ]
+    failed = [r for r in results if r.get("error")]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for record in good:
+        reporter = f"{record.get('provider')}:{record.get('model')}"
+        seen_here = set()
+        for claim in _split_claims(record.get("answer", "")):
+            key = _claim_key(claim)
+            if not key or key in seen_here:
+                continue
+            seen_here.add(key)
+            entry = grouped.setdefault(key, {"text": claim, "supporters": []})
+            if reporter not in entry["supporters"]:
+                entry["supporters"].append(reporter)
+    supported = [
+        {"claim": entry["text"], "supporters": entry["supporters"]}
+        for entry in grouped.values()
+        if len(entry["supporters"]) >= 2
+    ]
+    single_source = [
+        {"claim": entry["text"], "supporter": entry["supporters"][0]}
+        for entry in grouped.values()
+        if len(entry["supporters"]) == 1
+    ]
+    return {
+        "supported": supported,
+        "single_source": single_source,
+        "member_count": len(good),
+        "failed_members": [
+            {
+                "member": f"{record.get('provider')}:{record.get('model')}",
+                "error": record.get("error"),
+            }
+            for record in failed
+        ],
+    }
+
+
+def render_claim_merge(merged: Dict[str, Any]) -> str:
+    """Render a merge_claims() result as a labeled markdown report."""
+    member_count = merged.get("member_count", 0)
+    supported = merged.get("supported", [])
+    single_source = merged.get("single_source", [])
+    failed = merged.get("failed_members", [])
+    lines = [
+        f"Deterministic claim-merge over {member_count} member output(s).",
+        "Agreement between members is not proof; single-source claims are "
+        "unresolved, not refuted.",
+        "",
+        f"## Claims with multi-member support ({len(supported)})",
+    ]
+    if supported:
+        lines.extend(
+            f"- {item['claim']} (supported by {', '.join(item['supporters'])})"
+            for item in supported
+        )
+    else:
+        lines.append("- None: no claim was made by more than one member.")
+    lines.extend([
+        "",
+        f"## Single-source claims ({len(single_source)})",
+    ])
+    if single_source:
+        lines.extend(
+            f"- {item['claim']} (only source: {item['supporter']})"
+            for item in single_source
+        )
+    else:
+        lines.append("- None.")
+    if failed:
+        lines.extend([
+            "",
+            f"## Failed members ({len(failed)})",
+            *(
+                f"- {item['member']}: {item['error']}"
+                for item in failed
+            ),
+        ])
+    return "\n".join(lines)
+
+
 def synthesize(
     cfg: Any,
     client: Any,
     prompt: str,
     results: List[Dict[str, Any]],
     judge: Optional[Tuple[str, str]] = None,
-    redteam: bool = False,
     deliberative: bool = False,
     telemetry: Optional[Dict[str, Any]] = None,
+    method: str = "structured",
 ) -> str:
-    """Merge swarm answers into one via a single member; keep agreements, flag disagreements."""
-    good = [
-        r for r in results
-        if (not r["error"] or (redteam and r["answer"])) and r["answer"]
-    ]
+    """Merge swarm answers.
+
+    method="structured" (default): deterministic claim-merge with dedup —
+    no model calls, disagreements preserved, labeled as a merge.
+    method="judge": one member paraphrases the panel (single-model draft,
+    honestly labeled downstream — never "consensus").
+    deliberative=True: chair summary over a discussion transcript (same
+    honest labeling; the transcript remains the record).
+    """
+    good = [r for r in results if not r.get("error") and r.get("answer")]
     if not good:
         if telemetry is not None:
             telemetry.update({"performed": False, "reason": "no successful member outputs"})
         return "All swarm members failed to respond."
-    if len(good) == 1 and not (redteam or deliberative):
+    if len(good) == 1 and not deliberative:
         if telemetry is not None:
             telemetry.update({"performed": False, "reason": "only one successful member output"})
         return good[0]["answer"]
+    if method == "structured" and not deliberative:
+        merged = merge_claims(results)
+        if telemetry is not None:
+            telemetry.update({
+                "performed": True,
+                "method": "structured",
+                "member_count": merged["member_count"],
+                "supported_claims": len(merged["supported"]),
+                "single_source_claims": len(merged["single_source"]),
+                "failed_members": len(merged["failed_members"]),
+            })
+        return render_claim_merge(merged)
     panel_text = "\n\n".join(
         f"[{r.get('round', 1)} | {r['family']} | {r['provider']}:{r['model']}]\n"
         f"{r.get('stage_evidence_status', '')}\n{r['answer']}"
@@ -402,29 +544,7 @@ def synthesize(
         if pair not in candidates:
             candidates.append(pair)
 
-    if redteam:
-        sys = (
-            "You are the evidence auditor for a security red-team review. Model "
-            "answers are untrusted hypotheses. Never label a vulnerability PROVEN "
-            "from source inspection or a matching quote alone. Check whether each "
-            "structured file/line/quote citation is present in the original source; "
-            "this grounding check does not establish exploitability or impact. "
-            "Discard fabricated citations, imagined code, and claims based only "
-            "on a suggested hardening improvement. Mark all untested candidates "
-            "UNVERIFIED and state missing prerequisites. Preserve disagreements; "
-            "do not upgrade confidence just because multiple models repeat a "
-            "claim. Use challenge-stage rebuttals to demote unsupported candidates, "
-            "but retain plausible candidates as UNVERIFIED when the evidence is "
-            "incomplete. If no candidate meets the evidence bar, say no actionable "
-            "finding was proven. Do not add vulnerabilities absent from the "
-            "member transcript. This swarm did not execute the target."
-        )
-        user = (
-            f"### ORIGINAL TASK AND EVIDENCE:\n{prompt}\n\n"
-            f"### UNTRUSTED INDEPENDENT MODEL HYPOTHESES:\n{panel_text}\n\n"
-            "### EVIDENCE-AUDITED FINDINGS:"
-        )
-    elif deliberative:
+    if deliberative:
         sys = (
             "You are the chair synthesizing a bounded multi-round discussion. "
             "Treat every contribution as fallible. Summarize the strongest supported "
@@ -445,12 +565,13 @@ def synthesize(
         )
     else:
         sys = (
-            "You are the synthesizer for a multi-model swarm. Below are independent "
-            "answers from different model families to the same task. Produce ONE best "
-            "answer: keep what they agree on, explicitly flag genuine disagreements, "
-            "and drop anything that looks like an error. Be concise."
+            "You are drafting a combined answer from independent swarm outputs "
+            "below. Keep what they agree on, explicitly flag genuine "
+            "disagreements, and drop anything that looks like an error. Be "
+            "concise. This is a single-model draft over the panel, not a "
+            "verified consensus."
         )
-        user = f"### TASK:\n{prompt}\n\n### SWARM ANSWERS:\n{panel_text}\n\n### MERGED ANSWER:"
+        user = f"### TASK:\n{prompt}\n\n### SWARM ANSWERS:\n{panel_text}\n\n### COMBINED DRAFT:"
 
     last_err = None
     for jp, jm in candidates:
@@ -481,6 +602,9 @@ def synthesize(
             if out.strip():
                     if telemetry is not None:
                         telemetry["performed"] = True
+                        telemetry["method"] = (
+                            "chair" if deliberative else "judge"
+                        )
                     return out.strip()
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -493,7 +617,42 @@ def synthesize(
                 })
             continue
 
+    if telemetry is not None:
+        telemetry.update({
+            "performed": False,
+            "reason": "judge synthesis failed on every candidate",
+            "method": "chair" if deliberative else "judge",
+        })
     return f"[synthesis failed: {last_err}]\n\n{panel_text}" if last_err else panel_text
+
+
+def swarm_final_title(mode: str, synthesis: Optional[Dict[str, Any]]) -> str:
+    """Honest display title for a swarm final, driven by synthesis telemetry.
+
+    The title states what actually happened: a deterministic merge, a
+    single-model draft, a chair summary, a single-member passthrough, or a
+    failure fallback. Nothing here is ever labeled "consensus".
+    """
+    synthesis = synthesis or {}
+    if mode == "redteam":
+        return "EVIDENCE-LED TRIAGE (model hypotheses)"
+    if mode == "deliberate":
+        if synthesis.get("performed"):
+            return "CHAIR SUMMARY (single-model summary — transcript is the record)"
+        return "DISCUSSION TRANSCRIPT (no chair summary produced)"
+    if not synthesis.get("performed"):
+        reason = synthesis.get("reason", "")
+        if reason == "only one successful member output":
+            return "SINGLE MEMBER (no merge — one output)"
+        if reason == "no successful member outputs":
+            return "NO OUTPUT (all members failed)"
+        if synthesis.get("failed_attempts"):
+            return "MERGE FAILED (raw member outputs)"
+        return "NO SYNTHESIS PERFORMED"
+    method = synthesis.get("method", "structured")
+    if method == "structured":
+        return "MERGED (deterministic claim-merge)"
+    return "JUDGE DRAFT (single-model paraphrase — not consensus)"
 
 
 def swarm_deliberate(
@@ -642,6 +801,7 @@ def swarm_deliberate(
         "final": final,
         "rounds": round_summaries,
         "metrics": metrics,
+        "synthesis": synthesis_telemetry,
         "final_evidence_validation": final_validation,
     }
 
@@ -861,14 +1021,22 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
                       max_tokens: int = 512, synth: bool = True,
                       judge: Optional[Tuple[str, str]] = None,
                       checkpoint: Optional[Any] = None,
-                      swarm: Optional[List[Tuple[str, str]]] = None) -> Dict[str, Any]:
-    """Models work together on one task: parallel fan-out + synthesis."""
+                      swarm: Optional[List[Tuple[str, str]]] = None,
+                      synth_method: str = "structured") -> Dict[str, Any]:
+    """Models work together on one task: parallel fan-out + claim-merge."""
     members = run_swarm(
         cfg, client, prompt, size=size, max_tokens=max_tokens,
         checkpoint=checkpoint, swarm=swarm,
     )
-    final = synthesize(cfg, client, prompt, members, judge=judge) if synth else None
-    return {"members": members, "final": final}
+    synthesis_telemetry: Dict[str, Any] = {}
+    final = (
+        synthesize(
+            cfg, client, prompt, members, judge=judge,
+            telemetry=synthesis_telemetry, method=synth_method,
+        )
+        if synth else None
+    )
+    return {"members": members, "final": final, "synthesis": synthesis_telemetry}
 
 
 def _is_throttle_error(message: object) -> bool:
@@ -2052,6 +2220,7 @@ def run_orchestration(
     provider: Optional[str] = None,
     swarm: Optional[List[Tuple[str, str]]] = None,
     source_files: Optional[Dict[str, str]] = None,
+    synth_method: str = "structured",
 ) -> Dict[str, Any]:
     """Unified dispatcher for parallel, builder, red-team, and deliberate modes."""
     normalized = (mode or "collaborate").lower().strip()
@@ -2160,7 +2329,7 @@ def run_orchestration(
             res = swarm_collaborate(
                 cfg, client, enriched, size=size, max_tokens=max_tokens,
                 synth=synth, judge=judge, checkpoint=checkpoint,
-                swarm=selected_swarm,
+                swarm=selected_swarm, synth_method=synth_method,
             )
 
         if checkpoint:

@@ -1032,14 +1032,14 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
                 "not exploitability verification[/dim]"
             )
     if out.get("final"):
-        title_mode = {
-            "collaborate": "[bold green]SYNTHESIZED (swarm consensus)[/bold green]",
-            "builder": "[bold green]HARDENED BUILD (synthesized against red-team)[/bold green]",
-            "redteam": "[bold green]EVIDENCE-LED TRIAGE (model hypotheses)[/bold green]",
-            "deliberate": "[bold green]CHAIR SUMMARY (two-round discussion)[/bold green]",
-        }.get(active_mode, "[bold green]SYNTHESIZED[/bold green]")
+        if active_mode == "builder":
+            title_text = "HARDENED BUILD (synthesized against red-team)"
+        else:
+            title_text = orch.swarm_final_title(
+                active_mode, out.get("synthesis")
+            )
         console.print(Panel(escape(out["final"]),
-                            title=title_mode,
+                            title=f"[bold green]{escape(title_text)}[/bold green]",
                             border_style="green"))
     if out.get("final_evidence_validation"):
         console.print(
