@@ -7,7 +7,6 @@ engines conflict, the most specific covering engine decides. Original code.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
@@ -259,91 +258,3 @@ def build_case_file(
         "facts": [_fact_dict(f, sources) for f in global_verdict.facts],
         "precedents": list(precedents),
     }
-
-
-# ---------------------------------------------------------------------------
-# Category-indicator plausibility screen.
-#
-# Closes the NOT_COVERED echo chamber: when no engine covers a candidate's
-# category, an UPHOLD would otherwise sail through with zero deterministic
-# facts to rule on. This screen is the backstop — it checks the cited lines
-# for any construct that could even belong to the claimed category. An
-# "authentication" finding on a bare `def` line, or a "SQL injection" finding
-# where no database construct appears, is NOT_SUPPORTED: there is nothing at
-# the cited location that could be this vulnerability class. A claim WITH
-# indicators but no covering engine stays NOT_COVERED (honest uncertainty —
-# the judge decides).
-# ---------------------------------------------------------------------------
-
-CATEGORY_INDICATORS: Dict[str, Tuple[str, ...]] = {
-    "sql_injection": (
-        r"(?i)\bexecute\b", r"(?i)\bquery\b", r"\.raw\s*\(",
-        r"(?i)\bSELECT\b", r"(?i)\bINSERT\b", r"(?i)\bcursor\b",
-    ),
-    "command_injection": (
-        r"(?i)\bos\.system\b", r"(?i)\bpopen\b", r"(?i)subprocess",
-        r"(?i)shell\s*=\s*True", r"(?i)\beval\s*\(", r"(?i)\bexec\s*\(",
-    ),
-    "path_traversal": (
-        r"(?i)\bopen\s*\(", r"(?i)os\.path", r"(?i)expanduser",
-        r"(?i)read_text", r"(?i)write_text", r"(?i)\bPath\s*\(",
-    ),
-    "unsafe_deserialization": (
-        r"(?i)pickle", r"(?i)yaml\.load", r"(?i)jsonpickle",
-        r"(?i)marshal\.loads?", r"(?i)\.loads\s*\(",
-    ),
-    "authentication_authorization": (
-        r"(?i)\brequest\b", r"(?i)\bsession\b", r"(?i)current_user",
-        r"(?i)@\w*(route|app|blueprint)", r"(?i)\blogin\b", r"(?i)\bauth\b",
-        r"(?i)\btoken\b", r"(?i)\badmin\b", r"(?i)\brole\b",
-        r"(?i)\bpermission\b",
-    ),
-    "sensitive_data_exposure": (
-        r"(?i)\bpassword\b", r"(?i)\bsecret\b", r"(?i)token",
-        r"(?i)api[_-]?key", r"(?i)\bssn\b", r"(?i)\bcredential\b",
-        r"(?i)\bprivate\b", r"(?i)\blog\b", r"(?i)\bprint\s*\(",
-        r"(?i)environ",
-    ),
-}
-
-
-def location_plausibility_fact(
-    candidate: Mapping,
-    sources: Mapping[str, str],
-) -> Optional[EngineFact]:
-    """Return a NOT-supporting fact when the cited location has no indicator
-    constructs for the candidate's category; None when plausible or unknown
-    category (caller decides how to use it)."""
-    from omnicli.engines import EngineFact  # local import: keeps module importable standalone
-
-    category = str(candidate.get("category", "")).strip().lower()
-    indicators = CATEGORY_INDICATORS.get(category)
-    if not indicators:
-        return None
-    path = str(candidate.get("file", "")).replace("\\", "/").strip()
-    source = None
-    for key, text in (sources or {}).items():
-        if str(key).replace("\\", "/").strip() == path and isinstance(text, str):
-            source = text
-            break
-    if source is None:
-        return None
-    try:
-        start = int(candidate.get("start_line", 1)) - 1
-    except (TypeError, ValueError):
-        start = 0
-    window = "\n".join(source.splitlines()[max(0, start - 2):start + 3])
-    if any(re.search(pattern, window) for pattern in indicators):
-        return None
-    return EngineFact(
-        id="no_category_indicators",
-        kind="absence",
-        claim=(
-            f"No {category} indicator constructs matched in the cited line "
-            "window; the deterministic pattern check offers no opinion on "
-            "this location."
-        ),
-        line=start + 1,
-        code="",
-        supports_finding=False,
-    )

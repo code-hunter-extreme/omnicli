@@ -8,7 +8,6 @@ from omnicli.engines import ENGINE_REGISTRY
 from omnicli.engines.global_engine import (
     aggregate as aggregate_engine_votes,
     build_case_file,
-    location_plausibility_fact,
 )
 from omnicli.evidence import anchor_auth_candidate_to_mutation
 from omnicli.redteam import (
@@ -130,10 +129,6 @@ def run_candidate_judge_graph(
             global_verdict = aggregate_engine_votes(
                 candidate, votes, specificities
             )
-            if global_verdict.verdict == "not_covered":
-                plausibility = location_plausibility_fact(candidate, sources)
-                if plausibility is not None:
-                    global_verdict.facts.append(plausibility)
             entry: Dict[str, Any] = {
                 "candidate": candidate,
                 "reported_by": "existing scenario/adaptive/challenge pipeline",

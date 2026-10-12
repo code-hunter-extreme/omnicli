@@ -39,11 +39,27 @@ FINDING_CATEGORIES: Tuple[str, ...] = (
     "sensitive_data_exposure",
 )
 
-# Categories the deterministic analyzer (omnicli.evidence /
-# omnicli.evaluation._deterministic_findings) can independently check. A judge
+# Categories the deterministic engines claim to check, derived from the
+# registered engines' own covered_categories — never asserted here. A judge
 # can cross-check model findings in these categories against deterministic
-# facts; other categories are "not_covered".
-DETERMINISTIC_COVERED_CATEGORIES = frozenset(FINDING_CATEGORIES)
+# facts; other categories are "not_covered". Per-finding coverage is still
+# conditional: authentication_authorization and sensitive_data_exposure are
+# route-shaped analyses, so a file without routes yields "not_covered" for
+# those categories (see deterministic_cross_check), not "not_supported".
+def engine_covered_categories() -> frozenset:
+    """Union of covered_categories across registered deterministic engines.
+
+    Derived from ENGINE_REGISTRY at call time so adding, removing, or
+    reconfiguring an engine updates cross-check coverage everywhere
+    automatically. Import is lazy: engines pull in evidence analysis,
+    which must not load merely for taxonomy constants.
+    """
+    from omnicli.engines import ENGINE_REGISTRY
+
+    covered = set()
+    for engine in ENGINE_REGISTRY.values():
+        covered.update(getattr(engine, "covered_categories", ()) or ())
+    return frozenset(covered)
 
 # ---------------------------------------------------------------------------
 # 2. Vulnerability x attack coverage matrix (declarative, not hardcoded pairs).
@@ -493,7 +509,7 @@ def deterministic_cross_check(
     'not_covered' -- no deterministic analyzer exists for this category.
     """
     category = str(finding.get("category", "")).strip().lower()
-    if category not in DETERMINISTIC_COVERED_CATEGORIES:
+    if category not in engine_covered_categories():
         return {
             "signal": "not_covered",
             "reason": f"No deterministic analyzer covers category {category!r}.",

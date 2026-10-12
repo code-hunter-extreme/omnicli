@@ -1,7 +1,7 @@
 """Tests for the deterministic engine architecture (rowan/redteam-hardening).
 
 Covers: engine registry, python_general votes, python_web votes, global
-aggregation (specificity wins), category-indicator plausibility, adjudication
+aggregation (specificity wins), registry-derived coverage, adjudication
 memory (scopes + auto-kill), case-file judgment validation, FACT-line parsing,
 and heartbeat engine health.
 """
@@ -20,9 +20,8 @@ from omnicli.engines.adjudications import AdjudicationStore, pattern_signature
 from omnicli.engines.global_engine import (
     aggregate,
     build_case_file,
-    location_plausibility_fact,
 )
-from omnicli.redteam import parse_judgment
+from omnicli.redteam import engine_covered_categories, parse_judgment
 
 
 def _cand(cid="c1", category="sql_injection", file="app.py", line=2, quote="x"):
@@ -268,25 +267,41 @@ class TestAggregation(unittest.TestCase):
         self.assertIn("engine", cf["facts"][0])
 
 
-class TestPlausibility(unittest.TestCase):
-    def test_bare_def_line_implausible_for_auth(self):
-        src = {"m.py": "def helper(x):\n    return x + 1\n"}
-        cand = _cand(category="authentication_authorization", file="m.py", line=1,
-                     quote="def helper(x):")
-        fact = location_plausibility_fact(cand, src)
-        self.assertIsNotNone(fact)
-        self.assertEqual(fact.id, "no_category_indicators")
-        self.assertFalse(fact.supports_finding)
+class TestEngineCoveredCategories(unittest.TestCase):
+    def test_coverage_derived_from_registry(self):
+        from omnicli.engines import ENGINE_REGISTRY
+        expected = set()
+        for engine in ENGINE_REGISTRY.values():
+            expected.update(engine.covered_categories)
+        self.assertEqual(set(engine_covered_categories()), expected)
+        self.assertTrue(expected, "no engine declares coverage")
 
-    def test_request_handler_plausible_for_auth(self):
-        src = {"m.py": "def delete():\n    uid = request.form['id']\n    remove(uid)\n"}
-        cand = _cand(category="authentication_authorization", file="m.py", line=1,
-                     quote="def delete():")
-        self.assertIsNone(location_plausibility_fact(cand, src))
+    def test_registry_change_updates_coverage(self):
+        from omnicli.engines import Engine, ENGINE_REGISTRY
 
-    def test_unknown_category_none(self):
-        cand = _cand(category="weird_new_thing")
-        self.assertIsNone(location_plausibility_fact(cand, {"m.py": "x = 1"}))
+        class ProbeEngine(Engine):
+            name = "probe_test_engine"
+            covered_categories = ("probe_category",)
+
+        before = set(engine_covered_categories())
+        self.assertNotIn("probe_category", before)
+        ENGINE_REGISTRY["probe_test_engine"] = ProbeEngine()
+        try:
+            self.assertIn("probe_category", set(engine_covered_categories()))
+        finally:
+            del ENGINE_REGISTRY["probe_test_engine"]
+        self.assertEqual(set(engine_covered_categories()), before)
+
+    def test_flip_inert_backstop_removed(self):
+        import omnicli.engines.global_engine as global_engine
+        import omnicli.judge_pipeline as judge_pipeline_module
+        import inspect
+        self.assertFalse(hasattr(global_engine, "location_plausibility_fact"))
+        self.assertFalse(hasattr(global_engine, "CATEGORY_INDICATORS"))
+        self.assertNotIn(
+            "location_plausibility_fact",
+            inspect.getsource(judge_pipeline_module),
+        )
 
 
 class TestAdjudications(unittest.TestCase):
