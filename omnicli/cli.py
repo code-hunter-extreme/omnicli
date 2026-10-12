@@ -230,10 +230,9 @@ def run_one_shot(
 @click.option("-m", "--model", help="Model name")
 @click.option("-s", "--system", help="System prompt")
 @click.option("-t", "--temperature", type=float, default=0.7, help="Temperature")
-@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam", "single"]), default="collaborate",
-              help="Council mode: collaborate (all models), builder (architects+redteam), redteam (adversarial), or single")
+@click.option("--mode", type=click.Choice(["collaborate", "redteam", "single"]), default="collaborate",
+              help="Council mode: collaborate (all models), redteam (adversarial), or single")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Set mode to collaborate")
-@click.option("--builder", "flag_builder", is_flag=True, default=False, help="Set mode to builder")
 @click.option("--redteam", is_flag=True, default=False,
               help="Adversarial security-analyst persona (no tools; proof-demanding)")
 @click.option("--single", "flag_single", is_flag=True, default=False, help="Set mode to single-model chat")
@@ -241,7 +240,7 @@ def run_one_shot(
 @click.option("--rotate-families", is_flag=True, default=False,
               help="Switch model family each turn from the scanned roster")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
-             temperature: float, mode: str, flag_collaborate: bool, flag_builder: bool,
+             temperature: float, mode: str, flag_collaborate: bool,
              redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool) -> None:
     """Start an interactive chat session with multi-model orchestration."""
     active_mode = mode
@@ -249,8 +248,6 @@ def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str
         active_mode = "single"
     elif redteam:
         active_mode = "redteam"
-    elif flag_builder:
-        active_mode = "builder"
     elif flag_collaborate:
         active_mode = "collaborate"
 
@@ -941,10 +938,9 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 
 @main.command("swarm")
 @click.option("-n", "--size", type=int, default=None, help="Number of swarm members (default: all active providers)")
-@click.option("--mode", type=click.Choice(["collaborate", "builder", "redteam", "deliberate"]), default="collaborate",
-              help="Mode: parallel synthesis, builder, redteam, or two-round deliberate discussion")
+@click.option("--mode", type=click.Choice(["collaborate", "redteam", "deliberate"]), default="collaborate",
+              help="Mode: parallel claim-merge, redteam, or two-round deliberate discussion")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Run collaborative swarm")
-@click.option("--builder", "flag_builder", is_flag=True, default=False, help="Run builder swarm (architects vs redteam)")
 @click.option("--redteam", is_flag=True, default=False,
               help="Multi-model adversarial red-team review (different families together)")
 @click.option("--raw", is_flag=True, default=False, help="Show each member's answer, skip synthesis")
@@ -955,7 +951,7 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               type=click.Path(exists=True, dir_okay=False),
               help="Supply source for exact quote/line grounding; repeat as needed")
 @click.argument("prompt", nargs=-1, required=True)
-def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_builder: bool,
+def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
               redteam: bool, raw: bool, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               prompt: tuple) -> None:
@@ -984,7 +980,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
         return
 
-    active_mode = "redteam" if redteam else ("builder" if flag_builder else ("collaborate" if flag_collaborate else mode))
+    active_mode = "redteam" if redteam else ("collaborate" if flag_collaborate else mode)
     if checkpoint and active_mode == "deliberate":
         raise click.UsageError("--checkpoint is not supported with --mode deliberate yet")
     if resume and not checkpoint:
@@ -1032,12 +1028,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool, flag_build
                 "not exploitability verification[/dim]"
             )
     if out.get("final"):
-        if active_mode == "builder":
-            title_text = "HARDENED BUILD (synthesized against red-team)"
-        else:
-            title_text = orch.swarm_final_title(
-                active_mode, out.get("synthesis")
-            )
+        title_text = orch.swarm_final_title(active_mode, out.get("synthesis"))
         console.print(Panel(escape(out["final"]),
                             title=f"[bold green]{escape(title_text)}[/bold green]",
                             border_style="green"))

@@ -54,9 +54,8 @@ class SlashCommandCompleter(Completer):
         self.cfg = config_manager
         self.client = client
         self.commands = [
-            ("/mode", "Switch mode: collaborate, builder, redteam, single"),
+            ("/mode", "Switch mode: collaborate, redteam, single"),
             ("/collaborate", "Collaborative council mode (all models reason together)"),
-            ("/builder", "Builder mode (constructive builders + redteam stress-test)"),
             ("/redteam", "Adversarial red-team council mode"),
             ("/single", "Single-model direct chat mode"),
             ("/size", "Set council size for swarm orchestration"),
@@ -93,7 +92,7 @@ class SlashCommandCompleter(Completer):
         arg = words[1] if len(words) > 1 else ""
 
         if cmd == "/mode":
-            for m in ("collaborate", "builder", "redteam", "single"):
+            for m in ("collaborate", "redteam", "single"):
                 if m.startswith(arg.lower()):
                     yield Completion(m, start_position=-len(arg), display_meta=f"Set mode: {m}")
 
@@ -169,7 +168,6 @@ class ChatSession:
         grid.add_row(f"[bold green]Lead Provider:[/bold green] {self.provider}  |  [bold green]Model:[/bold green] {self.model}  |  [bold green]Temp:[/bold green] {self.temperature}")
         mode_style = {
             "collaborate": "[bold cyan]COLLABORATE (Multi-Model Council)[/bold cyan]",
-            "builder": "[bold yellow]BUILDER (Architects + Red-Team Stress-Test)[/bold yellow]",
             "redteam": "[bold red]RED-TEAM (Adversarial Audit)[/bold red]",
             "single": "[dim]SINGLE-MODEL (Direct Chat)[/dim]",
         }.get(self.mode, f"[bold cyan]{self.mode.upper()}[/bold cyan]")
@@ -187,7 +185,7 @@ class ChatSession:
             mcount = 0
         if mcount:
             grid.add_row(f"[bold green]Memory:[/bold green] {mcount} file(s) for {self.provider}")
-        grid.add_row("[dim]Type /mode, /collaborate, /builder, /redteam, /single to switch modes. Type /help for all commands.[/dim]\n")
+        grid.add_row("[dim]Type /mode, /collaborate, /redteam, /single to switch modes. Type /help for all commands.[/dim]\n")
         self.console.print(Panel(grid, border_style="cyan", padding=(0, 1)))
 
     def show_help(self) -> None:
@@ -195,9 +193,8 @@ class ChatSession:
         table.add_column("Command", style="bold green", width=24)
         table.add_column("Description", style="white")
 
-        table.add_row("/mode [mode]", "Switch mode (collaborate, builder, redteam, single)")
+        table.add_row("/mode [mode]", "Switch mode (collaborate, redteam, single)")
         table.add_row("/collaborate, /c", "Collaborative council (all models reason together)")
-        table.add_row("/builder, /b", "Builder mode (constructive builders + red-team attack)")
         table.add_row("/redteam, /rt", "Adversarial red-team council (vulnerability focus)")
         table.add_row("/single", "Direct 1-on-1 single-model chat")
         table.add_row("/size <1-10>", "Set council size for swarm orchestration")
@@ -307,22 +304,21 @@ class ChatSession:
 
         elif cmd in ("/mode",):
             if not arg:
-                self.console.print(f"Current mode: [bold cyan]{self.mode}[/bold cyan] (options: collaborate, builder, redteam, single)")
+                self.console.print(f"Current mode: [bold cyan]{self.mode}[/bold cyan] (options: collaborate, redteam, single)")
             else:
                 m = arg.lower()
-                if m in ("collaborate", "builder", "redteam", "single"):
+                if m in ("collaborate", "redteam", "single"):
                     self.mode = m
                     self.console.print(f"[bold green]Mode switched to:[/bold green] [bold cyan]{self.mode}[/bold cyan]")
                 else:
-                    self.console.print(f"[red]Unknown mode '{arg}'. Choose from: collaborate, builder, redteam, single[/red]")
+                    self.console.print(f"[red]Unknown mode '{arg}'. Choose from: collaborate, redteam, single[/red]")
 
         elif cmd in ("/collaborate", "/collab", "/c"):
             self.mode = "collaborate"
             self.console.print("[bold green]Mode switched to:[/bold green] [bold cyan]collaborate[/bold cyan] (all models reason together)")
 
         elif cmd in ("/builder", "/build", "/b"):
-            self.mode = "builder"
-            self.console.print("[bold green]Mode switched to:[/bold green] [bold yellow]builder[/bold yellow] (constructive builders + red-team attack)")
+            self.console.print("[red]Builder mode was removed: it never built or tested anything. Use collaborate, redteam, or single.[/red]")
 
         elif cmd in ("/redteam", "/rt"):
             self.mode = "redteam"
@@ -571,7 +567,7 @@ class ChatSession:
             )
         self.messages.append({"role": "user", "content": orchestration_prompt})
 
-        if self.mode in ("collaborate", "builder", "redteam"):
+        if self.mode in ("collaborate", "redteam"):
             from omnicli.orchestrate import run_orchestration
             from rich.markup import escape
             if self.mode == "redteam" and source_files:
@@ -625,9 +621,7 @@ class ChatSession:
             # Display final merged answer
             final_ans = out.get("final") or "All swarm members failed to respond."
             from omnicli.orchestrate import swarm_final_title
-            if self.mode == "builder":
-                title_text = "HARDENED BUILD (Builders Fortified Against Red-Team)"
-            elif self.mode == "redteam":
+            if self.mode == "redteam":
                 title_text = (
                     "EVIDENCE-LED RED-TEAM TRIAGE (NOT A SECURITY VERDICT)"
                 )

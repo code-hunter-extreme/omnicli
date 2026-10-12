@@ -950,7 +950,6 @@ class TestCliModeWiring(unittest.TestCase):
         from omnicli.cli import ChatSession
         cases = [
             (["--mode", "collaborate"], "collaborate", False),
-            (["--mode", "builder"], "builder", False),
             (["--mode", "redteam"], "redteam", False),
             (["--single"], "single", False),
             (["--redteam"], "redteam", True),
@@ -970,9 +969,9 @@ class TestCliModeWiring(unittest.TestCase):
         from omnicli.orchestrate import run_orchestration
         cases = [
             (["--mode", "collaborate"], "collaborate"),
-            (["--builder"], "builder"),
+            (["--mode", "deliberate"], "deliberate"),
             (["--redteam"], "redteam"),
-            (["--builder", "--redteam"], "redteam"),
+            (["--collaborate", "--redteam"], "redteam"),
         ]
         for options, expected_mode in cases:
             with self.subTest(options=options), \
@@ -4768,15 +4767,16 @@ class TestSwarm(unittest.TestCase):
                         validation["recovery"]["error"], "retry unavailable"
                     )
 
-    def test_builder_swarm_alternates_roles(self):
-        from omnicli.orchestrate import swarm_builder
-        rec = []
-        out = swarm_builder(self._cfg(), self.FakeClient(record=rec), "build X", size=4, synth=False)
-        roles = [r["role"] for r in out["members"]]
-        self.assertEqual(roles, ["BUILDER", "REDTEAM", "BUILDER", "REDTEAM"])
-        sys_msgs = [m["content"] for call in rec for m in call["messages"] if m["role"] == "system"]
-        self.assertTrue(any("builder" in s.lower() for s in sys_msgs))
-        self.assertTrue(any("breaker" in s.lower() or "red-team" in s.lower() for s in sys_msgs))
+    def test_builder_mode_is_cut_until_it_can_build_and_test(self):
+        import omnicli.orchestrate as orch
+        from omnicli.orchestrate import run_orchestration
+        self.assertFalse(hasattr(orch, "swarm_builder"))
+        for mode in ("builder", "build", "b"):
+            with self.assertRaisesRegex(ValueError, "removed"):
+                run_orchestration(
+                    mode, self._cfg(), self.FakeClient(), "task",
+                    size=2, synth=False,
+                )
 
     def test_run_orchestration_dispatcher(self):
         from omnicli.orchestrate import run_orchestration
@@ -4784,9 +4784,6 @@ class TestSwarm(unittest.TestCase):
         client = self.FakeClient()
         c = run_orchestration("collaborate", cfg, client, "task", size=2, synth=False)
         self.assertEqual(len(c["members"]), 2)
-        b = run_orchestration("builder", cfg, client, "task", size=2, synth=False)
-        self.assertEqual(len(b["members"]), 2)
-        self.assertIn("role", b["members"][0])
         r = run_orchestration(
             "redteam", cfg, client, "task", size=2, synth=False,
             source_files={"app.py": "safe()"},
@@ -4811,7 +4808,7 @@ class TestSwarm(unittest.TestCase):
             s.council_size = 3
 
             s.handle_slash_command("/builder")
-            self.assertEqual(s.mode, "builder")
+            self.assertEqual(s.mode, "collaborate")
 
             s.handle_slash_command("/redteam")
             self.assertEqual(s.mode, "redteam")

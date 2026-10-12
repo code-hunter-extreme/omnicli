@@ -806,21 +806,6 @@ def swarm_deliberate(
     }
 
 
-_SWARM_BUILDER_SYSTEM = (
-    "You are the BUILDER / ARCHITECT in a multi-model engineering council. "
-    "Your objective is to produce the cleanest, most robust, production-grade "
-    "design, code, and implementation for the task. Focus on modularity, correct "
-    "architecture, and concrete executable steps."
-)
-
-_SWARM_BREAKER_SYSTEM = (
-    "You are the RED-TEAM / BREAKER in a multi-model engineering council. "
-    "Your objective is to stress-test and attack the proposed solutions for this task. "
-    "Identify edge cases, security vulnerabilities, race conditions, scaling bottlenecks, "
-    "and invalid assumptions. Be specific and rigorous."
-)
-
-
 def enrich_prompt_with_files(prompt: str) -> str:
     """Detect references to local files, folders, or projects in prompt and attach context."""
     import re
@@ -2144,68 +2129,6 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     }
 
 
-def swarm_builder(
-    cfg: Any,
-    client: Any,
-    prompt: str,
-    size: Optional[int] = None,
-    max_tokens: int = 512,
-    synth: bool = True,
-    judge: Optional[Tuple[str, str]] = None,
-    checkpoint: Optional[Any] = None,
-    swarm: Optional[List[Tuple[str, str]]] = None,
-) -> Dict[str, Any]:
-    """Builder mode: builders propose solutions while red-teamers stress-test in parallel,
-    synthesized into a hardened, battle-tested solution."""
-    effective_size = 4 if size is None else max(2, size)
-    swarm = swarm if swarm is not None else build_swarm(cfg, size=effective_size)
-    if not swarm:
-        return {"members": [], "final": None}
-
-    saved = checkpoint.load_members() if checkpoint else {}
-    results: List[Dict[str, Any]] = [
-        saved[(p, m)]
-        for p, m in swarm
-        if (p, m) in saved and not saved[(p, m)].get("error")
-    ]
-    completed_pairs = {(r["provider"], r["model"]) for r in results}
-    with cf.ThreadPoolExecutor(max_workers=max(1, len(swarm))) as ex:
-        futs = {}
-        for i, (p, m) in enumerate(swarm):
-            if (p, m) in completed_pairs:
-                continue
-            role = "BUILDER" if (i % 2 == 0) else "REDTEAM"
-            sys_prompt = _SWARM_BUILDER_SYSTEM if role == "BUILDER" else _SWARM_BREAKER_SYSTEM
-            messages = [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": prompt},
-            ]
-            fut = ex.submit(_one_call, client, p, m, messages, max_tokens)
-            futs[fut] = (role, p, m)
-        for fut in cf.as_completed(futs):
-            role, p, m = futs[fut]
-            res = fut.result()
-            res["role"] = role
-            results.append(res)
-            if checkpoint:
-                checkpoint.save_member(res)
-
-    order = {(p, m): i for i, (p, m) in enumerate(swarm)}
-    results.sort(key=lambda r: order.get((r["provider"], r["model"]), 1_000_000))
-
-    final = None
-    if synth:
-        synth_prompt = (
-            f"You are the lead architect synthesizing a battle-hardened solution for:\n{prompt}\n\n"
-            "Below are independent proposals from BUILDER models and adversarial stress-tests from REDTEAM models.\n"
-            "Produce the final, hardened build: take the best architectural solutions from the Builders, "
-            "and directly fortify them against the vulnerabilities and failure modes identified by the Red Team. "
-            "Deliver the concrete, robust solution."
-        )
-        final = synthesize(cfg, client, synth_prompt, results, judge=judge)
-    return {"members": results, "final": final}
-
-
 def run_orchestration(
     mode: str,
     cfg: Any,
@@ -2222,8 +2145,20 @@ def run_orchestration(
     source_files: Optional[Dict[str, str]] = None,
     synth_method: str = "structured",
 ) -> Dict[str, Any]:
-    """Unified dispatcher for parallel, builder, red-team, and deliberate modes."""
+    """Unified dispatcher for collaborate, red-team, and deliberate modes.
+
+    Builder mode was cut: parity-assigned BUILDER/REDTEAM roles plus a judge
+    prompt proved nothing (no build step, no test step, no tool use). It
+    stays out until it can actually build and test. Requesting it raises
+    instead of silently running something else.
+    """
     normalized = (mode or "collaborate").lower().strip()
+    if normalized in ("builder", "build", "b"):
+        raise ValueError(
+            "Builder mode was removed: it assigned roles by index parity and "
+            "merged with a judge prompt without building or testing anything. "
+            "Use collaborate, redteam, or deliberate."
+        )
     is_redteam = normalized in ("redteam", "red", "rt")
     enriched = prompt if is_redteam else enrich_prompt_with_files(prompt)
     normalized_sources = {
@@ -2256,10 +2191,6 @@ def run_orchestration(
         )
     if swarm is not None:
         selected_swarm = list(swarm)
-    elif normalized in ("builder", "build", "b"):
-        selected_swarm = build_swarm(
-            cfg, size=4 if size is None else max(2, size), provider=provider
-        )
     else:
         selected_swarm = build_swarm(cfg, size=size, provider=provider)
     checkpoint = None
@@ -2307,13 +2238,7 @@ def run_orchestration(
         if checkpoint:
             checkpoint.record_event("collection_started", {"members": len(selected_swarm)})
 
-        if normalized in ("builder", "build", "b"):
-            res = swarm_builder(
-                cfg, client, enriched, size=size, max_tokens=max_tokens,
-                synth=synth, judge=judge, checkpoint=checkpoint,
-                swarm=selected_swarm,
-            )
-        elif normalized in ("redteam", "red", "rt"):
+        if normalized in ("redteam", "red", "rt"):
             res = swarm_redteam(
                 cfg, client, enriched, size=size, max_tokens=max_tokens,
                 synth=synth, judge=judge, checkpoint=checkpoint,
