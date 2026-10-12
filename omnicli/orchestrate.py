@@ -1157,10 +1157,11 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
                       synth_method: str = "structured",
                       member_tools: Optional[List[Dict[str, Any]]] = None,
                       tool_kwargs: Optional[Dict[str, Any]] = None,
-                      max_tool_turns: int = 3) -> Dict[str, Any]:
+                      max_tool_turns: int = 3,
+                      system: Optional[str] = None) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + claim-merge."""
     members = run_swarm(
-        cfg, client, prompt, size=size, max_tokens=max_tokens,
+        cfg, client, prompt, system=system, size=size, max_tokens=max_tokens,
         checkpoint=checkpoint, swarm=swarm, member_tools=member_tools,
         tool_kwargs=tool_kwargs, max_tool_turns=max_tool_turns,
     )
@@ -2300,6 +2301,7 @@ def run_orchestration(
     member_tools: Optional[List[Dict[str, Any]]] = None,
     tool_kwargs: Optional[Dict[str, Any]] = None,
     max_tool_turns: int = 3,
+    system: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2316,6 +2318,9 @@ def run_orchestration(
     runs a bounded agent tool-loop instead of a single call, with members
     still in parallel. Red-team/deliberate stages ignore this (tool-less
     by design).
+
+    system (collaborate only): system prompt delivered as a real system
+    role message to every member — never flattened into the user prompt.
     """
     normalized = (mode or "collaborate").lower().strip()
     if normalized in ("builder", "build", "b"):
@@ -2430,7 +2435,7 @@ def run_orchestration(
                 synth=synth, judge=judge, checkpoint=checkpoint,
                 swarm=selected_swarm, synth_method=synth_method,
                 member_tools=member_tools, tool_kwargs=tool_kwargs,
-                max_tool_turns=max_tool_turns,
+                max_tool_turns=max_tool_turns, system=system,
             )
 
         if checkpoint:

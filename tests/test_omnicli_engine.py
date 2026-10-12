@@ -5185,6 +5185,21 @@ class TestSwarm(unittest.TestCase):
         )
         self.assertIsNot(first, verification_toolset())
 
+    def test_collaborate_system_prompt_keeps_role_separation(self):
+        from omnicli.orchestrate import run_orchestration
+        client = self.FakeClient(record=[])
+        run_orchestration(
+            "collaborate", self._cfg(), client, "user task",
+            size=2, synth=False, system="SYSTEM PROMPT",
+        )
+        self.assertEqual(len(client.record), 2)
+        for call in client.record:
+            messages = call["messages"]
+            self.assertEqual(messages[0]["role"], "system")
+            self.assertEqual(messages[0]["content"], "SYSTEM PROMPT")
+            self.assertEqual(messages[1]["role"], "user")
+            self.assertNotIn("SYSTEM PROMPT", messages[1]["content"])
+
     def test_groq_provider_configured(self):
         from omnicli.config import DEFAULT_PROVIDERS
         self.assertIn("groq", DEFAULT_PROVIDERS)
