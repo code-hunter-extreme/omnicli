@@ -9,6 +9,12 @@ Modes:
   - collaborate: fan out a task, then synthesize one merged answer.
   - redteam:     fan out an adversarial review across families, then consolidate
                  the findings (multi-model red-team, not one model).
+
+Tooled members: run_swarm(..., member_tools=[...]) runs each member as a
+bounded agent tool-loop (same transport + tool dispatch as the sequential
+agent) while members run in parallel — fan-out WITH tool verification.
+Red-team and deliberate stages stay tool-less by design (structured prompts
+with deterministic grounding instead); only collaborate wires member tools.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from omnicli.agent import call_model_with_tools
 from omnicli.evidence import (
     assess_evidence_gate,
     analyze_python_security_facts,
@@ -31,6 +38,7 @@ from omnicli.evidence import (
 )
 from omnicli.judge_pipeline import run_candidate_judge_graph
 from omnicli.scanner import classify_family
+from omnicli.tools import execute_tool_call
 
 # Adversarial persona for a swarm member. Members have no tools, so (unlike the
 # agent's tool-driven red-team prompt) this demands reasoned, proof-oriented
@@ -303,6 +311,91 @@ def _one_call(client: Any, provider: str, model: str,
                 "usage": None, "reported_cost_usd": None}
 
 
+def _agent_member_call(
+    client: Any,
+    provider: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    tools: List[Dict[str, Any]],
+    tool_kwargs: Dict[str, Any],
+    max_tool_turns: int = 3,
+) -> Dict[str, Any]:
+    """One swarm member as a bounded agent tool-loop. Errors are captured, never raised.
+
+    Same model transport (call_model_with_tools) and tool dispatch
+    (execute_tool_call) as the sequential agent loop; the member runs up to
+    max_tool_turns model calls, executing tool calls between them. Called
+    once per member inside run_swarm's thread pool, so N members verify with
+    tools in parallel. The tools_used transcript records every executed
+    call (truncated outputs) for audit.
+    """
+    started = time.perf_counter()
+
+    def record(answer: str, error: Optional[str],
+               transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "provider": provider,
+            "model": model,
+            "family": classify_family(model),
+            "answer": answer,
+            "error": error,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "usage": None,
+            "reported_cost_usd": None,
+            "tools_used": transcript,
+        }
+
+    transcript: List[Dict[str, Any]] = []
+    convo: List[Dict[str, Any]] = [dict(message) for message in messages]
+    try:
+        for _ in range(max(1, max_tool_turns)):
+            data, err = call_model_with_tools(
+                client, provider, model, convo, tools
+            )
+            if err:
+                return record("", err[:160], transcript)
+            message = ((data or {}).get("choices") or [{}])[0].get("message", {}) or {}
+            tool_calls = message.get("tool_calls") or []
+            content = message.get("content") or ""
+            convo.append(message)
+            if not tool_calls:
+                if not content.strip():
+                    return record("", "Provider returned an empty response", transcript)
+                return record(content.strip(), None, transcript)
+            for call in tool_calls:
+                function = (call or {}).get("function", {}) or {}
+                name = function.get("name", "unknown")
+                raw_args = function.get("arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(args, dict):
+                        args = {}
+                except (TypeError, ValueError):
+                    args = {}
+                output = execute_tool_call(
+                    name, args, client_ref=client, **tool_kwargs
+                )
+                transcript.append({
+                    "tool": name,
+                    "arguments": args,
+                    "output": str(output)[:2000],
+                })
+                convo.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", f"call_{len(transcript)}"),
+                    "name": name,
+                    "content": output,
+                })
+        return record(
+            "Tool budget exhausted before a final answer.",
+            "tool_budget_exhausted",
+            transcript,
+        )
+    except Exception as e:  # noqa: BLE001
+        message = str(e).strip()
+        return record("", (message if message else type(e).__name__)[:160], transcript)
+
+
 def _format_source_line_map(sources: Dict[str, str]) -> str:
     """Render supplied source with stable line numbers for model citations."""
     sections = []
@@ -329,8 +422,19 @@ def run_swarm(
     size: Optional[int] = None,
     max_tokens: int = 512,
     checkpoint: Optional[Any] = None,
+    member_tools: Optional[List[Dict[str, Any]]] = None,
+    tool_kwargs: Optional[Dict[str, Any]] = None,
+    max_tool_turns: int = 3,
 ) -> List[Dict[str, Any]]:
-    """Fan a prompt out to the swarm IN PARALLEL; one record per member, in swarm order."""
+    """Fan a prompt out to the swarm IN PARALLEL; one record per member, in swarm order.
+
+    member_tools=None (default): one plain model call per member.
+    member_tools=[...]: each member runs a bounded agent tool-loop (up to
+    max_tool_turns model calls with tool execution between them) — the
+    agent loop routed through parallel fan-out. tool_kwargs forwards to
+    execute_tool_call (allow_shell/allow_local/allowed_hosts/
+    allow_mutating_http). Tooled records carry a tools_used transcript.
+    """
     swarm = swarm if swarm is not None else build_swarm(cfg, size=size)
     if not swarm:
         return []
@@ -350,9 +454,19 @@ def run_swarm(
     ]
     if not pending:
         return results
+    kwargs = dict(tool_kwargs or {})
+
+    def call_member(provider: str, model: str) -> Dict[str, Any]:
+        if member_tools is None:
+            return _one_call(client, provider, model, messages, max_tokens)
+        return _agent_member_call(
+            client, provider, model, messages, member_tools, kwargs,
+            max_tool_turns,
+        )
+
     with cf.ThreadPoolExecutor(max_workers=max(1, len(swarm))) as ex:
         futures = {
-            ex.submit(_one_call, client, provider, model, messages, max_tokens): (provider, model)
+            ex.submit(call_member, provider, model): (provider, model)
             for provider, model in pending
         }
         for fut in cf.as_completed(futures):
@@ -1040,11 +1154,15 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
                       judge: Optional[Tuple[str, str]] = None,
                       checkpoint: Optional[Any] = None,
                       swarm: Optional[List[Tuple[str, str]]] = None,
-                      synth_method: str = "structured") -> Dict[str, Any]:
+                      synth_method: str = "structured",
+                      member_tools: Optional[List[Dict[str, Any]]] = None,
+                      tool_kwargs: Optional[Dict[str, Any]] = None,
+                      max_tool_turns: int = 3) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + claim-merge."""
     members = run_swarm(
         cfg, client, prompt, size=size, max_tokens=max_tokens,
-        checkpoint=checkpoint, swarm=swarm,
+        checkpoint=checkpoint, swarm=swarm, member_tools=member_tools,
+        tool_kwargs=tool_kwargs, max_tool_turns=max_tool_turns,
     )
     synthesis_telemetry: Dict[str, Any] = {}
     final = (
@@ -2179,6 +2297,9 @@ def run_orchestration(
     synth_method: str = "structured",
     enrich_files: bool = False,
     report_path: Optional[Any] = None,
+    member_tools: Optional[List[Dict[str, Any]]] = None,
+    tool_kwargs: Optional[Dict[str, Any]] = None,
+    max_tool_turns: int = 3,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2190,6 +2311,11 @@ def run_orchestration(
     report_path (redteam only): caller-chosen report destination — a file
     path or a directory for a timestamped file. None (default) writes
     nothing: library runs have no CWD side effects.
+
+    member_tools (collaborate only): tool schemas per member — each member
+    runs a bounded agent tool-loop instead of a single call, with members
+    still in parallel. Red-team/deliberate stages ignore this (tool-less
+    by design).
     """
     normalized = (mode or "collaborate").lower().strip()
     if normalized in ("builder", "build", "b"):
@@ -2303,6 +2429,8 @@ def run_orchestration(
                 cfg, client, enriched, size=size, max_tokens=max_tokens,
                 synth=synth, judge=judge, checkpoint=checkpoint,
                 swarm=selected_swarm, synth_method=synth_method,
+                member_tools=member_tools, tool_kwargs=tool_kwargs,
+                max_tool_turns=max_tool_turns,
             )
 
         if checkpoint:

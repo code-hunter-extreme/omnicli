@@ -1027,6 +1027,56 @@ class TestCliModeWiring(unittest.TestCase):
             self.assertFalse(run.call_args.kwargs["enrich_files"])
             self.assertNotIn("File-Enrichment Disclosure", result.output)
 
+    def test_swarm_member_tools_flag_wires_verify_toolset(self):
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                patch(
+                    "omnicli.orchestrate.run_orchestration",
+                    return_value={"members": [], "final": None},
+                ) as run:
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--member-tools", "--allowed-hosts", "h.test",
+                 "--raw", "--provider", "p", "audit", "this"],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            names = {
+                t["function"]["name"]
+                for t in run.call_args.kwargs["member_tools"]
+            }
+            self.assertIn("verify_http", names)
+            self.assertIn("verify_code", names)
+            self.assertNotIn("write_file", names)
+            self.assertEqual(
+                run.call_args.kwargs["tool_kwargs"]["allowed_hosts"], ["h.test"]
+            )
+            self.assertFalse(run.call_args.kwargs["tool_kwargs"]["allow_shell"])
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                patch(
+                    "omnicli.orchestrate.run_orchestration",
+                    return_value={"members": [], "final": None},
+                ) as run:
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--raw", "--provider", "p", "audit", "this"],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIsNone(run.call_args.kwargs["member_tools"])
+
+    def test_swarm_member_tools_refused_outside_collaborate(self):
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                patch(
+                    "omnicli.orchestrate.run_orchestration",
+                    return_value={"members": [], "final": None},
+                ) as run:
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--mode", "deliberate", "--member-tools",
+                 "--raw", "--provider", "p", "audit", "this"],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIsNone(run.call_args.kwargs["member_tools"])
+            self.assertIn("collaborate only", result.output)
+
     def test_swarm_checkpoint_options_are_forwarded(self):
         checkpoint = "/tmp/omnicli-checkpoint.sqlite3"
         with (
@@ -4988,6 +5038,152 @@ class TestSwarm(unittest.TestCase):
                 [str(target)],
             )
             self.assertEqual(enrichment_candidate_paths("no paths here"), [])
+
+    def test_tooled_members_verify_with_tools_in_parallel(self):
+        import json as _json
+        import os
+        import threading
+        from omnicli.orchestrate import run_swarm
+        from omnicli.tools import TOOL_DEFINITIONS
+
+        read_file_def = [
+            t for t in TOOL_DEFINITIONS
+            if t["function"]["name"] == "read_file"
+        ]
+        barrier = threading.Barrier(2, timeout=10)
+
+        class FakeToolClient:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.calls_per_model = {}
+                self.saw_tools = []
+
+            def get_endpoint_url(self, provider, path):
+                return "https://fake.test/v1/chat/completions"
+
+            def get_headers(self, provider):
+                return {}
+
+            def post_chat_completion(self, url, headers, payload, timeout):
+                import collections
+                model = payload["model"]
+                with self.lock:
+                    self.saw_tools.append(bool(payload.get("tools")))
+                    count = self.calls_per_model.get(model, 0) + 1
+                    self.calls_per_model[model] = count
+                response = collections.namedtuple("Resp", ["status_code", "text", "json"])
+                if count == 1:
+                    barrier.wait()  # both members' first calls must overlap
+                    message = {
+                        "tool_calls": [{
+                            "id": f"call-{model}",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": _json.dumps({"path": "evidence.txt"}),
+                            },
+                        }],
+                    }
+                else:
+                    message = {"content": f"verified by {model}"}
+                return response(
+                    status_code=200, text="ok",
+                    json=lambda: {"choices": [{"message": message}]},
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "evidence.txt").write_text("SENTINEL-42", encoding="utf-8")
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                client = FakeToolClient()
+                results = run_swarm(
+                    self._cfg(), client, "check evidence.txt",
+                    swarm=[("p1", "m1"), ("p2", "m2")],
+                    member_tools=read_file_def,
+                )
+            finally:
+                os.chdir(old)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["error"] is None for r in results))
+        self.assertTrue(all(client.saw_tools))
+        for record in results:
+            used = record.get("tools_used", [])
+            self.assertEqual(len(used), 1)
+            self.assertEqual(used[0]["tool"], "read_file")
+            self.assertIn("SENTINEL-42", used[0]["output"])
+            self.assertIn("verified by", record["answer"])
+
+    def test_tooled_member_budget_exhaustion_is_an_error(self):
+        import json as _json
+        from omnicli.orchestrate import run_swarm
+        from omnicli.tools import TOOL_DEFINITIONS
+
+        read_file_def = [
+            t for t in TOOL_DEFINITIONS
+            if t["function"]["name"] == "read_file"
+        ]
+
+        class LoopingClient:
+            def get_endpoint_url(self, provider, path):
+                return "https://fake.test/v1"
+
+            def get_headers(self, provider):
+                return {}
+
+            def post_chat_completion(self, url, headers, payload, timeout):
+                import collections
+                response = collections.namedtuple("Resp", ["status_code", "text", "json"])
+                return response(
+                    status_code=200, text="ok",
+                    json=lambda: {"choices": [{"message": {
+                        "tool_calls": [{
+                            "id": "c1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": _json.dumps({"path": "nope.txt"}),
+                            },
+                        }],
+                    }}]},
+                )
+
+        results = run_swarm(
+            self._cfg(), LoopingClient(), "loop",
+            swarm=[("p", "m")], member_tools=read_file_def, max_tool_turns=2,
+        )
+        self.assertEqual(results[0]["error"], "tool_budget_exhausted")
+        self.assertEqual(len(results[0]["tools_used"]), 2)
+
+    def test_tooled_member_model_error_keeps_transcript(self):
+        import collections
+        from omnicli.orchestrate import run_swarm
+        from omnicli.tools import TOOL_DEFINITIONS
+
+        class FailingClient:
+            def get_endpoint_url(self, provider, path):
+                return "https://fake.test/v1"
+
+            def get_headers(self, provider):
+                return {}
+
+            def post_chat_completion(self, url, headers, payload, timeout):
+                response = collections.namedtuple("Resp", ["status_code", "text", "json"])
+                return response(status_code=500, text="boom", json=lambda: {})
+
+        results = run_swarm(
+            self._cfg(), FailingClient(), "hi",
+            swarm=[("p", "m")], member_tools=TOOL_DEFINITIONS,
+        )
+        self.assertIn("retry:500", results[0]["error"])
+        self.assertEqual(results[0]["tools_used"], [])
+
+    def test_verification_toolset_matches_redteam_agent_set(self):
+        from omnicli.agent import _REDTEAM_TOOLS, verification_toolset
+        first = verification_toolset()
+        self.assertEqual(
+            {t["function"]["name"] for t in first},
+            {t["function"]["name"] for t in _REDTEAM_TOOLS},
+        )
+        self.assertIsNot(first, verification_toolset())
 
     def test_groq_provider_configured(self):
         from omnicli.config import DEFAULT_PROVIDERS

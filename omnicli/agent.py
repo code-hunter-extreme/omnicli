@@ -74,6 +74,61 @@ _REDTEAM_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] in (
 )]
 
 
+def verification_toolset() -> List[Dict[str, Any]]:
+    """The bounded verify toolset shared by the agent and tooled swarm members.
+
+    Same list the red-team agent loop uses (verify_*, analyze, bash,
+    read_file, consult_provider — no write_file, no registry_search).
+    Returned as a fresh list so callers cannot mutate the shared set.
+    """
+    return list(_REDTEAM_TOOLS)
+
+
+def call_model_with_tools(
+    client: Any,
+    provider: str,
+    model: str,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    timeout: float = 90.0,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Single tool-calling model call. Returns (data, None) or (None, error).
+
+    Shared transport for the sequential agent loop and for parallel tooled
+    swarm members: identical payload shape, identical retry/hard-fail
+    classification. Error prefixes are the contract — "retry:..." walks the
+    roster, anything else stops.
+    """
+    url = client.get_endpoint_url(provider, "chat/completions")
+    headers = client.get_headers(provider)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0.2,
+        "max_tokens": 2048,
+    }
+    try:
+        res = client.post_chat_completion(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+        )
+        if res.status_code in _HARD_FAIL_CODES:
+            return None, f"hard_fail:{res.status_code}:{res.text[:120]}"
+        if res.status_code in _RETRY_CODES:
+            return None, f"retry:{res.status_code}:{res.text[:120]}"
+        if res.status_code != 200:
+            return None, f"error:{res.status_code}:{res.text[:120]}"
+        return res.json(), None
+    except httpx.TimeoutException:
+        return None, "retry:timeout"
+    except Exception as e:
+        return None, f"retry:network:{e}"
+
+
 class AgentRunner:
     def __init__(
         self,
@@ -163,37 +218,12 @@ class AgentRunner:
 
         Caller decides whether error warrants a roster retry.
         """
-        url = self.client.get_endpoint_url(provider, "chat/completions")
-        headers = self.client.get_headers(provider)
         # In red-team mode expose only the verify_* set (+bash/read_file/consult)
         # so the model stays on proving findings, not writing files.
         tools = _REDTEAM_TOOLS if getattr(self, "redteam", False) else TOOL_DEFINITIONS
-        payload = {
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": 0.2,
-            "max_tokens": 2048,
-        }
-        try:
-            res = self.client.post_chat_completion(
-                url=url,
-                headers=headers,
-                payload=payload,
-                timeout=90.0,
-            )
-            if res.status_code in _HARD_FAIL_CODES:
-                return None, f"hard_fail:{res.status_code}:{res.text[:120]}"
-            if res.status_code in _RETRY_CODES:
-                return None, f"retry:{res.status_code}:{res.text[:120]}"
-            if res.status_code != 200:
-                return None, f"error:{res.status_code}:{res.text[:120]}"
-            return res.json(), None
-        except httpx.TimeoutException:
-            return None, "retry:timeout"
-        except Exception as e:
-            return None, f"retry:network:{e}"
+        return call_model_with_tools(
+            self.client, provider, model, messages, tools
+        )
 
     def run(self, goal: str, system_override: Optional[str] = None) -> str:
         """Run an autonomous agent loop with tools to achieve a user goal.

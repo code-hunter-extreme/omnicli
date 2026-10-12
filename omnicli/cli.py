@@ -7,7 +7,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import click
 from rich.console import Console
@@ -947,6 +947,12 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--enrich-files", is_flag=True, default=False,
               help="Attach local files referenced by path-like words in the prompt "
               "(contents are sent to providers; never on by default; ignored for redteam)")
+@click.option("--member-tools", is_flag=True, default=False,
+              help="Give each collaborate member the verify toolset: bounded agent "
+              "tool-loop per member, members still in parallel (collaborate only)")
+@click.option("--allowed-hosts", multiple=True,
+              help="Hosts tooled members may probe with verify_http (repeatable; "
+              "required before any member HTTP probe)")
 @click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
 @click.option("--checkpoint", type=click.Path(dir_okay=False), help="Opt in to a local SQLite checkpoint (stores the prompt and model outputs)")
 @click.option("--resume", is_flag=True, help="Resume the existing --checkpoint; the same mode and prompt are required")
@@ -957,7 +963,8 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               help="Red-team report destination: file path or directory (default: ./reports)")
 @click.argument("prompt", nargs=-1, required=True)
 def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
-              redteam: bool, raw: bool, enrich_files: bool, provider: Optional[str],
+              redteam: bool, raw: bool, enrich_files: bool, member_tools: bool,
+              allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               report_path: str, prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
@@ -1019,6 +1026,24 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
             title="File-Enrichment Disclosure",
             border_style="yellow",
         ))
+    tooled = member_tools and active_mode == "collaborate"
+    if member_tools and active_mode != "collaborate":
+        console.print(
+            "[yellow]--member-tools applies to collaborate only; "
+            f"{active_mode} stages stay tool-less by design.[/yellow]"
+        )
+    if tooled:
+        from omnicli.agent import verification_toolset
+        member_tool_defs: Optional[list] = verification_toolset()
+        member_tool_kwargs: Dict[str, Any] = {
+            "allow_shell": False,
+            "allow_local": False,
+            "allowed_hosts": list(allowed_hosts) or None,
+            "allow_mutating_http": False,
+        }
+    else:
+        member_tool_defs = None
+        member_tool_kwargs = {}
     with console.status(f"[cyan]Querying {len(swarm)} models in parallel ({active_mode})...[/cyan]", spinner="dots"):
         try:
             out = orch.run_orchestration(
@@ -1026,6 +1051,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
                 checkpoint_path=checkpoint, resume=resume,
                 provider=provider, swarm=swarm, source_files=source_files,
                 enrich_files=enrich_files, report_path=report_path,
+                member_tools=member_tool_defs, tool_kwargs=member_tool_kwargs,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -1036,6 +1062,9 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
         body = escape(r["answer"]) if r["answer"] else "[dim](empty)[/dim]"
         if r["error"]:
             body += f"\n\n[red]STAGE ERROR: {escape(r['error'])}[/red]"
+        if r.get("tools_used"):
+            used = ", ".join(escape(item.get("tool", "?")) for item in r["tools_used"])
+            body += f"\n\n[dim]Tools executed ({len(r['tools_used'])}): {used}[/dim]"
         if r.get("latency_ms") is not None:
             body += f"\n\n[dim]Call latency: {r['latency_ms'] / 1000:.1f}s[/dim]"
         console.print(Panel(body, title=head, border_style="red" if r["error"] else "dim"))
