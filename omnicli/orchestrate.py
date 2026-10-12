@@ -806,9 +806,12 @@ def swarm_deliberate(
     }
 
 
-def enrich_prompt_with_files(prompt: str) -> str:
-    """Detect references to local files, folders, or projects in prompt and attach context."""
-    import re
+def enrichment_candidate_paths(prompt: str) -> List[str]:
+    """Local paths enrich_prompt_with_files would attach for this prompt.
+
+    Pure discovery (no reads beyond existence checks) so callers can
+    disclose exactly what would leave the machine before enriching.
+    """
     from pathlib import Path
 
     words = re.findall(r"[\w\./~_-]+", prompt)
@@ -863,6 +866,19 @@ def enrich_prompt_with_files(prompt: str) -> str:
                     except Exception:
                         pass
 
+    return [str(p) for p in candidate_paths[:3]]
+
+
+def enrich_prompt_with_files(prompt: str) -> str:
+    """Attach local file/dir contents referenced by path-like words in prompt.
+
+    Explicit opt-in ONLY (CLI --enrich-files): attached contents are sent
+    to model providers. Never call this on untrusted or library-consumer
+    prompts — a path mention silently exfiltrates local files.
+    """
+    from pathlib import Path
+
+    candidate_paths = [Path(p) for p in enrichment_candidate_paths(prompt)]
     if not candidate_paths:
         return prompt
 
@@ -2144,6 +2160,7 @@ def run_orchestration(
     swarm: Optional[List[Tuple[str, str]]] = None,
     source_files: Optional[Dict[str, str]] = None,
     synth_method: str = "structured",
+    enrich_files: bool = False,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2160,7 +2177,14 @@ def run_orchestration(
             "Use collaborate, redteam, or deliberate."
         )
     is_redteam = normalized in ("redteam", "red", "rt")
-    enriched = prompt if is_redteam else enrich_prompt_with_files(prompt)
+    # File enrichment is explicit opt-in only: it sends local file contents
+    # to model providers, so it never runs by default (and never for
+    # redteam, which takes explicit source_files instead).
+    enriched = (
+        prompt
+        if (is_redteam or not enrich_files)
+        else enrich_prompt_with_files(prompt)
+    )
     normalized_sources = {
         path.replace("\\", "/"): content
         for path, content in (source_files or {}).items()

@@ -1001,6 +1001,32 @@ class TestCliModeWiring(unittest.TestCase):
                 self.assertEqual(run.call_args.kwargs["provider"], "p")
                 self.assertEqual(run.call_args.kwargs["swarm"], [("p", "openai/test")])
 
+    def test_swarm_enrich_files_flag_is_forwarded_with_disclosure(self):
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                patch(
+                    "omnicli.orchestrate.run_orchestration",
+                    return_value={"members": [], "final": None},
+                ) as run:
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--enrich-files", "--raw", "--provider", "p", "audit", "this"],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(run.call_args.kwargs["enrich_files"])
+            self.assertIn("File-Enrichment Disclosure", result.output)
+        with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                patch(
+                    "omnicli.orchestrate.run_orchestration",
+                    return_value={"members": [], "final": None},
+                ) as run:
+            result = self.runner.invoke(
+                self.main,
+                ["swarm", "--raw", "--provider", "p", "audit", "this"],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(run.call_args.kwargs["enrich_files"])
+            self.assertNotIn("File-Enrichment Disclosure", result.output)
+
     def test_swarm_checkpoint_options_are_forwarded(self):
         checkpoint = "/tmp/omnicli-checkpoint.sqlite3"
         with (
@@ -4789,6 +4815,57 @@ class TestSwarm(unittest.TestCase):
             source_files={"app.py": "safe()"},
         )
         self.assertEqual(len(r["members"]), 2)
+
+    def test_file_enrichment_is_opt_in_only(self):
+        from omnicli.orchestrate import run_orchestration
+        with tempfile.TemporaryDirectory() as td:
+            secret = Path(td) / "secret.txt"
+            secret.write_text("TOP-SECRET-CONTENTS", encoding="utf-8")
+            task = f"review {secret} for issues"
+            client = self.FakeClient(record=[])
+            run_orchestration(
+                "collaborate", self._cfg(), client, task,
+                size=1, synth=False,
+            )
+            sent = client.record[0]["messages"][-1]["content"]
+            self.assertNotIn("ATTACHED", sent)
+            self.assertNotIn("TOP-SECRET-CONTENTS", sent)
+
+            client = self.FakeClient(record=[])
+            run_orchestration(
+                "collaborate", self._cfg(), client, task,
+                size=1, synth=False, enrich_files=True,
+            )
+            sent = client.record[0]["messages"][-1]["content"]
+            self.assertIn("ATTACHED FILE", sent)
+            self.assertIn("TOP-SECRET-CONTENTS", sent)
+
+    def test_file_enrichment_never_runs_for_redteam(self):
+        from omnicli.orchestrate import run_orchestration
+        with tempfile.TemporaryDirectory() as td:
+            secret = Path(td) / "secret.txt"
+            secret.write_text("TOP-SECRET-CONTENTS", encoding="utf-8")
+            client = self.FakeClient(record=[])
+            run_orchestration(
+                "redteam", self._cfg(), client, f"review {secret}",
+                size=1, synth=False, enrich_files=True,
+                source_files={"app.py": "safe()"},
+            )
+            for call in client.record:
+                sent = call["messages"][-1]["content"]
+                self.assertNotIn("ATTACHED FILE", sent)
+                self.assertNotIn("TOP-SECRET-CONTENTS", sent)
+
+    def test_enrichment_candidate_paths_discloses_matches(self):
+        from omnicli.orchestrate import enrichment_candidate_paths
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "notes.md"
+            target.write_text("hello", encoding="utf-8")
+            self.assertEqual(
+                enrichment_candidate_paths(f"read {target} please"),
+                [str(target)],
+            )
+            self.assertEqual(enrichment_candidate_paths("no paths here"), [])
 
     def test_groq_provider_configured(self):
         from omnicli.config import DEFAULT_PROVIDERS

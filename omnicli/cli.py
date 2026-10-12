@@ -944,6 +944,9 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--redteam", is_flag=True, default=False,
               help="Multi-model adversarial red-team review (different families together)")
 @click.option("--raw", is_flag=True, default=False, help="Show each member's answer, skip synthesis")
+@click.option("--enrich-files", is_flag=True, default=False,
+              help="Attach local files referenced by path-like words in the prompt "
+              "(contents are sent to providers; never on by default; ignored for redteam)")
 @click.option("-p", "--provider", help="Restrict the swarm to one provider's families")
 @click.option("--checkpoint", type=click.Path(dir_okay=False), help="Opt in to a local SQLite checkpoint (stores the prompt and model outputs)")
 @click.option("--resume", is_flag=True, help="Resume the existing --checkpoint; the same mode and prompt are required")
@@ -952,7 +955,7 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               help="Supply source for exact quote/line grounding; repeat as needed")
 @click.argument("prompt", nargs=-1, required=True)
 def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
-              redteam: bool, raw: bool, provider: Optional[str],
+              redteam: bool, raw: bool, enrich_files: bool, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
@@ -1002,12 +1005,25 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
             title="Red-Team Source Disclosure",
             border_style="yellow",
         ))
+    if enrich_files and active_mode != "redteam":
+        enrich_paths = orch.enrichment_candidate_paths(task)
+        console.print(Panel(
+            "Local files matched by path-like words in the prompt will be "
+            "sent to the configured model providers:\n"
+            + (
+                "\n".join(f"- {escape(path)}" for path in enrich_paths)
+                if enrich_paths else "- (none matched)"
+            ),
+            title="File-Enrichment Disclosure",
+            border_style="yellow",
+        ))
     with console.status(f"[cyan]Querying {len(swarm)} models in parallel ({active_mode})...[/cyan]", spinner="dots"):
         try:
             out = orch.run_orchestration(
                 active_mode, cfg, client, task, size=size, synth=not raw,
                 checkpoint_path=checkpoint, resume=resume,
                 provider=provider, swarm=swarm, source_files=source_files,
+                enrich_files=enrich_files,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc
