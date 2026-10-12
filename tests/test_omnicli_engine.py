@@ -2978,7 +2978,11 @@ class TestPinTransport(unittest.TestCase):
         self.assertEqual(captured["host"], "::1")
         self.assertEqual(captured["host_header"], "example.com")
 
-    def test_global_resolver_never_patched(self):
+    def test_pin_transport_adds_no_new_global_patch(self):
+        # Narrow claim: the pin transport adds no NEW resolver patch.
+        # (omnicli/__init__.py keeps a pre-existing IPv4 getaddrinfo
+        # forcing — untouched and out of scope; identity below proves
+        # the pin path does not patch on top of it.)
         import socket
         import omnicli.deterministic as deterministic
         self.assertFalse(hasattr(deterministic, "_pin_getaddrinfo"))
@@ -2989,7 +2993,7 @@ class TestPinTransport(unittest.TestCase):
         )
         self.assertIs(socket.getaddrinfo, real)
 
-    def test_http_verifier_pins_localhost_without_global_patch(self):
+    def test_http_verifier_pins_localhost_without_new_pin_patch(self):
         import socket
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer

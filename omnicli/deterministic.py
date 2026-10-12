@@ -282,8 +282,10 @@ class PinnedHostTransport(httpx.HTTPTransport):
     second DNS lookup that rebinds to an internal address (TOCTOU). The
     original Host header is preserved and the original hostname travels as
     the TLS SNI / certificate hostname via httpcore's sni_hostname
-    extension. All state is per-connection (no global resolver patch),
-    so parallel callers cannot race each other.
+    extension. All pin state is per-connection (this transport adds no
+    per-request patch of the global resolver, so parallel callers cannot
+    race each other); the pre-existing IPv4 forcing in omnicli/__init__.py
+    is untouched and out of scope for this claim.
     """
 
     def __init__(self, hostname: str, ip: str, **kwargs: Any) -> None:
