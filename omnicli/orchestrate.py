@@ -23,6 +23,7 @@ import concurrent.futures as cf
 import json
 import re
 import time
+import warnings
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from omnicli.agent import call_model_with_tools
@@ -2316,8 +2317,8 @@ def run_orchestration(
 
     member_tools (collaborate only): tool schemas per member — each member
     runs a bounded agent tool-loop instead of a single call, with members
-    still in parallel. Red-team/deliberate stages ignore this (tool-less
-    by design).
+    still in parallel. Red-team/deliberate stages warn and ignore this
+    (tool-less by design).
 
     system (collaborate only): system prompt delivered as a real system
     role message to every member — never flattened into the user prompt.
@@ -2330,6 +2331,14 @@ def run_orchestration(
             "Use collaborate, redteam, or deliberate."
         )
     is_redteam = normalized in ("redteam", "red", "rt")
+    is_deliberate = normalized in ("deliberate", "discussion", "boardroom")
+    if member_tools is not None and (is_redteam or is_deliberate):
+        warnings.warn(
+            f"member_tools applies to collaborate only; {normalized} stages "
+            "stay tool-less by design — ignoring member_tools.",
+            UserWarning,
+            stacklevel=2,
+        )
     # File enrichment is explicit opt-in only: it sends local file contents
     # to model providers, so it never runs by default (and never for
     # redteam, which takes explicit source_files instead).

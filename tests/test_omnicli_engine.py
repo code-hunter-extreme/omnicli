@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -1076,6 +1077,38 @@ class TestCliModeWiring(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIsNone(run.call_args.kwargs["member_tools"])
             self.assertIn("collaborate only", result.output)
+
+    def test_run_orchestration_warns_when_member_tools_dropped(self):
+        from omnicli import orchestrate as orch
+        tools = [{"type": "function", "function": {"name": "read_file"}}]
+        with patch("omnicli.orchestrate.swarm_redteam",
+                   return_value={"members": [], "final": None}), \
+                patch("omnicli.orchestrate.swarm_deliberate",
+                      return_value={"members": [], "final": None}):
+            with self.assertWarnsRegex(UserWarning, "collaborate only"):
+                orch.run_orchestration(
+                    "redteam", object(), object(), "task", synth=False,
+                    swarm=[("p", "m")], member_tools=tools,
+                )
+            with self.assertWarnsRegex(UserWarning, "collaborate only"):
+                orch.run_orchestration(
+                    "deliberate", object(), object(), "task", synth=False,
+                    swarm=[("p", "m")], member_tools=tools,
+                )
+        with patch("omnicli.orchestrate.swarm_collaborate",
+                   return_value={"members": [], "final": None}), \
+                patch("omnicli.orchestrate.swarm_redteam",
+                      return_value={"members": [], "final": None}):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                orch.run_orchestration(
+                    "collaborate", object(), object(), "task", synth=False,
+                    swarm=[("p", "m")], member_tools=tools,
+                )
+                orch.run_orchestration(
+                    "redteam", object(), object(), "task", synth=False,
+                    swarm=[("p", "m")],
+                )
 
     def test_swarm_checkpoint_options_are_forwarded(self):
         checkpoint = "/tmp/omnicli-checkpoint.sqlite3"
