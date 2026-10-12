@@ -236,15 +236,23 @@ def build_swarm(
             chosen_families.add(classify_family(ms[0]))
         swarm.append(picked)
 
-    # Pass 2: If size > len(providers), round-robin fill remaining slots.
+    # Pass 2: If size > len(providers), round-robin fill remaining slots —
+    # one unused model per provider per round, in provider order.
     if len(swarm) < size:
-        for pid in providers:
-            for m in per_provider.get(pid, []):
-                if (pid, m) not in swarm:
-                    swarm.append((pid, m))
-                    if len(swarm) >= size:
-                        break
-            if len(swarm) >= size:
+        remaining = {
+            pid: [m for m in per_provider.get(pid, []) if (pid, m) not in swarm]
+            for pid in providers
+        }
+        while len(swarm) < size:
+            progressed = False
+            for pid in providers:
+                if len(swarm) >= size:
+                    break
+                queue = remaining.get(pid, [])
+                if queue:
+                    swarm.append((pid, queue.pop(0)))
+                    progressed = True
+            if not progressed:
                 break
 
     return swarm[:size]
@@ -253,7 +261,11 @@ def build_swarm(
 def _one_call(client: Any, provider: str, model: str,
               messages: List[Dict[str, str]], max_tokens: int,
               temperature: Optional[float] = None) -> Dict[str, Any]:
-    """Single swarm-member call. Errors are captured, never raised."""
+    """Single swarm-member call. Errors are captured, never raised.
+
+    The provider message passes through verbatim; a message-less exception
+    falls back to its type name so the failure still surfaces truthfully.
+    """
     started = time.perf_counter()
     try:
         call_options: Dict[str, Any] = {
@@ -283,8 +295,10 @@ def _one_call(client: Any, provider: str, model: str,
                     else None
                 )}
     except Exception as e:  # noqa: BLE001
+        message = str(e).strip()
+        detail = message if message else type(e).__name__
         return {"provider": provider, "model": model, "family": classify_family(model),
-                "answer": "", "error": str(e)[:160],
+                "answer": "", "error": detail[:160],
                 "latency_ms": round((time.perf_counter() - started) * 1000, 1),
                 "usage": None, "reported_cost_usd": None}
 
