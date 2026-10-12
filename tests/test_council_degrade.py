@@ -275,6 +275,105 @@ def test_all_failing_members_still_fail():
     assert gate["passing_members"] == []
 
 
+def _unsupported_triage(title, reporters):
+    return {
+        "title": title,
+        "file": "vuln.py",
+        "start_line": 3,
+        "status": "unsupported_citation",
+        "reported_by": [list(pair) for pair in reporters],
+    }
+
+
+def test_scoped_veto_clean_member_carries_trial():
+    from omnicli.evidence import assess_evidence_gate
+    gate = assess_evidence_gate(
+        SOURCE,
+        [
+            _attack_validation("clean"),
+            _challenge_validation("clean"),
+            _attack_validation("bad", grounded=False),
+            _challenge_validation("bad"),
+        ],
+        [],
+        [_unsupported_triage("Hallucinated quote", [("bad", "m")])],
+    )
+    assert gate["status"] == "PASS_GROUNDING_ONLY"
+    assert gate["failed_checks"] == []
+    assert gate["passing_members"] == ["clean:m"]
+    assert any("Non-passing member bad:m" in w for w in gate["provider_warnings"])
+    assert any("not grounded" in w for w in gate["provider_warnings"])
+
+
+def test_scoped_veto_shared_bad_citation_fails_all_reporters():
+    from omnicli.evidence import assess_evidence_gate
+    gate = assess_evidence_gate(
+        SOURCE,
+        [
+            _attack_validation("a", grounded=False),
+            _challenge_validation("a"),
+            _attack_validation("b", grounded=False),
+            _challenge_validation("b"),
+        ],
+        [],
+        [_unsupported_triage("Shared hallucination", [("a", "m"), ("b", "m")])],
+    )
+    assert gate["status"] == "FAIL"
+    assert gate["passing_members"] == []
+    assert any("not grounded" in f for f in gate["failed_checks"])
+
+
+def test_scoped_veto_unknown_owner_fails_closed():
+    from omnicli.evidence import assess_evidence_gate
+    triage = _unsupported_triage("Orphan citation", [])
+    del triage["reported_by"]
+    gate = assess_evidence_gate(
+        SOURCE,
+        [
+            _attack_validation("clean"),
+            _challenge_validation("clean"),
+        ],
+        [],
+        [triage],
+    )
+    assert gate["status"] == "FAIL"
+    assert any("not grounded" in f for f in gate["failed_checks"])
+
+
+def test_triage_records_reporters_and_merges_on_dedup():
+    from omnicli.evidence import triage_grounded_findings
+
+    def validation(provider, quote, grounded):
+        return {
+            "provider": provider,
+            "model": "m",
+            "findings_checked": [{
+                "finding": "Candidate",
+                "category": "sql_injection",
+                "file": "vuln.py",
+                "start_line": 3,
+                "end_line": 3,
+                "quote": quote,
+                "grounded": grounded,
+            }],
+        }
+
+    triaged = triage_grounded_findings(
+        [
+            validation("a", "same excerpt", False),
+            validation("b", "same excerpt", False),
+            validation("a", "other excerpt", True),
+        ],
+        [],
+    )
+    by_quote = {item["quote"]: item for item in triaged}
+    assert by_quote["same excerpt"]["status"] == "unsupported_citation"
+    assert sorted(tuple(pair) for pair in by_quote["same excerpt"]["reported_by"]) == [
+        ("a", "m"), ("b", "m"),
+    ]
+    assert by_quote["other excerpt"]["reported_by"] == [["a", "m"]]
+
+
 def test_empty_challenge_assignment_needs_no_magic_phrase():
     client = _CleanBillFake({"fast": "unused"})
     review = swarm_redteam(

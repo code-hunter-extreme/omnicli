@@ -752,6 +752,14 @@ def triage_grounded_findings(
         items = validation.get("findings_checked", [])
         if not isinstance(items, list):
             continue
+        reporter: Optional[List[str]] = None
+        provider = validation.get("provider")
+        model = validation.get("model")
+        if (
+            isinstance(provider, str) and provider
+            and isinstance(model, str) and model
+        ):
+            reporter = [provider, model]
         for item in items:
             if not isinstance(item, Mapping):
                 continue
@@ -782,6 +790,7 @@ def triage_grounded_findings(
                 "status": "unverified_candidate",
                 "reason": "Static source patterns do not establish the complete security behavior.",
                 "reported_categories": [category],
+                "reported_by": [reporter] if reporter else [],
                 "candidate_id": candidate_id,
             }
             reviews = challenge_by_id.get(candidate_id, [])
@@ -866,6 +875,10 @@ def triage_grounded_findings(
                 categories = existing["reported_categories"]
                 if category not in categories:
                     categories.append(category)
+                reporters = existing.setdefault("reported_by", [])
+                for pair in candidate.get("reported_by", []):
+                    if pair not in reporters:
+                        reporters.append(pair)
                 titles = existing.setdefault("alternate_titles", [])
                 if title != existing["title"] and title not in titles:
                     titles.append(title)
@@ -1019,7 +1032,9 @@ def assess_evidence_gate(
     Provider errors fail the gate only when they leave zero usable review
     outputs. Surviving members are judged on grounding merit; members with
     failures are demoted to warnings (never silently dropped) while at
-    least one member passes. Sources, vacuous-input, triage, and
+    least one member passes. Unsupported triage citations are scoped to
+    their reporting members via reported_by — one bad citation fails its
+    reporters, never the clean members. Sources, vacuous-input, and
     unattributed failures always fail closed.
 
     When the typed-judge verdicts are supplied, the gate also reports the
@@ -1110,15 +1125,32 @@ def assess_evidence_gate(
 
     for candidate in candidate_triage:
         if candidate.get("status") == "unsupported_citation":
-            failures.append(
-                (
-                    None,
-                    "Candidate citation is not grounded: "
-                    f"{candidate.get('title', 'unnamed candidate')} "
-                    f"({candidate.get('file', 'unknown file')}:"
-                    f"{candidate.get('start_line', '?')}).",
-                )
+            message = (
+                "Candidate citation is not grounded: "
+                f"{candidate.get('title', 'unnamed candidate')} "
+                f"({candidate.get('file', 'unknown file')}:"
+                f"{candidate.get('start_line', '?')})."
             )
+            # Scope the veto to the owning members: one hallucinated quote
+            # fails its reporters, never the clean members. Ownership
+            # unknown (hand-built triage without reported_by) fails closed
+            # as a global failure.
+            owners = set()
+            reported = candidate.get("reported_by") or []
+            if isinstance(reported, list):
+                for pair in reported:
+                    if (
+                        isinstance(pair, (list, tuple))
+                        and len(pair) == 2
+                        and pair[0]
+                        and pair[1]
+                    ):
+                        owners.add((pair[0], pair[1]))
+            if not owners:
+                failures.append((None, message))
+            else:
+                for owner in sorted(owners, key=str):
+                    failures.append((owner, message))
 
     global_failures = [message for owner, message in failures if owner is None]
     member_failures: Dict[Tuple[object, object], List[str]] = {}
