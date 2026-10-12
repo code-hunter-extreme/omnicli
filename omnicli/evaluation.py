@@ -1046,7 +1046,16 @@ def evaluate_staged_security(
     repetitions: int = 1,
     pricing: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
-    """Evaluate the staged red-team pipeline on the same labeled cases."""
+    """Evaluate the staged red-team pipeline on the same labeled cases.
+
+    Each model runs the staged pipeline solo (per-model isolation for
+    benchmarking); predictions are the typed judge's UPHOLD verdicts, not
+    raw attack claims. Invalid trials (gate FAIL, total member failure)
+    still score their predictions on the merits — true positives are never
+    zeroed — but the trial is flagged (trial_invalid) and counted in
+    errors/invalid_trials, which fail the quality gate. The penalty for an
+    invalid trial is gate failure, not erased detections.
+    """
     from omnicli.orchestrate import swarm_redteam
 
     if not models:
@@ -1073,6 +1082,7 @@ def evaluate_staged_security(
         tp = fp = fn = errors = gate_failures = citations = grounded_citations = 0
         clean_true_negatives = clean_false_positives = 0
         failed_clean_trials = 0
+        invalid_trials = 0
         category_counts: Dict[str, Dict[str, int]] = {}
         case_results = []
         latencies: List[float] = []
@@ -1130,8 +1140,6 @@ def evaluate_staged_security(
                     else:
                         tokens_known = False
 
-                    predictions = []
-                    seen_predictions = set()
                     case_citations = case_grounded = 0
                     for validation in review.get("attack_validations", []):
                         if not isinstance(validation, dict):
@@ -1141,21 +1149,31 @@ def evaluate_staged_security(
                                 continue
                             case_citations += 1
                             case_grounded += bool(finding.get("grounded"))
-                            prediction = {
-                                "category": finding.get("category", "unknown"),
-                                "file": finding.get("file", ""),
-                                "line": finding.get("start_line", 0),
-                                "evidence": finding.get("quote", ""),
-                            }
-                            identity = (
-                                prediction["category"],
-                                prediction["file"],
-                                prediction["line"],
-                                prediction["evidence"],
-                            )
-                            if identity not in seen_predictions:
-                                seen_predictions.add(identity)
-                                predictions.append(prediction)
+                    typed_judgment = review.get("typed_judgment") or {}
+                    predictions = []
+                    seen_predictions = set()
+                    for adjudication in typed_judgment.get("verdicts", []):
+                        if (
+                            not isinstance(adjudication, dict)
+                            or adjudication.get("verdict") != "UPHOLD"
+                        ):
+                            continue
+                        candidate = adjudication.get("candidate") or {}
+                        prediction = {
+                            "category": candidate.get("category", "unknown"),
+                            "file": candidate.get("file", ""),
+                            "line": candidate.get("start_line", 0),
+                            "evidence": candidate.get("quote", ""),
+                        }
+                        identity = (
+                            prediction["category"],
+                            prediction["file"],
+                            prediction["line"],
+                            prediction["evidence"],
+                        )
+                        if identity not in seen_predictions:
+                            seen_predictions.add(identity)
+                            predictions.append(prediction)
                     result = _evaluate_case(case, predictions)
                     result.update({
                         "citations": case_citations,
@@ -1172,8 +1190,15 @@ def evaluate_staged_security(
                     )
                     if gate_failed:
                         gate_failures += 1
+                    result["trial_invalid"] = bool(trial_failed)
                     if trial_failed:
                         errors += 1
+                        invalid_trials += 1
+                        result["trial_invalid_reason"] = (
+                            "; ".join(member_errors)[:240]
+                            if member_errors
+                            else "Staged review evidence gate failed."
+                        )
                         result["invalid_trial_observations"] = {
                             "predicted_findings": predictions,
                             "false_positives": result["false_positives"],
@@ -1183,22 +1208,14 @@ def evaluate_staged_security(
                             "citations": case_citations,
                             "grounded_citations": case_grounded,
                         }
-                        result["error"] = (
-                            "; ".join(member_errors)[:240]
-                            if member_errors
-                            else "Staged review evidence gate failed."
-                        )
-                        result["true_positives"] = 0
-                        result["false_positives"] = 0
-                        result["false_negatives"] = len(case["expected_findings"])
-                        result["matched"] = []
-                        result["missed"] = case["expected_findings"]
-                        result["false_positive_categories"] = []
-                    else:
-                        citations += case_citations
-                        grounded_citations += case_grounded
+                        result["error"] = result["trial_invalid_reason"]
+                        # Scored on the merits above: no zeroing. The trial
+                        # is penalized via errors/invalid_trials (which fail
+                        # the quality gate), not by erasing detections.
+                    citations += case_citations
+                    grounded_citations += case_grounded
                     if not case["expected_findings"]:
-                        if result.get("error"):
+                        if trial_failed:
                             failed_clean_trials += 1
                         elif predictions:
                             clean_false_positives += 1
@@ -1207,6 +1224,7 @@ def evaluate_staged_security(
                 except Exception as exc:
                     errors += 1
                     gate_failures += 1
+                    invalid_trials += 1
                     tokens_known = False
                     result = {
                         "case_id": case_id,
@@ -1222,6 +1240,8 @@ def evaluate_staged_security(
                         "false_positive_categories": [],
                         "raw_outputs": raw_outputs,
                         "error": str(exc)[:240],
+                        "trial_invalid": True,
+                        "trial_invalid_reason": f"Crashed trial: {str(exc)[:200]}",
                     }
                     if not case["expected_findings"]:
                         failed_clean_trials += 1
@@ -1260,6 +1280,11 @@ def evaluate_staged_security(
             "repetitions": repetitions,
             "errors": errors,
             "failed_clean_trials": failed_clean_trials,
+            "invalid_trials": invalid_trials,
+            "invalid_trial_rate": (
+                round(invalid_trials / (len(cases) * repetitions), 4)
+                if cases and repetitions else None
+            ),
             "category_mismatches": sum(
                 len(result.get("category_mismatches", []))
                 for result in case_results
@@ -1338,7 +1363,13 @@ def evaluate_staged_council(
     models: List[Tuple[str, str]],
     repetitions: int = 1,
 ) -> Dict[str, Any]:
-    """Evaluate the actual multi-member red-team council on labeled cases."""
+    """Evaluate the actual multi-member red-team council on labeled cases.
+
+    Predictions are the typed judge's UPHOLD verdicts over the full council
+    run. Invalid trials score on the merits (true positives are never
+    zeroed) and are flagged via trial_invalid; errors/invalid_trials still
+    fail the quality gate.
+    """
     from omnicli.orchestrate import swarm_redteam
 
     if len(models) < 2:
@@ -1353,6 +1384,7 @@ def evaluate_staged_council(
     case_results: List[Dict[str, Any]] = []
     tp = fp = fn = errors = gate_failures = citations = grounded_citations = 0
     clean_true_negatives = clean_false_positives = failed_clean_trials = 0
+    invalid_trials = 0
     member_calls = input_tokens = output_tokens = 0
     usage_known = True
     latencies: List[float] = []
@@ -1452,29 +1484,26 @@ def evaluate_staged_council(
                         "evidence_gap_cues": review.get("evidence_gap_cues", []),
                     },
                 })
+                result["trial_invalid"] = bool(trial_failed)
                 if trial_failed:
                     errors += 1
+                    invalid_trials += 1
                     gate_failures += int(gate.get("status") != "PASS_GROUNDING_ONLY")
+                    result["trial_invalid_reason"] = (
+                        "; ".join(str(error) for error in member_errors)[:240]
+                        if member_errors else "Council evidence gate failed."
+                    )
                     result["invalid_trial_observations"] = {
                         "predicted_findings": predictions,
                         "false_positives": result["false_positives"],
                         "category_mismatches": result.get("category_mismatches", []),
                     }
-                    result.update({
-                        "error": (
-                            "; ".join(str(error) for error in member_errors)[:240]
-                            if member_errors else "Council evidence gate failed."
-                        ),
-                        "true_positives": 0,
-                        "false_positives": 0,
-                        "false_negatives": len(case["expected_findings"]),
-                        "matched": [],
-                        "missed": case["expected_findings"],
-                        "false_positive_categories": [],
-                    })
-                else:
-                    citations += case_citations
-                    grounded_citations += case_grounded
+                    result["error"] = result["trial_invalid_reason"]
+                    # Scored on the merits above: no zeroing. Penalty is
+                    # errors/invalid_trials (quality-gate failure), not
+                    # erased detections.
+                citations += case_citations
+                grounded_citations += case_grounded
                 if not case["expected_findings"]:
                     if trial_failed:
                         failed_clean_trials += 1
@@ -1485,6 +1514,7 @@ def evaluate_staged_council(
             except Exception as exc:
                 errors += 1
                 gate_failures += 1
+                invalid_trials += 1
                 usage_known = False
                 result = {
                     "case_id": case["id"],
@@ -1501,6 +1531,8 @@ def evaluate_staged_council(
                     "raw_outputs": raw_outputs,
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:240],
+                    "trial_invalid": True,
+                    "trial_invalid_reason": f"Crashed trial: {str(exc)[:200]}",
                 }
                 if not case["expected_findings"]:
                     failed_clean_trials += 1
@@ -1520,6 +1552,11 @@ def evaluate_staged_council(
         "repetitions": repetitions,
         "member_calls": member_calls,
         "errors": errors,
+        "invalid_trials": invalid_trials,
+        "invalid_trial_rate": (
+            round(invalid_trials / (len(cases) * repetitions), 4)
+            if cases and repetitions else None
+        ),
         "evidence_gate_failures": gate_failures,
         "category_mismatches": sum(
             len(result.get("category_mismatches", [])) for result in case_results

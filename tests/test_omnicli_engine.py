@@ -3495,13 +3495,79 @@ class TestSecurityEvaluation(unittest.TestCase):
             )["models"][0]
         self.assertEqual(result["errors"], 2)
         self.assertEqual(result["evidence_gate_failures"], 2)
+        self.assertEqual(result["invalid_trials"], 2)
+        self.assertEqual(result["invalid_trial_rate"], 1.0)
         self.assertEqual(result["true_positives"], 0)
         self.assertEqual(result["false_positives"], 0)
         self.assertEqual(result["false_negatives"], 1)
         self.assertEqual(result["false_positive_clean_cases"], 0)
         self.assertEqual(result["failed_clean_trials"], 1)
+        for case_result in result["case_results"]:
+            self.assertTrue(case_result["trial_invalid"])
+            self.assertIn("trial_invalid_reason", case_result)
         invalid_clean = result["case_results"][1]
         self.assertIn("invalid_trial_observations", invalid_clean)
+
+    def test_staged_invalid_trial_scores_judge_verdicts_on_merits(self):
+        from omnicli.evaluation import (
+            evaluate_staged_council,
+            evaluate_staged_security,
+            load_security_dataset,
+        )
+
+        def fake_redteam(cfg, client, goal, **kwargs):
+            source = next(iter(kwargs["source_files"].values()))
+            verdicts = []
+            if 'execute(f"SELECT' in source:
+                verdicts = [{
+                    "verdict": "UPHOLD",
+                    "candidate": {
+                        "category": "sql_injection",
+                        "file": "app/query.py",
+                        "start_line": 2,
+                        "quote": 'cursor.execute(f"SELECT {value}")',
+                    },
+                }]
+            return {
+                "members": [
+                    {"provider": provider, "model": model, "error": None}
+                    for provider, model in kwargs["swarm"]
+                ],
+                "attack_validations": [{"findings_checked": []}],
+                "typed_judgment": {"verdicts": verdicts},
+                "stage_calls": [],
+                "challenge_validations": [],
+                "candidate_triage": [],
+                "scenario_coverage": [],
+                "evidence_gap_cues": [],
+                # Gate failed, but the judge still upheld a correct finding.
+                "evidence_gate": {"status": "FAIL"},
+                "metrics": {},
+            }
+
+        roster = [("p1", "family-a/model"), ("p2", "family-b/model")]
+        with tempfile.TemporaryDirectory() as td, patch(
+            "omnicli.orchestrate.swarm_redteam", side_effect=fake_redteam
+        ):
+            cases = load_security_dataset(str(self._dataset(td)))
+            per_model = evaluate_staged_security(
+                MagicMock(), MagicMock(), cases, [roster[0]], repetitions=1,
+            )["models"][0]
+            council = evaluate_staged_council(
+                MagicMock(), MagicMock(), cases, roster, repetitions=1,
+            )
+        for result in (per_model, council):
+            # The true positive survives: invalid trials are penalized via
+            # errors/invalid_trials (quality-gate failure), not zeroed.
+            self.assertEqual(result["true_positives"], 1)
+            self.assertEqual(result["false_negatives"], 0)
+            self.assertEqual(result["errors"], 2)
+            self.assertEqual(result["invalid_trials"], 2)
+            self.assertEqual(
+                result["case_results"][0]["predicted_findings"][0]["category"],
+                "sql_injection",
+            )
+            self.assertTrue(result["case_results"][0]["trial_invalid"])
 
     def test_staged_council_evaluator_uses_full_roster_once_per_case(self):
         from omnicli.evaluation import evaluate_staged_council, load_security_dataset
