@@ -217,11 +217,127 @@ class TestBuildRosterAndPanel(unittest.TestCase):
         self.assertEqual(roster, [])
         self.assertEqual(panel, [])
 
-    def test_only_other_family_excluded_from_panel(self):
+    def test_other_family_models_are_kept_in_roster_and_panel(self):
         models = self._models(["some-unknown-model-a", "some-unknown-model-b"])
         roster, panel = build_roster_and_panel(models, max_per_family=2, panel_size=3)
-        # 'other' family never enters the panel
-        self.assertEqual(panel, [])
+        # Unclassified models are never dropped: router-native catalogs whose
+        # names match no family keyword must still scan to usable rosters.
+        self.assertEqual(
+            roster, ["some-unknown-model-a", "some-unknown-model-b"]
+        )
+        self.assertEqual(
+            [entry["model"] for entry in panel],
+            ["some-unknown-model-a", "some-unknown-model-b"],
+        )
+
+    def test_known_families_keep_priority_over_other(self):
+        models = self._models([
+            "some-unknown-model-a",
+            "meta-llama/llama-3.3-70b-instruct",
+            "anthropic/claude-3.5-haiku",
+        ])
+        roster, panel = build_roster_and_panel(models, max_per_family=2, panel_size=2)
+        self.assertEqual(
+            roster,
+            [
+                "meta-llama/llama-3.3-70b-instruct",
+                "anthropic/claude-3.5-haiku",
+                "some-unknown-model-a",
+            ],
+        )
+        self.assertEqual(
+            [entry["family"] for entry in panel], ["meta", "anthropic"]
+        )
+
+    def test_nonempty_catalog_never_emits_empty_roster(self):
+        models = self._models(["router-native-name-1", "whisper-large"])
+        roster, panel = build_roster_and_panel(models, max_per_family=2, panel_size=3)
+        # whisper is filtered as non-chat; the surviving text model must remain.
+        self.assertEqual(roster, ["router-native-name-1"])
+        self.assertEqual(len(panel), 1)
+
+
+class TestScanProviderAdditive(unittest.TestCase):
+    def _cfg(self, fallbacks=None, panel=None, default="orig-default"):
+        saved = {}
+
+        class FakeCfg:
+            def get_fallback_models(self, _provider):
+                return list(fallbacks or [])
+
+            def get_verification_panel(self, _provider):
+                return list(panel or [])
+
+            def get_default_model(self, _provider):
+                return default
+
+            def set_default_model(self, _provider, _model):
+                raise AssertionError("scan must never rewrite default_model")
+
+            def save_scan_results(self, provider, roster, pan):
+                saved["provider"] = provider
+                saved["roster"] = roster
+                saved["panel"] = pan
+
+        cfg = FakeCfg()
+        cfg.saved = saved
+        return cfg
+
+    class _Client:
+        def __init__(self, ids):
+            self.ids = ids
+
+        def list_models(self, _provider, timeout=10.0):
+            return [{"id": mid} for mid in self.ids]
+
+    def test_scan_merges_without_dropping_existing(self):
+        from omnicli.scanner import scan_provider
+        cfg = self._cfg(
+            fallbacks=["agnes-3-flash", "deepseek-v4-flash-alibaba"],
+            panel=[{"model": "agnes-2.5-flash", "family": "google"}],
+        )
+        client = self._Client([
+            "agnes-2.5-flash",
+            "meta-llama/llama-3.3-70b-instruct",
+        ])
+        result = scan_provider("bthor", cfg=cfg, client=client, save=True)
+        self.assertTrue(result["ok"])
+        # Existing entries survive first, in order; genuinely new models append.
+        self.assertEqual(
+            result["fallback_models"],
+            [
+                "agnes-3-flash",
+                "deepseek-v4-flash-alibaba",
+                "meta-llama/llama-3.3-70b-instruct",
+                "agnes-2.5-flash",
+            ],
+        )
+        self.assertEqual(
+            [entry["model"] for entry in result["verification_panel"]],
+            ["agnes-2.5-flash", "meta-llama/llama-3.3-70b-instruct"],
+        )
+        self.assertEqual(cfg.saved["roster"], result["fallback_models"])
+
+    def test_scan_never_rewrites_default_model(self):
+        from omnicli.scanner import scan_provider
+        cfg = self._cfg(fallbacks=[], panel=[])
+        client = self._Client(["some-120b-beast", "tiny-model"])
+        # set_default_model raises if called; the scan must complete anyway.
+        result = scan_provider("bthor", cfg=cfg, client=client, save=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(cfg.get_default_model("bthor"), "orig-default")
+
+    def test_failed_scan_saves_nothing(self):
+        from omnicli.scanner import scan_provider
+
+        class FailingClient:
+            def list_models(self, _provider, timeout=10.0):
+                raise RuntimeError("no key")
+
+        cfg = self._cfg(fallbacks=["keep-me"], panel=[])
+        result = scan_provider("bthor", cfg=cfg, client=FailingClient(), save=True)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("roster", cfg.saved)
 
 
 # ── AgentRunner fallback roster ──────────────────────────────────────────────

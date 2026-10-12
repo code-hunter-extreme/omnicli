@@ -50,11 +50,16 @@ def build_roster_and_panel(
 ) -> Tuple[List[str], List[Dict[str, str]]]:
     """From a raw /models list build fallback_models and verification_panel.
 
-    fallback_models: up to max_per_family models per family, ordered by family
-    diversity so the first retries are genuinely different from each other.
+    fallback_models: up to max_per_family models per known family, ordered by
+    family diversity so the first retries are genuinely different from each
+    other, followed by every unclassified ("other") text model. Unknown-family
+    models are never dropped: no family signal exists to rank them, and
+    dropping them hollows out router-native catalogs (e.g. bynara agnes-*).
 
-    verification_panel: exactly one model per family (the first seen), capped at
-    panel_size entries — used by CrossModelConsensusVerifier for blind voting.
+    verification_panel: one model per known family first, then unclassified
+    models fill remaining slots, capped at panel_size entries — used by
+    CrossModelConsensusVerifier for blind voting. Non-empty whenever any
+    text/chat model was discovered.
     """
     seen_families: Dict[str, List[str]] = {}
     for m in models:
@@ -64,9 +69,12 @@ def build_roster_and_panel(
         family = classify_family(mid)
         seen_families.setdefault(family, []).append(mid)
 
-    # Build fallback roster: round-robin across families so family diversity is
-    # maximised across the first N retries, not bunched by family.
-    family_iters = {f: iter(ids) for f, ids in seen_families.items() if f != "other"}
+    # Build fallback roster: round-robin across known families so family
+    # diversity is maximised across the first N retries, not bunched by
+    # family. Unclassified models append after — never dropped.
+    family_iters = {
+        f: iter(ids) for f, ids in seen_families.items() if f != "other"
+    }
     roster: List[str] = []
     active = list(family_iters.keys())
     counts: Dict[str, int] = {f: 0 for f in active}
@@ -82,17 +90,24 @@ def build_roster_and_panel(
             except StopIteration:
                 pass
         active = next_active
+    roster.extend(
+        mid for mid in seen_families.get("other", []) if mid not in roster
+    )
 
-    # Build verification panel: one per family, up to panel_size
+    # Build verification panel: one per known family, then unclassified
+    # models fill remaining slots so router-native catalogs still get a panel.
     panel: List[Dict[str, str]] = []
     used_families: set = set()
     for mid in roster:
-        family = classify_family(mid)
-        if family not in used_families and family != "other":
-            panel.append({"model": mid, "family": family})
-            used_families.add(family)
         if len(panel) >= panel_size:
             break
+        family = classify_family(mid)
+        if family == "other":
+            if mid not in {entry["model"] for entry in panel}:
+                panel.append({"model": mid, "family": family})
+        elif family not in used_families:
+            panel.append({"model": mid, "family": family})
+            used_families.add(family)
 
     return roster, panel
 
@@ -107,14 +122,19 @@ def scan_provider(
 ) -> Dict[str, Any]:
     """Scan a single provider: fetch /models, classify, build roster + panel.
 
+    Additive-only: scanned models merge INTO the stored roster/panel — a scan
+    never removes existing entries and never rewrites default_model. Router
+    catalogs rename models freely; heuristic rewrites destroyed working
+    hand-written fallbacks, so the operator's config always wins.
+
     Returns:
         {
           "provider": str,
           "ok": bool,
           "model_count": int,
           "families_found": int,
-          "fallback_models": [...],
-          "verification_panel": [...],
+          "fallback_models": [...],      # merged (existing first, then new)
+          "verification_panel": [...],   # merged by model id
           "error": str | None,
           "latency_ms": float,
         }
@@ -144,23 +164,32 @@ def scan_provider(
     families = {classify_family(m.get("id", "")) for m in models if m.get("id")}
     families.discard("other")
 
-    text_models = [m.get("id") for m in models if m.get("id") and is_text_or_chat_model(m.get("id"))]
-    text_models.sort(key=lambda x: ("120b" not in x.lower(), "70b" not in x.lower(), "27b" not in x.lower()))
-    curr_def = cfg.get_default_model(provider_id)
-    all_ids = {m.get("id") for m in models if m.get("id")}
-    if (curr_def not in all_ids or not is_text_or_chat_model(curr_def)) and text_models:
-        cfg.set_default_model(provider_id, text_models[0])
+    # Additive merge: existing entries survive every scan; only genuinely
+    # new models append. default_model is never touched here.
+    existing_roster = list(cfg.get_fallback_models(provider_id) or [])
+    merged_roster = existing_roster + [
+        mid for mid in roster if mid not in existing_roster
+    ]
+    existing_panel = list(cfg.get_verification_panel(provider_id) or [])
+    known_panel_models = {
+        entry.get("model") for entry in existing_panel
+        if isinstance(entry, dict)
+    }
+    merged_panel = existing_panel + [
+        entry for entry in panel
+        if entry.get("model") not in known_panel_models
+    ]
 
     if save:
-        cfg.save_scan_results(provider_id, roster, panel)
+        cfg.save_scan_results(provider_id, merged_roster, merged_panel)
 
     return {
         "provider": provider_id,
         "ok": True,
         "model_count": len(models),
         "families_found": len(families),
-        "fallback_models": roster,
-        "verification_panel": panel,
+        "fallback_models": merged_roster,
+        "verification_panel": merged_panel,
         "error": None,
         "latency_ms": latency,
     }
