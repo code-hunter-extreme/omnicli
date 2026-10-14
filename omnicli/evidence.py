@@ -159,31 +159,76 @@ def parse_challenge_triage(answer: str) -> list[Dict[str, str]]:
     return sorted(unique.values(), key=lambda item: text.find(item["candidate_id"]))
 
 
-_AUTH_ENFORCE_NAMES = frozenset({
+# Guard functions that reject/redirect unauthenticated callers when *called*
+# (as a statement in a before_request body, not merely referenced).
+_AUTH_GUARD_CALLS = frozenset({
     "login_required", "jwt_required", "require_auth", "requires_auth",
     "authenticate", "verify_jwt", "verify_jwt_in_request", "check_auth",
-    "unauthorized", "forbidden", "login_manager", "current_user",
+    "verify_token", "require_role",
 })
+# Exception types whose raise denies the request.
+_AUTH_RAISE_NAMES = frozenset({"unauthorized", "forbidden"})
+
+
+def _call_name(call: ast.Call) -> Optional[str]:
+    """Bare name of a call target: ``abort`` for ``flask.abort(...)``."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _has_rejecting_status(node: ast.AST) -> bool:
+    """True if a 401/403 literal appears anywhere in this subtree."""
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Constant)
+            and isinstance(sub.value, int)
+            and not isinstance(sub.value, bool)
+            and sub.value in (401, 403)
+        ):
+            return True
+    return False
 
 
 def _hook_enforces_auth(fn: ast.AST) -> bool:
-    """Best-effort: does this request-hook body actually enforce auth?
+    """Best-effort: does this request-hook body actually *reject* callers?
 
-    Returns True only on concrete enforcement signals — a 401/403 status, an
-    ``abort(401/403)``, a raised Unauthorized/Forbidden, or a call to a known
-    auth guard. Anything else leaves enforcement unproven (callers must not
-    then claim auth is *absent* on the strength of this record alone).
+    Requires a concrete rejecting action — ``abort(401/403)``, a raised
+    Unauthorized/Forbidden (or any raise carrying a 401/403), a ``return`` that
+    carries a 401/403 status, or a call to a known auth guard. A bare reference
+    to ``current_user`` or a 401 literal in a log line does NOT count: logging
+    is not enforcement. When enforcement is unproven this returns False, and
+    callers must not then claim auth is *absent* on this record alone.
     """
     for n in ast.walk(fn):
-        if isinstance(n, ast.Constant) and n.value in (401, 403):
-            return True
-        name = None
-        if isinstance(n, ast.Name):
-            name = n.id
-        elif isinstance(n, ast.Attribute):
-            name = n.attr
-        if name and name.lower() in _AUTH_ENFORCE_NAMES:
-            return True
+        if isinstance(n, ast.Call):
+            cn = _call_name(n)
+            if cn == "abort" and any(
+                isinstance(a, ast.Constant) and a.value in (401, 403) for a in n.args
+            ):
+                return True
+            if cn and cn.lower() in _AUTH_GUARD_CALLS:
+                return True
+        elif isinstance(n, ast.Raise) and n.exc is not None:
+            exc = n.exc
+            if isinstance(exc, ast.Call):
+                if _has_rejecting_status(exc):
+                    return True
+                rn = _call_name(exc)
+            elif isinstance(exc, ast.Name):
+                rn = exc.id
+            elif isinstance(exc, ast.Attribute):
+                rn = exc.attr
+            else:
+                rn = None
+            if rn and rn.lower() in _AUTH_RAISE_NAMES:
+                return True
+        elif isinstance(n, ast.Return) and n.value is not None:
+            if _has_rejecting_status(n.value):
+                return True
     return False
 
 

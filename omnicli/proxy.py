@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -34,15 +35,40 @@ app.add_middleware(
 cfg = ConfigManager()
 
 
+_LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+
+
+def _reject_cross_site(request: Request) -> None:
+    """Block drive-by CSRF from a web page the operator happens to be visiting.
+
+    CORS only stops a cross-origin site from *reading* the response; it does
+    NOT stop a simple POST (e.g. Content-Type: text/plain, no preflight) from
+    *reaching* this endpoint and spending the operator's key. A browser always
+    labels such requests: it sends an ``Origin`` header on cross-origin POSTs
+    and ``Sec-Fetch-Site`` on modern browsers. Non-browser clients (curl,
+    Aider, Cursor) send neither, so they are unaffected. Reject any request
+    that a browser marks as coming from a non-local origin.
+    """
+    origin = request.headers.get("origin")
+    if origin and not _LOCAL_ORIGIN_RE.match(origin):
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site and fetch_site.lower() not in ("same-origin", "same-site", "none"):
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+
+
 def _require_proxy_auth(request: Request) -> None:
-    """Gate the key-forwarding endpoints behind an operator token.
+    """Gate the key-forwarding endpoints behind origin and operator-token checks.
 
     The proxy injects the operator's stored provider keys, so an unauthenticated
-    caller who can reach the port would spend the operator's quota. When
-    OMNICLI_PROXY_TOKEN is set, every forwarding request must present it as a
-    bearer token. The token is required whenever the server is reachable off
-    loopback (see start_proxy), so exposure without a token fails closed.
+    caller who can reach the port would spend the operator's quota. Every
+    forwarding request is first screened for cross-site browser origins
+    (fixes drive-by CSRF even on the default tokenless loopback launch). When
+    OMNICLI_PROXY_TOKEN is set, the request must also present it as a bearer
+    token. The token is required whenever the server is reachable off loopback
+    (see start_proxy), so network exposure fails closed.
     """
+    _reject_cross_site(request)
     expected = os.environ.get("OMNICLI_PROXY_TOKEN")
     if not expected:
         return
@@ -179,12 +205,19 @@ async def chat_completions(request: Request):
         await client.aclose()
         raise HTTPException(status_code=502, detail=f"Proxy error forwarding to {provider_id}: {e}")
     if resp.status_code >= 400:
-        detail = (await resp.aread()).decode("utf-8", "replace")
-        await resp.aclose()
-        await client.aclose()
+        status = resp.status_code
+        # Read the error body, but ensure both the response and client are
+        # closed even if the upstream stalls or drops mid-read (aread raises).
+        try:
+            detail = (await resp.aread()).decode("utf-8", "replace")
+        except Exception as e:
+            detail = f"upstream {status} (error body read failed: {e})"
+        finally:
+            await resp.aclose()
+            await client.aclose()
         return JSONResponse(
-            status_code=resp.status_code,
-            content={"error": {"message": detail or f"upstream {resp.status_code}",
+            status_code=status,
+            content={"error": {"message": detail or f"upstream {status}",
                                "type": "upstream_error", "provider": provider_id}},
         )
 
