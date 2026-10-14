@@ -7,6 +7,8 @@ client (Aider, Cursor, Continue, Open-WebUI, curl, etc.) can query all providers
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -19,15 +21,71 @@ from omnicli.config import ConfigManager
 
 app = FastAPI(title="OmniCLI Local Proxy", version="1.0.0")
 
+# Restrict browser callers to localhost; a wildcard origin with credentials is
+# both invalid per the CORS spec and lets any site drive the operator's keys.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost", "http://127.0.0.1"],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 cfg = ConfigManager()
+
+
+_LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+
+
+def _reject_cross_site(request: Request) -> None:
+    """Block drive-by CSRF from a web page the operator happens to be visiting.
+
+    CORS only stops a cross-origin site from *reading* the response; it does
+    NOT stop a simple POST (e.g. Content-Type: text/plain, no preflight) from
+    *reaching* this endpoint and spending the operator's key. A browser always
+    labels such requests: it sends an ``Origin`` header on cross-origin POSTs
+    and ``Sec-Fetch-Site`` on modern browsers. Non-browser clients (curl,
+    Aider, Cursor) send neither, so they are unaffected. Reject any request
+    that a browser marks as coming from a non-local origin.
+    """
+    origin = request.headers.get("origin")
+    if origin is not None:
+        # Origin is authoritative when present: a browser sends it on every
+        # cross-origin request. A local origin (incl. a different local port) is
+        # allowed — that is a legitimate local cross-origin call CORS permits;
+        # a non-local origin is a drive-by and is rejected. Do not also consult
+        # Sec-Fetch-Site here, or a local localhost:3000 → 127.0.0.1:8000 call
+        # (marked cross-site) would be wrongly blocked.
+        if not _LOCAL_ORIGIN_RE.match(origin):
+            raise HTTPException(status_code=403, detail="cross-origin request rejected")
+        return
+    # No Origin header (non-browser client, or same-origin on some browsers).
+    # Fall back to Sec-Fetch-Site to catch a browser cross-site POST that omits
+    # Origin; non-browser clients send neither header and pass.
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site and fetch_site.lower() not in ("same-origin", "same-site", "none"):
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+
+
+def _require_proxy_auth(request: Request) -> None:
+    """Gate the key-forwarding endpoints behind origin and operator-token checks.
+
+    The proxy injects the operator's stored provider keys, so an unauthenticated
+    caller who can reach the port would spend the operator's quota. Every
+    forwarding request is first screened for cross-site browser origins
+    (fixes drive-by CSRF even on the default tokenless loopback launch). When
+    OMNICLI_PROXY_TOKEN is set, the request must also present it as a bearer
+    token. The token is required whenever the server is reachable off loopback
+    (see start_proxy), so network exposure fails closed.
+    """
+    _reject_cross_site(request)
+    expected = os.environ.get("OMNICLI_PROXY_TOKEN")
+    if not expected:
+        return
+    sent = request.headers.get("authorization", "")
+    if not sent.startswith("Bearer ") or sent[7:].strip() != expected:
+        raise HTTPException(status_code=401, detail="invalid or missing proxy token")
 
 
 def resolve_provider_and_model(model_id: str) -> tuple[str, str]:
@@ -110,6 +168,7 @@ async def list_models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    _require_proxy_auth(request)
     try:
         body = await request.json()
     except Exception:
@@ -147,11 +206,34 @@ async def chat_completions(request: Request):
             await client.aclose()
             raise HTTPException(status_code=502, detail=f"Proxy error forwarding to {provider_id}: {e}")
 
-    # Streaming mode
+    # Streaming mode. Open the upstream response BEFORE returning the stream so
+    # an upstream failure (401/429/5xx) is forwarded with its real status code
+    # instead of being masked as a local 200 stream of error text.
+    req = client.build_request("POST", url, headers=headers, json=forward_body)
+    try:
+        resp = await client.send(req, stream=True)
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Proxy error forwarding to {provider_id}: {e}")
+    if resp.status_code >= 400:
+        status = resp.status_code
+        # Read the error body, but ensure both the response and client are
+        # closed even if the upstream stalls or drops mid-read (aread raises).
+        try:
+            detail = (await resp.aread()).decode("utf-8", "replace")
+        except Exception as e:
+            detail = f"upstream {status} (error body read failed: {e})"
+        finally:
+            await resp.aclose()
+            await client.aclose()
+        return JSONResponse(
+            status_code=status,
+            content={"error": {"message": detail or f"upstream {status}",
+                               "type": "upstream_error", "provider": provider_id}},
+        )
+
     async def sse_generator() -> AsyncGenerator[bytes, None]:
         try:
-            req = client.build_request("POST", url, headers=headers, json=forward_body)
-            resp = await client.send(req, stream=True)
             async for line in resp.aiter_lines():
                 if not line:
                     continue
@@ -161,6 +243,7 @@ async def chat_completions(request: Request):
             yield f"data: {err_msg}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
         finally:
+            await resp.aclose()
             await client.aclose()
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
@@ -168,5 +251,12 @@ async def chat_completions(request: Request):
 
 def start_proxy(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
+    # Fail closed: binding off loopback exposes the operator's keys to the
+    # network, so refuse unless an access token is configured to gate callers.
+    if host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("OMNICLI_PROXY_TOKEN"):
+        raise RuntimeError(
+            f"refusing to bind proxy to {host!r} without OMNICLI_PROXY_TOKEN set — "
+            "an unauthenticated listener would let any caller spend your provider keys"
+        )
     print(f"Starting OmniCLI local proxy on http://{host}:{port}/v1 ...")
     uvicorn.run(app, host=host, port=port, log_level="warning")

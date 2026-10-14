@@ -2493,6 +2493,37 @@ class TestRedteamGroundingIntegration(unittest.TestCase):
         )
         self.assertEqual(triaged[0]["status"], "not_actionable_for_handler")
 
+    def test_hook_enforces_auth_requires_rejecting_action_not_logging(self):
+        """A hook must actually reject callers to count as enforcing auth.
+
+        Logging ``current_user`` or a stray 401 literal is not enforcement;
+        treating it as such would dismiss genuine missing-auth findings.
+        """
+        import ast as _ast
+        from omnicli.evidence import _hook_enforces_auth
+
+        def enforces(src: str) -> bool:
+            return _hook_enforces_auth(_ast.parse(src).body[0])
+
+        # Not enforcement — must be False.
+        self.assertFalse(enforces("def h():\n    logger.info(current_user.id)\n"))
+        self.assertFalse(enforces("def h():\n    logger.info('code %s', 401)\n"))
+        self.assertFalse(enforces("def h():\n    code = 401\n    return 'ok', 200\n"))
+        # Real enforcement — must be True.
+        self.assertTrue(enforces("def h():\n    abort(401)\n"))
+        self.assertTrue(enforces("def h():\n    raise Forbidden()\n"))
+        self.assertTrue(enforces("def h():\n    raise HTTPException(403)\n"))
+        self.assertTrue(enforces("def h():\n    return jsonify(e=1), 401\n"))
+        self.assertTrue(enforces("def h():\n    verify_jwt_in_request()\n"))
+        # Flask-Login bounce-to-login: redirect guarded by login state enforces.
+        self.assertTrue(enforces(
+            "def h():\n"
+            "    if not current_user.is_authenticated:\n"
+            "        return redirect(url_for('login'))\n"
+        ))
+        # A redirect with no identity check is not auth enforcement.
+        self.assertFalse(enforces("def h():\n    return redirect('/maintenance')\n"))
+
     def test_python_project_facts_link_routes_to_helpers_in_supplied_files(self):
         from omnicli.evidence import analyze_python_security_facts
 

@@ -1186,7 +1186,9 @@ def evaluate_staged_security(
                     member_errors = [item.get("error") for item in raw_outputs if item.get("error")]
                     gate_failed = evidence_gate.get("status") == "FAIL"
                     trial_failed = staged_trial_failed(
-                        evidence_gate.get("status", ""), raw_outputs
+                        evidence_gate.get("status", ""),
+                        raw_outputs,
+                        verdicts=typed_judgment.get("verdicts", []),
                     )
                     if gate_failed:
                         gate_failures += 1
