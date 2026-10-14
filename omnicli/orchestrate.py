@@ -24,6 +24,7 @@ import json
 import re
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from omnicli.agent import call_model_with_tools
@@ -927,8 +928,6 @@ def enrichment_candidate_paths(prompt: str) -> List[str]:
     Pure discovery (no reads beyond existence checks) so callers can
     disclose exactly what would leave the machine before enriching.
     """
-    from pathlib import Path
-
     words = re.findall(r"[\w\./~_-]+", prompt)
     candidate_paths: List[Path] = []
     try:
@@ -991,8 +990,6 @@ def enrich_prompt_with_files(prompt: str) -> str:
     to model providers. Never call this on untrusted or library-consumer
     prompts — a path mention silently exfiltrates local files.
     """
-    from pathlib import Path
-
     candidate_paths = [Path(p) for p in enrichment_candidate_paths(prompt)]
     if not candidate_paths:
         return prompt
@@ -1046,7 +1043,6 @@ def generate_redteam_report(
     nothing — calling this function directly is itself the choice to write.
     """
     from datetime import datetime
-    from pathlib import Path
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_path is None:
         reports_dir = Path.cwd() / "reports"
