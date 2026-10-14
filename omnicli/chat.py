@@ -747,21 +747,14 @@ class ChatSession:
                 **pending_files,
             }
             if not source_files:
-                p_lower = user_prompt.lower()
-                folder_keywords = (
-                    "current folder", "this folder", "current directory", "this directory",
-                    "codebase", "repository", "this repo", "project", "folder", "directory",
-                    " .", ". ", "./",
-                )
-                if any(kw in p_lower for kw in folder_keywords):
-                    from omnicli.tools import scan_directory_sources
-                    cwd = Path.cwd()
-                    dir_sources = scan_directory_sources(cwd, max_chars=200_000)
-                    if dir_sources:
-                        source_files.update(dir_sources)
-                        self.console.print(
-                            f"[dim]Auto-scanned current directory: {cwd} ({len(dir_sources)} source files loaded)[/dim]"
-                        )
+                from omnicli.tools import scan_directory_sources
+                cwd = Path.cwd()
+                dir_sources = scan_directory_sources(cwd, max_chars=200_000)
+                if dir_sources:
+                    source_files.update(dir_sources)
+                    self.console.print(
+                        f"[bold yellow]Auto-discovered repository sources from:[/bold yellow] [cyan]{cwd}[/cyan] [dim]({len(dir_sources)} files loaded)[/dim]"
+                    )
             if sum(len(content) for content in source_files.values()) > 200_000:
                 self.console.print(
                     "[red]Red-team source files exceed the 200,000-character limit.[/red]"

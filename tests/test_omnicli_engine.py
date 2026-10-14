@@ -5310,8 +5310,9 @@ class TestSwarm(unittest.TestCase):
                 run_orchestration.call_args_list[0].kwargs["prompt"],
                 "Review this source.",
             )
-            self.assertEqual(
-                run_orchestration.call_args_list[1].kwargs["source_files"], {}
+            self.assertNotIn(
+                str(source_path),
+                run_orchestration.call_args_list[1].kwargs["source_files"],
             )
             self.assertEqual(session.pending_files, {})
             printed_panels = [
@@ -5360,6 +5361,39 @@ class TestSwarm(unittest.TestCase):
                 "200,000-character limit",
                 session.console.print.call_args.args[0],
             )
+
+    def test_chat_redteam_auto_loads_cwd_when_no_files_supplied(self):
+        import tempfile
+        from pathlib import Path
+        from omnicli.chat import ChatSession
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "main.py").write_text("def app(): return 42\n", encoding="utf-8")
+            session = ChatSession.__new__(ChatSession)
+            session.console = MagicMock()
+            session.cfg = MagicMock()
+            session.client = MagicMock()
+            session.provider = "groq"
+            session.model = "llama-3"
+            session.mode = "redteam"
+            session.council_size = 2
+            session.messages = []
+            session.pending_files = {}
+            session.last_report_path = None
+
+            with patch("pathlib.Path.cwd", return_value=root), patch.object(
+                ChatSession, "_apply_memory"
+            ), patch(
+                "omnicli.orchestrate.run_orchestration",
+                return_value={"members": [], "final": "OK"},
+            ) as run_orch:
+                session.stream_turn("read my fiels to hlep me")
+
+            run_orch.assert_called_once()
+            loaded_sources = run_orch.call_args.kwargs["source_files"]
+            self.assertIn("main.py", loaded_sources)
+            self.assertEqual(loaded_sources["main.py"], "def app(): return 42\n")
 
     def test_chat_keys_and_retry_flow(self):
         from omnicli.chat import ChatSession
