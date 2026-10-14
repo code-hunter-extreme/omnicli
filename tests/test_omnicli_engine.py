@@ -2854,6 +2854,13 @@ class TestScopeGateSSRF(unittest.TestCase):
         # No allowlist at all: allow_localhost alone still permits (unchanged).
         g3 = self._gate(allow_localhost=True)
         self.assertTrue(g3.is_in_scope("http://127.0.0.1/x")[0])
+        # A wildcard allowlist that matches the localhost base host authorizes it
+        # (use the real host matcher, not exact membership).
+        g4 = self._gate(allowed_hosts=["*.localhost"], allow_localhost=True)
+        self.assertTrue(g4.is_in_scope("http://localhost/x")[0])
+        # Listing one loopback alias authorizes the others (same machine).
+        g5 = self._gate(allowed_hosts=["127.0.0.1"], allow_localhost=True)
+        self.assertTrue(g5.is_in_scope("http://localhost/x")[0])
 
     def test_parser_differential_authority_blocked(self):
         from omnicli.deterministic import ScopeGate
