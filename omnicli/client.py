@@ -385,20 +385,11 @@ class OmniClient:
         try:
             res = self.post_chat_completion(url, headers, payload, timeout)
             if res.status_code != 200:
-                if res.status_code in (400, 404) and any(
-                    x in res.text.lower() for x in ("model_not_found", "does not exist", "not have access", "invalid_model")
-                ):
-                    try:
-                        from omnicli.scanner import scan_provider
-                        scan_provider(provider_id, cfg=self.cfg, client=self)
-                        new_model = self.cfg.get_default_model(provider_id)
-                        if new_model and new_model != payload["model"]:
-                            payload["model"] = new_model
-                            retry_res = self.post_chat_completion(url, headers, payload, timeout)
-                            if retry_res.status_code == 200:
-                                return retry_res.json()
-                    except Exception:
-                        pass
+                # Do NOT silently substitute a different model on
+                # model_not_found and return it under the requested name:
+                # callers (red-team scoring) attribute the output to the model
+                # they asked for, so a swap mislabels which model produced it.
+                # Fail loudly and let the caller pick a valid model.
                 raise ProviderError(provider_id, res.status_code, res.text)
             return res.json()
         except httpx.RequestError as e:
@@ -448,40 +439,10 @@ class OmniClient:
                 with client.stream("POST", url, headers=headers, json=payload) as response:
                     if response.status_code != 200:
                         err_body = response.read().decode("utf-8", errors="replace")
-                        if response.status_code in (400, 404) and any(
-                            x in err_body.lower() for x in ("model_not_found", "does not exist", "not have access", "invalid_model")
-                        ):
-                            try:
-                                from omnicli.scanner import scan_provider
-                                scan_provider(provider_id, cfg=self.cfg, client=self)
-                                new_model = self.cfg.get_default_model(provider_id)
-                                if new_model and new_model != payload["model"]:
-                                    payload["model"] = new_model
-                                    with client.stream("POST", url, headers=headers, json=payload) as retry_resp:
-                                        if retry_resp.status_code == 200:
-                                            for line in retry_resp.iter_lines():
-                                                if not line:
-                                                    continue
-                                                line_str = line.strip()
-                                                if line_str.startswith("data: "):
-                                                    data_chunk = line_str[6:].strip()
-                                                    if data_chunk == "[DONE]":
-                                                        break
-                                                    try:
-                                                        parsed = json.loads(data_chunk)
-                                                        choices = parsed.get("choices", [])
-                                                        if choices:
-                                                            delta = choices[0].get("delta", {})
-                                                            content = delta.get("content", "")
-                                                            if content is not None and content != "":
-                                                                yield {"type": "content", "delta": str(content), "raw": parsed}
-                                                        if "usage" in parsed and parsed["usage"]:
-                                                            yield {"type": "usage", "usage": parsed["usage"]}
-                                                    except json.JSONDecodeError:
-                                                        continue
-                                            return
-                            except Exception:
-                                pass
+                        # Do NOT silently substitute a different model on
+                        # model_not_found: the stream would be attributed to the
+                        # requested model though another produced it. Surface the
+                        # error loudly so the caller picks a valid model.
                         yield {
                             "type": "error",
                             "status_code": response.status_code,

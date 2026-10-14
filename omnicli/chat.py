@@ -784,6 +784,14 @@ class ChatSession:
                 ))
             t0 = time.perf_counter()
             active_size = self.council_size or len(self.cfg.data.get("providers", {}))
+            # Deliver the active (memory-augmented) system prompt to the council.
+            # _apply_memory() keeps messages[0] in sync, so it is authoritative.
+            # run_orchestration honours `system` for collaborate mode only.
+            council_system = (
+                self.messages[0]["content"]
+                if self.messages and self.messages[0].get("role") == "system"
+                else None
+            )
             with self.console.status(
                 f"[bold cyan]Council ({self.mode.upper()}) reasoning across {active_size} models in parallel...[/bold cyan]",
                 spinner="dots",
@@ -798,6 +806,7 @@ class ChatSession:
                     judge=(self.provider, self.model),
                     source_files=source_files or pending_files,
                     report_path="reports",
+                    system=council_system if self.mode == "collaborate" else None,
                 )
             total_time = time.perf_counter() - t0
 

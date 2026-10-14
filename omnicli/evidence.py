@@ -159,6 +159,34 @@ def parse_challenge_triage(answer: str) -> list[Dict[str, str]]:
     return sorted(unique.values(), key=lambda item: text.find(item["candidate_id"]))
 
 
+_AUTH_ENFORCE_NAMES = frozenset({
+    "login_required", "jwt_required", "require_auth", "requires_auth",
+    "authenticate", "verify_jwt", "verify_jwt_in_request", "check_auth",
+    "unauthorized", "forbidden", "login_manager", "current_user",
+})
+
+
+def _hook_enforces_auth(fn: ast.AST) -> bool:
+    """Best-effort: does this request-hook body actually enforce auth?
+
+    Returns True only on concrete enforcement signals — a 401/403 status, an
+    ``abort(401/403)``, a raised Unauthorized/Forbidden, or a call to a known
+    auth guard. Anything else leaves enforcement unproven (callers must not
+    then claim auth is *absent* on the strength of this record alone).
+    """
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Constant) and n.value in (401, 403):
+            return True
+        name = None
+        if isinstance(n, ast.Name):
+            name = n.id
+        elif isinstance(n, ast.Attribute):
+            name = n.attr
+        if name and name.lower() in _AUTH_ENFORCE_NAMES:
+            return True
+    return False
+
+
 def analyze_python_security_facts(
     sources: Mapping[str, str],
 ) -> list[Dict[str, object]]:
@@ -260,6 +288,7 @@ def analyze_python_security_facts(
                     "handler": function.name,
                     "line": function.lineno,
                     "decorators": hook_decorators,
+                    "enforces_auth": _hook_enforces_auth(function),
                 })
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
