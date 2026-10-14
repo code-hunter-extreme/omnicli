@@ -50,8 +50,19 @@ def _reject_cross_site(request: Request) -> None:
     that a browser marks as coming from a non-local origin.
     """
     origin = request.headers.get("origin")
-    if origin and not _LOCAL_ORIGIN_RE.match(origin):
-        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+    if origin is not None:
+        # Origin is authoritative when present: a browser sends it on every
+        # cross-origin request. A local origin (incl. a different local port) is
+        # allowed — that is a legitimate local cross-origin call CORS permits;
+        # a non-local origin is a drive-by and is rejected. Do not also consult
+        # Sec-Fetch-Site here, or a local localhost:3000 → 127.0.0.1:8000 call
+        # (marked cross-site) would be wrongly blocked.
+        if not _LOCAL_ORIGIN_RE.match(origin):
+            raise HTTPException(status_code=403, detail="cross-origin request rejected")
+        return
+    # No Origin header (non-browser client, or same-origin on some browsers).
+    # Fall back to Sec-Fetch-Site to catch a browser cross-site POST that omits
+    # Origin; non-browser clients send neither header and pass.
     fetch_site = request.headers.get("sec-fetch-site")
     if fetch_site and fetch_site.lower() not in ("same-origin", "same-site", "none"):
         raise HTTPException(status_code=403, detail="cross-site request rejected")

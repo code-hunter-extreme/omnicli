@@ -2515,6 +2515,14 @@ class TestRedteamGroundingIntegration(unittest.TestCase):
         self.assertTrue(enforces("def h():\n    raise HTTPException(403)\n"))
         self.assertTrue(enforces("def h():\n    return jsonify(e=1), 401\n"))
         self.assertTrue(enforces("def h():\n    verify_jwt_in_request()\n"))
+        # Flask-Login bounce-to-login: redirect guarded by login state enforces.
+        self.assertTrue(enforces(
+            "def h():\n"
+            "    if not current_user.is_authenticated:\n"
+            "        return redirect(url_for('login'))\n"
+        ))
+        # A redirect with no identity check is not auth enforcement.
+        self.assertFalse(enforces("def h():\n    return redirect('/maintenance')\n"))
 
     def test_python_project_facts_link_routes_to_helpers_in_supplied_files(self):
         from omnicli.evidence import analyze_python_security_facts

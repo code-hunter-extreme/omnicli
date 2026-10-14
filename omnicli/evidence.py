@@ -168,6 +168,12 @@ _AUTH_GUARD_CALLS = frozenset({
 })
 # Exception types whose raise denies the request.
 _AUTH_RAISE_NAMES = frozenset({"unauthorized", "forbidden"})
+# Identity/login-state references. On their own these prove nothing (logging
+# current_user is not enforcement), but a redirect *guarded by* one of these is
+# the standard Flask-Login pattern of bouncing anonymous users to a login page.
+_AUTH_IDENTITY_NAMES = frozenset({
+    "current_user", "is_authenticated", "is_anonymous", "logged_in", "authenticated",
+})
 
 
 def _call_name(call: ast.Call) -> Optional[str]:
@@ -198,11 +204,14 @@ def _hook_enforces_auth(fn: ast.AST) -> bool:
 
     Requires a concrete rejecting action — ``abort(401/403)``, a raised
     Unauthorized/Forbidden (or any raise carrying a 401/403), a ``return`` that
-    carries a 401/403 status, or a call to a known auth guard. A bare reference
-    to ``current_user`` or a 401 literal in a log line does NOT count: logging
-    is not enforcement. When enforcement is unproven this returns False, and
-    callers must not then claim auth is *absent* on this record alone.
+    carries a 401/403 status, a call to a known auth guard, or a ``redirect(...)``
+    guarded by a login-state reference (the Flask-Login bounce-to-login pattern).
+    A bare reference to ``current_user`` or a 401 literal in a log line does NOT
+    count: logging is not enforcement. When enforcement is unproven this returns
+    False, and callers must not then claim auth is *absent* on this record alone.
     """
+    has_redirect = False
+    has_identity_ref = False
     for n in ast.walk(fn):
         if isinstance(n, ast.Call):
             cn = _call_name(n)
@@ -212,6 +221,8 @@ def _hook_enforces_auth(fn: ast.AST) -> bool:
                 return True
             if cn and cn.lower() in _AUTH_GUARD_CALLS:
                 return True
+            if cn == "redirect":
+                has_redirect = True
         elif isinstance(n, ast.Raise) and n.exc is not None:
             exc = n.exc
             if isinstance(exc, ast.Call):
@@ -229,7 +240,18 @@ def _hook_enforces_auth(fn: ast.AST) -> bool:
         elif isinstance(n, ast.Return) and n.value is not None:
             if _has_rejecting_status(n.value):
                 return True
-    return False
+        ref = None
+        if isinstance(n, ast.Name):
+            ref = n.id
+        elif isinstance(n, ast.Attribute):
+            ref = n.attr
+        if ref and ref.lower() in _AUTH_IDENTITY_NAMES:
+            has_identity_ref = True
+    # A redirect gated on login state (e.g. `if not current_user.is_authenticated:
+    # return redirect(url_for("login"))`) rejects anonymous callers. A redirect
+    # without any identity check, or an identity reference with no rejecting
+    # action, does not qualify.
+    return has_redirect and has_identity_ref
 
 
 def analyze_python_security_facts(
