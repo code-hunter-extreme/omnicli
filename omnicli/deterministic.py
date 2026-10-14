@@ -110,10 +110,18 @@ class ScopeGate:
             return False, "out_of_scope: ambiguous/unsafe URL authority", None
 
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            if self.allow_localhost:
-                pin = "::1" if host == "::1" else "127.0.0.1"
-                return True, "in_scope: localhost permitted", pin
-            return False, "out_of_scope: localhost access blocked", None
+            if not self.allow_localhost:
+                return False, "out_of_scope: localhost access blocked", None
+            # allow_localhost grants local-address permission, but it must not
+            # bypass host authorization: with an explicit allowlist, localhost
+            # is reachable only if the operator also listed it. Both checks are
+            # required — otherwise `--allowed-host x --allow-local` would silently
+            # authorize 127.0.0.1 that was never in scope.
+            loopback_aliases = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+            if self.allowed_hosts and not (loopback_aliases & set(self.allowed_hosts)):
+                return False, "out_of_scope: localhost not in authorized host list", None
+            pin = "::1" if host == "::1" else "127.0.0.1"
+            return True, "in_scope: localhost permitted", pin
 
         if host in self.blocked_hosts or any(host.endswith("." + b) for b in self.blocked_hosts):
             return False, f"EXPLICIT_BLOCKED: host '{host}' is in blacklisted/metadata domains", None
