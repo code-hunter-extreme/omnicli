@@ -10,11 +10,12 @@ Provides standard OpenAI function schemas and local execution for:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 from omnicli.deterministic import (
@@ -281,8 +282,135 @@ def format_tool_error(code: str, message: str, remedy: str = "") -> str:
     return f"Error: {message}\n" + json.dumps(err, indent=2)
 
 
+def tool_list_directory(path: str = ".", max_depth: int = 2) -> str:
+    """List directory contents (files and folders) within the project workspace."""
+    try:
+        p = check_workspace_jail(path)
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+
+    if not p.exists():
+        return format_tool_error("E_NOT_FOUND", f"Directory '{path}' does not exist.", "Check directory path spelling.")
+    if not p.is_dir():
+        return format_tool_error("E_NOT_DIR", f"'{path}' is a file, not a directory.", "Use read_file to inspect files.")
+
+    try:
+        try:
+            max_depth = int(max_depth) if max_depth not in (None, "None", "") else 2
+        except (ValueError, TypeError):
+            max_depth = 2
+
+        entries = []
+        root_path = p.resolve()
+        ignored_names = {
+            ".git", "__pycache__", "venv", ".venv", "env", "node_modules",
+            ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+            ".egg-info", ".idea", ".vscode"
+        }
+
+        for current_root, dirs, files in os.walk(root_path):
+            curr = Path(current_root)
+            try:
+                rel = curr.relative_to(root_path)
+            except ValueError:
+                continue
+            depth = len(rel.parts)
+            # Prune ignored directories in place
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ignored_names]
+            if depth >= max_depth:
+                dirs.clear()
+
+            prefix = "" if str(rel) == "." else f"{rel}/"
+            for d in sorted(dirs):
+                entries.append(f"📁 {prefix}{d}/")
+            for f in sorted(files):
+                if f.startswith("."):
+                    continue
+                fpath = curr / f
+                try:
+                    st = fpath.stat()
+                    size_b = st.st_size
+                    size_str = f"{size_b:,} B" if size_b < 1024 else f"{size_b / 1024:.1f} KB"
+                    entries.append(f"📄 {prefix}{f} ({size_str})")
+                except OSError:
+                    entries.append(f"📄 {prefix}{f}")
+
+                if len(entries) >= 250:
+                    entries.append("... [truncated, directory contains > 250 items]")
+                    break
+            if len(entries) >= 250:
+                break
+
+        header = f"--- Directory listing: {p} ({len(entries)} items) ---\n"
+        return header + "\n".join(entries)
+    except Exception as e:
+        return format_tool_error("E_IO", f"Error listing directory: {e}")
+
+
+def scan_directory_sources(
+    directory: str | Path = ".",
+    max_chars: int = 200_000,
+    allowed_extensions: Optional[Set[str]] = None,
+) -> Dict[str, str]:
+    """Scan directory recursively and load readable source files up to max_chars limit."""
+    p = Path(directory).expanduser().resolve()
+    if not p.is_dir():
+        return {}
+
+    extensions = allowed_extensions or {
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".php",
+        ".rb", ".c", ".cpp", ".h", ".hpp", ".java", ".sh", ".bash",
+        ".sql", ".json", ".yaml", ".yml", ".toml", ".html", ".css", ".md",
+    }
+    ignored_names = {
+        ".git", "__pycache__", "venv", ".venv", "env", "node_modules",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+        ".egg-info", ".idea", ".vscode"
+    }
+
+    results: Dict[str, str] = {}
+    total_chars = 0
+
+    for current_root, dirs, files in os.walk(p):
+        curr = Path(current_root)
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ignored_names]
+
+        for f in sorted(files):
+            fpath = curr / f
+            if fpath.suffix.lower() not in extensions:
+                continue
+            try:
+                rel_path = str(fpath.relative_to(p)).replace("\\", "/")
+            except ValueError:
+                rel_path = str(fpath).replace("\\", "/")
+
+            try:
+                # Skip giant binary or data files (> 200KB)
+                if fpath.stat().st_size > 200_000:
+                    continue
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+                if not content.strip():
+                    continue
+                if total_chars + len(content) > max_chars:
+                    remaining = max_chars - total_chars
+                    suffix = "\n... [truncated to fit 200k char budget]"
+                    if remaining > len(suffix) + 50:
+                        results[rel_path] = content[: remaining - len(suffix)] + suffix
+                    total_chars = max_chars
+                    break
+                results[rel_path] = content
+                total_chars += len(content)
+            except Exception:
+                continue
+
+        if total_chars >= max_chars:
+            break
+
+    return results
+
+
 def tool_read_file(path: str, max_lines: int = 300) -> str:
-    """Read the contents of a local file with path jail verification."""
+    """Read the contents of a local file or directory with path jail verification."""
     try:
         p = check_workspace_jail(path)
     except PermissionError as pe:
@@ -290,8 +418,10 @@ def tool_read_file(path: str, max_lines: int = 300) -> str:
 
     if not p.exists():
         return format_tool_error("E_NOT_FOUND", f"File '{path}' does not exist.", "Check file path spelling and location.")
+    if p.is_dir():
+        return tool_list_directory(path)
     if not p.is_file():
-        return format_tool_error("E_NOT_FILE", f"'{path}' is not a regular file.", "Specify a file path, not a directory.")
+        return format_tool_error("E_NOT_FILE", f"'{path}' is not a regular file.", "Specify a file path or directory.")
     try:
         try:
             max_lines = int(max_lines) if max_lines not in (None, "None", "") else 300
@@ -421,6 +551,20 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and subdirectories in a workspace folder (defaults to current folder '.').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative folder path (default '.')", "default": "."},
+                    "max_depth": {"type": "integer", "description": "Maximum directory traversal depth (default 2)", "default": 2},
+                },
             },
         },
     },
@@ -604,6 +748,8 @@ def execute_tool_call(
     """Execute a function call by name and arguments."""
     if tool_name == "bash":
         return tool_bash(command=arguments.get("command", ""), allow_shell=allow_shell)
+    elif tool_name == "list_directory":
+        return tool_list_directory(path=arguments.get("path", "."), max_depth=arguments.get("max_depth", 2))
     elif tool_name == "read_file":
         return tool_read_file(path=arguments.get("path", ""), max_lines=arguments.get("max_lines", 300))
     elif tool_name == "write_file":

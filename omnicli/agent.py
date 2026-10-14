@@ -58,7 +58,7 @@ Rules:
    - PROOF: the verify_http / analyze_python_security / verify_code / verify_consensus tool result and how it supports this exact claim; analyzer candidates support only a source-level lead, not exploitability.
    - IMPACT: what an attacker can do with this.
    - REPRO: the exact curl command to reproduce.
-4. Use bash and read_file to gather evidence. Use consult_provider to get a second opinion.
+4. Use bash, list_directory, and read_file to explore the project folder and gather evidence. Use consult_provider to get a second opinion.
 5. Be thorough. Check auth, access control, information disclosure, and error handling.
 6. Use verify_http only for operator-authorized hosts configured for this run. GET, HEAD, and OPTIONS are permitted by default; never use state-changing methods unless the operator explicitly enabled them.
 """
@@ -70,7 +70,7 @@ from omnicli.tools import TOOL_DEFINITIONS as _ALL_TOOLS
 
 _REDTEAM_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] in (
     "verify_http", "verify_code", "analyze_python_security", "verify_consensus",
-    "bash", "read_file", "consult_provider",
+    "bash", "read_file", "consult_provider", "list_directory",
 )]
 
 
@@ -245,11 +245,11 @@ class AgentRunner:
         else:
             system_prompt = (
                 "You are an expert autonomous AI agent equipped with local tools: "
-                "'bash' (run commands), 'read_file', 'write_file', 'registry_search' "
-                "(search ~6,400 local tools in Program Registry), and 'consult_provider' "
-                "(ask NVIDIA NIM, XKiro, OpenRouter, Cloudflare, Bynara, or Apinex for "
-                "specialized help). Always inspect and verify before answering. Use tools "
-                "actively to gather truth."
+                "'bash' (run commands), 'read_file', 'write_file', 'list_directory' "
+                "(explore folders), 'registry_search' (search ~6,400 local tools in Program "
+                "Registry), and 'consult_provider' (ask NVIDIA NIM, XKiro, OpenRouter, "
+                "Cloudflare, Bynara, or Apinex for specialized help). Always inspect and "
+                "verify before answering. Use tools actively to gather truth."
             )
 
         # Layer per-provider memory (context files) on top of the system prompt.
@@ -277,7 +277,7 @@ class AgentRunner:
                 f"[bold cyan]OmniCLI Agent Goal:[/bold cyan] {goal}\n"
                 f"[bold green]Supervisor:[/bold green] {active_provider} ({active_model})  |  "
                 f"[dim]Roster: {len(roster)} model(s) across {span}  |  "
-                f"Tools: bash, file_ops, registry_search (6.4k tools), cross-provider[/dim]",
+                f"Tools: bash, file_ops, list_directory, registry_search (6.4k tools), cross-provider[/dim]",
                 title="Agent Active",
                 border_style="cyan",
             )

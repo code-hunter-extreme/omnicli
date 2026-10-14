@@ -69,11 +69,15 @@ class SlashCommandCompleter(Completer):
             ("/retry", "Retry the last failed prompt after updating key or provider"),
             ("/system", "View or set system prompt"),
             ("/temp", "Set generation temperature (0.0 - 2.0)"),
-            ("/file", "Attach a file to chat context"),
+            ("/file", "Attach a file or directory to chat context"),
+            ("/folder", "Attach an entire folder of source files to chat context"),
+            ("/dir", "Attach an entire folder of source files to chat context"),
+            ("/ls", "List files and subdirectories in workspace"),
             ("/save", "Save conversation to a Markdown file"),
             ("/clear", "Clear chat history"),
             ("/forget", "Delete persisted history for the active provider"),
             ("/ping", "Test latency to all providers"),
+            ("/builder", "Collaborative build mode (all models reason together)"),
             ("/help", "Show available commands"),
             ("/exit", "Exit the chat session"),
         ]
@@ -214,7 +218,9 @@ class ChatSession:
         table.add_row("/retry, /r", "Retry the last failed prompt after updating key/provider")
         table.add_row("/system, /s [prompt]", "Show or change the active system prompt")
         table.add_row("/temp <0.0-2.0>", "Adjust sampling temperature")
-        table.add_row("/file <path>", "Attach file content to the next prompt")
+        table.add_row("/file <path>", "Attach file or folder content to the next prompt")
+        table.add_row("/folder, /dir [path]", "Attach all code files in folder to the next prompt")
+        table.add_row("/ls, /tree [path]", "List files and subdirectories in workspace")
         table.add_row("/clear", "Clear chat message history (in-session only)")
         table.add_row("/forget", "Delete persisted history file for the active provider")
         table.add_row("/save [path]", "Save conversation transcript to a markdown file")
@@ -538,11 +544,28 @@ class ChatSession:
 
         elif cmd == "/file":
             if not arg:
-                self.console.print("[red]Usage: /file <path/to/file>[/red]")
+                self.console.print("[red]Usage: /file <path/to/file_or_directory>[/red]")
             else:
-                fpath = Path(arg).expanduser()
-                if not fpath.exists() or not fpath.is_file():
-                    self.console.print(f"[red]File not found: {fpath}[/red]")
+                fpath = Path(arg).expanduser().resolve()
+                if not fpath.exists():
+                    self.console.print(f"[red]Path not found: {fpath}[/red]")
+                elif fpath.is_dir():
+                    from omnicli.tools import scan_directory_sources
+                    pending_files = getattr(self, "pending_files", {})
+                    curr_chars = sum(len(c) for c in pending_files.values())
+                    remaining = max(0, 200_000 - curr_chars)
+                    dir_files = scan_directory_sources(fpath, max_chars=remaining)
+                    if not dir_files:
+                        self.console.print(f"[yellow]No supported code files found in directory: {fpath}[/yellow]")
+                    else:
+                        for dpath, dcontent in dir_files.items():
+                            pending_files[dpath] = dcontent
+                        self.pending_files = pending_files
+                        total_added = sum(len(c) for c in dir_files.values())
+                        self.console.print(
+                            f"[bold green]Loaded directory for the next prompt:[/bold green] "
+                            f"{fpath} ({len(dir_files)} files, {total_added:,} chars)"
+                        )
                 else:
                     try:
                         content = fpath.read_text(encoding="utf-8", errors="replace")
@@ -565,6 +588,34 @@ class ChatSession:
                             )
                     except Exception as e:
                         self.console.print(f"[red]Error reading file: {e}[/red]")
+
+        elif cmd in ("/folder", "/dir"):
+            target_dir = Path(arg).expanduser().resolve() if arg else Path.cwd()
+            if not target_dir.exists() or not target_dir.is_dir():
+                self.console.print(f"[red]Directory not found: {target_dir}[/red]")
+            else:
+                from omnicli.tools import scan_directory_sources
+                pending_files = getattr(self, "pending_files", {})
+                curr_chars = sum(len(c) for c in pending_files.values())
+                remaining = max(0, 200_000 - curr_chars)
+                dir_files = scan_directory_sources(target_dir, max_chars=remaining)
+                if not dir_files:
+                    self.console.print(f"[yellow]No supported code files found in: {target_dir}[/yellow]")
+                else:
+                    for dpath, dcontent in dir_files.items():
+                        pending_files[dpath] = dcontent
+                    self.pending_files = pending_files
+                    total_added = sum(len(c) for c in dir_files.values())
+                    self.console.print(
+                        f"[bold green]Loaded directory for the next prompt:[/bold green] "
+                        f"{target_dir} ({len(dir_files)} files, {total_added:,} chars)"
+                    )
+
+        elif cmd in ("/ls", "/tree"):
+            from omnicli.tools import tool_list_directory
+            target = arg if arg else "."
+            tree_output = tool_list_directory(target)
+            self.console.print(Panel(tree_output, title=f"Directory Listing: {target}", border_style="cyan"))
 
         elif cmd in ("/keys",):
             self.show_keys(arg or None)
@@ -695,6 +746,22 @@ class ChatSession:
                 **extract_sources_from_prompt(user_prompt),
                 **pending_files,
             }
+            if not source_files:
+                p_lower = user_prompt.lower()
+                folder_keywords = (
+                    "current folder", "this folder", "current directory", "this directory",
+                    "codebase", "repository", "this repo", "project", "folder", "directory",
+                    " .", ". ", "./",
+                )
+                if any(kw in p_lower for kw in folder_keywords):
+                    from omnicli.tools import scan_directory_sources
+                    cwd = Path.cwd()
+                    dir_sources = scan_directory_sources(cwd, max_chars=200_000)
+                    if dir_sources:
+                        source_files.update(dir_sources)
+                        self.console.print(
+                            f"[dim]Auto-scanned current directory: {cwd} ({len(dir_sources)} source files loaded)[/dim]"
+                        )
             if sum(len(content) for content in source_files.values()) > 200_000:
                 self.console.print(
                     "[red]Red-team source files exceed the 200,000-character limit.[/red]"
@@ -736,7 +803,7 @@ class ChatSession:
                     size=self.council_size,
                     synth=True,
                     judge=(self.provider, self.model),
-                    source_files=source_files,
+                    source_files=source_files or pending_files,
                     report_path="reports",
                 )
             total_time = time.perf_counter() - t0

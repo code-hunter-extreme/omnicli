@@ -101,7 +101,7 @@ def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
 @click.option("-m", "--model", help="Model identifier")
 @click.option("-s", "--system", help="System prompt")
 @click.option("-t", "--temperature", type=float, default=0.7, help="Sampling temperature (0.0 - 2.0)")
-@click.option("-f", "--file", "input_file", type=click.Path(exists=True), help="Attach file content")
+@click.option("-f", "--file", "input_file", type=click.Path(exists=True), help="Attach file or directory content")
 @click.option("--max-tokens", type=int, default=2048, help="Max tokens to generate (default: 2048)")
 @click.option("--no-stream", is_flag=True, help="Disable streaming output")
 @click.option("--raw", is_flag=True, help="Output raw text without rich markdown formatting")
@@ -131,11 +131,24 @@ def cmd_ask(
 
     if input_file:
         try:
-            content = Path(input_file).read_text(encoding="utf-8", errors="replace")
-            file_block = f"\n\n[Attached File: {Path(input_file).name}]\n```\n{content}\n```\n"
-            prompt = f"{prompt}{file_block}" if prompt else file_block
+            path_obj = Path(input_file).resolve()
+            if path_obj.is_dir():
+                from omnicli.tools import scan_directory_sources
+                dir_sources = scan_directory_sources(path_obj, max_chars=200_000)
+                if not dir_sources:
+                    console.print(f"[yellow]No supported code files found in directory: {path_obj}[/yellow]")
+                else:
+                    file_blocks = []
+                    for spath, scontent in dir_sources.items():
+                        file_blocks.append(f"\n\n[Attached File: {Path(spath).name} ({spath})]\n```\n{scontent}\n```\n")
+                    folder_block = "".join(file_blocks)
+                    prompt = f"{prompt}{folder_block}" if prompt else folder_block
+            else:
+                content = path_obj.read_text(encoding="utf-8", errors="replace")
+                file_block = f"\n\n[Attached File: {path_obj.name}]\n```\n{content}\n```\n"
+                prompt = f"{prompt}{file_block}" if prompt else file_block
         except Exception as e:
-            console.print(f"[bold red]Failed to read attached file:[/bold red] {e}")
+            console.print(f"[bold red]Failed to read attached file/directory:[/bold red] {e}")
             sys.exit(1)
 
     if not prompt:
@@ -957,8 +970,11 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--checkpoint", type=click.Path(dir_okay=False), help="Opt in to a local SQLite checkpoint (stores the prompt and model outputs)")
 @click.option("--resume", is_flag=True, help="Resume the existing --checkpoint; the same mode and prompt are required")
 @click.option("--source-file", "source_paths", multiple=True,
-              type=click.Path(exists=True, dir_okay=False),
-              help="Supply source for exact quote/line grounding; repeat as needed")
+              type=click.Path(exists=True, dir_okay=True),
+              help="Supply source file or directory for exact quote/line grounding; repeat as needed")
+@click.option("--dir", "--folder", "source_dir",
+              type=click.Path(exists=True, file_okay=False),
+              help="Supply target directory to load code sources for review")
 @click.option("--report-path", type=click.Path(), default="reports",
               help="Red-team report destination: file path or directory (default: ./reports)")
 @click.argument("prompt", nargs=-1, required=True)
@@ -966,33 +982,65 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
               redteam: bool, raw: bool, enrich_files: bool, member_tools: bool,
               allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
-              report_path: str, prompt: tuple) -> None:
+              source_dir: Optional[str], report_path: str, prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
     from omnicli import orchestrate as orch
+    from omnicli.tools import scan_directory_sources
     task = " ".join(prompt).strip()
     source_files = {}
     total_source_chars = 0
-    for source_path in source_paths:
+
+    all_inputs = list(source_paths)
+    if source_dir:
+        all_inputs.append(source_dir)
+
+    for source_path in all_inputs:
         path = Path(source_path)
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            raise click.ClickException(f"Could not read source file {path}: {exc}") from exc
-        total_source_chars += len(content)
-        if total_source_chars > 200_000:
-            raise click.BadParameter(
-                "combined --source-file content exceeds 200,000 characters",
-                param_hint="--source-file",
-            )
-        source_files[str(path)] = content
+        if path.is_dir():
+            remaining = max(0, 200_000 - total_source_chars)
+            dir_files = scan_directory_sources(path, max_chars=remaining)
+            for dpath, dcontent in dir_files.items():
+                total_source_chars += len(dcontent)
+                if total_source_chars > 200_000:
+                    raise click.BadParameter(
+                        "combined source content exceeds 200,000 characters",
+                        param_hint="--source-file",
+                    )
+                source_files[dpath] = dcontent
+        else:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise click.ClickException(f"Could not read source file {path}: {exc}") from exc
+            total_source_chars += len(content)
+            if total_source_chars > 200_000:
+                raise click.BadParameter(
+                    "combined --source-file content exceeds 200,000 characters",
+                    param_hint="--source-file",
+                )
+            source_files[str(path)] = content
+
+    active_mode = "redteam" if redteam else ("collaborate" if flag_collaborate else mode)
+
+    # In red-team mode, if no sources were explicitly provided, auto-discover project sources in cwd
+    if active_mode == "redteam" and not source_files:
+        cwd = Path.cwd()
+        dir_files = scan_directory_sources(cwd, max_chars=200_000)
+        if dir_files:
+            source_files.update(dir_files)
+            console.print(Panel(
+                f"[dim]Auto-scanned current directory: {escape(str(cwd))} ({len(dir_files)} source files loaded)[/dim]",
+                title="Red-Team Directory Auto-Discovery",
+                border_style="yellow",
+            ))
+
     swarm = orch.build_swarm(cfg, size=size, provider=provider)
     if not swarm:
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
         return
 
-    active_mode = "redteam" if redteam else ("collaborate" if flag_collaborate else mode)
     if checkpoint and active_mode == "deliberate":
         raise click.UsageError("--checkpoint is not supported with --mode deliberate yet")
     if resume and not checkpoint:
@@ -1012,6 +1060,17 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
             f"These explicitly selected files will be sent to the configured model providers:\n"
             f"{disclosed_files}",
             title="Red-Team Source Disclosure",
+            border_style="yellow",
+        ))
+    elif source_files:
+        disclosed_files = "\n".join(
+            f"- {escape(path)} ({len(content):,} characters)"
+            for path, content in source_files.items()
+        )
+        console.print(Panel(
+            f"These local source files will be sent to the configured model providers:\n"
+            f"{disclosed_files}",
+            title="Source Files Disclosure",
             border_style="yellow",
         ))
     if enrich_files and active_mode != "redteam":

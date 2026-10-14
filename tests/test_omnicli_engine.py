@@ -749,7 +749,7 @@ class TestAgentRedteam(unittest.TestCase):
         allnames = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         self.assertEqual(
             rt, {"verify_http", "verify_code", "verify_consensus",
-                 "analyze_python_security", "bash", "read_file", "consult_provider"}
+                 "analyze_python_security", "bash", "read_file", "consult_provider", "list_directory"}
         )
         # write_file / registry_search must NOT be exposed in red-team mode
         self.assertNotIn("write_file", rt)
@@ -5668,6 +5668,75 @@ class TestWorkspaceJail(unittest.TestCase):
                     must_contain=["secret"],
                 )
                 self.assertIn("REJECTED", verify)
+
+class TestDirectorySupport(unittest.TestCase):
+    def test_tool_list_directory_and_read_file_on_dir(self):
+        from omnicli.tools import tool_list_directory, tool_read_file, execute_tool_call
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sub = root / "src"
+            sub.mkdir()
+            (sub / "app.py").write_text("print('hello')", encoding="utf-8")
+            (root / "README.md").write_text("# Test Project", encoding="utf-8")
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            (git_dir / "config").write_text("[core]", encoding="utf-8")
+
+            with patch("omnicli.tools.Path.cwd", return_value=root):
+                listing = tool_list_directory(str(root))
+                self.assertIn("src/", listing)
+                self.assertIn("app.py", listing)
+                self.assertIn("README.md", listing)
+                self.assertNotIn(".git", listing)
+
+                # tool_read_file on directory automatically lists directory
+                rf_listing = tool_read_file(str(root))
+                self.assertIn("Directory listing", rf_listing)
+                self.assertIn("app.py", rf_listing)
+
+                # execute_tool_call dispatch
+                call_res = execute_tool_call("list_directory", {"path": str(root)})
+                self.assertIn("src/", call_res)
+
+    def test_scan_directory_sources(self):
+        from omnicli.tools import scan_directory_sources
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "mod1.py").write_text("def f(): return 1", encoding="utf-8")
+            (root / "mod2.ts").write_text("const x: number = 2;", encoding="utf-8")
+            (root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            sources = scan_directory_sources(root)
+            self.assertIn("mod1.py", sources)
+            self.assertIn("mod2.ts", sources)
+            self.assertNotIn("image.png", sources)
+
+            # Strict budget cap
+            budget_sources = scan_directory_sources(root, max_chars=15)
+            total = sum(len(c) for c in budget_sources.values())
+            self.assertLessEqual(total, 15)
+
+    def test_chat_folder_slash_command(self):
+        from omnicli.chat import ChatSession
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "service.py").write_text("def serve(): pass\n", encoding="utf-8")
+
+            session = ChatSession.__new__(ChatSession)
+            session.console = MagicMock()
+            session.cfg = MagicMock()
+            session.client = MagicMock()
+            session.provider = "groq"
+            session.model = "llama-3"
+            session.mode = "single"
+            session.pending_files = {}
+
+            self.assertTrue(session.handle_slash_command(f"/folder {root}"))
+            self.assertIn("service.py", session.pending_files)
+            self.assertEqual(session.pending_files["service.py"], "def serve(): pass\n")
 
 
 def main() -> int:
