@@ -110,10 +110,24 @@ class ScopeGate:
             return False, "out_of_scope: ambiguous/unsafe URL authority", None
 
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            if self.allow_localhost:
-                pin = "::1" if host == "::1" else "127.0.0.1"
-                return True, "in_scope: localhost permitted", pin
-            return False, "out_of_scope: localhost access blocked", None
+            if not self.allow_localhost:
+                return False, "out_of_scope: localhost access blocked", None
+            # allow_localhost grants local-address permission, but it must not
+            # bypass host authorization: with an explicit allowlist, localhost
+            # is reachable only if the operator also listed it. Both checks are
+            # required — otherwise `--allowed-host x --allow-local` would silently
+            # authorize 127.0.0.1 that was never in scope.
+            # Authorize via the same allowlist matcher used for other hosts, so a
+            # wildcard rule like '*.localhost' (which matches the base host) still
+            # works. Test every loopback alias so listing one form (e.g.
+            # '127.0.0.1') also authorizes the others.
+            if self.allowed_hosts and not any(
+                self._host_matches_allowlist(a)
+                for a in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            ):
+                return False, "out_of_scope: localhost not in authorized host list", None
+            pin = "::1" if host == "::1" else "127.0.0.1"
+            return True, "in_scope: localhost permitted", pin
 
         if host in self.blocked_hosts or any(host.endswith("." + b) for b in self.blocked_hosts):
             return False, f"EXPLICIT_BLOCKED: host '{host}' is in blacklisted/metadata domains", None
@@ -131,18 +145,29 @@ class ScopeGate:
             # If no explicit whitelist is defined, allow any valid public host not in blacklist
             return True, "in_scope: general public target", pin_ip
 
+        matched = self._host_matches_allowlist(host)
+        if matched:
+            kind = "wildcard" if matched.startswith("*.") else "explicit"
+            return True, f"in_scope: matches {kind} rule '{matched}'", pin_ip
+
+        return False, f"out_of_scope: host '{host}' does not match permitted scopes", None
+
+    def _host_matches_allowlist(self, host: str) -> Optional[str]:
+        """Return the allowlist pattern that authorizes ``host``, else None.
+
+        A '*.' pattern is anchored both ends — '*.victim.com' matches
+        'api.victim.com' and the base 'victim.com', but NOT
+        'api.victim.com.evil.net'. Other patterns require an exact host match.
+        """
         for pattern in self.allowed_hosts:
             if pattern.startswith("*."):
-                # Anchor both ends: *.victim.com must match api.victim.com
-                # but NOT api.victim.com.evil.net (suffix match is not enough).
                 suffix = re.escape(pattern[2:])
                 anchored = re.compile(rf"^(?:[a-zA-Z0-9_\-]+\.)*{suffix}$", re.IGNORECASE)
                 if anchored.match(host):
-                    return True, f"in_scope: matches wildcard rule '{pattern}'", pin_ip
+                    return pattern
             elif host == pattern:
-                return True, f"in_scope: matches explicit rule '{pattern}'", pin_ip
-
-        return False, f"out_of_scope: host '{host}' does not match permitted scopes", None
+                return pattern
+        return None
 
     @staticmethod
     def _resolve_host(host: str) -> List[Any]:

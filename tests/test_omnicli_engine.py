@@ -2871,6 +2871,28 @@ class TestScopeGateSSRF(unittest.TestCase):
         # metadata / link-local stays blocked even with allow_local
         self.assertFalse(g.is_in_scope("http://169.254.169.254/x")[0])
 
+    def test_allow_local_does_not_bypass_explicit_allowlist(self):
+        # With an explicit allowlist that omits localhost, --allow-local must NOT
+        # authorize 127.0.0.1 — local permission and host authorization are both
+        # required (Greptile: deterministic.py localhost bypass).
+        g = self._gate(allowed_hosts=["staging.example"], allow_localhost=True)
+        ok, reason = g.is_in_scope("http://127.0.0.1/x")
+        self.assertFalse(ok)
+        self.assertIn("not in authorized host list", reason)
+        # Listing localhost in the allowlist re-permits it.
+        g2 = self._gate(allowed_hosts=["localhost"], allow_localhost=True)
+        self.assertTrue(g2.is_in_scope("http://127.0.0.1/x")[0])
+        # No allowlist at all: allow_localhost alone still permits (unchanged).
+        g3 = self._gate(allow_localhost=True)
+        self.assertTrue(g3.is_in_scope("http://127.0.0.1/x")[0])
+        # A wildcard allowlist that matches the localhost base host authorizes it
+        # (use the real host matcher, not exact membership).
+        g4 = self._gate(allowed_hosts=["*.localhost"], allow_localhost=True)
+        self.assertTrue(g4.is_in_scope("http://localhost/x")[0])
+        # Listing one loopback alias authorizes the others (same machine).
+        g5 = self._gate(allowed_hosts=["127.0.0.1"], allow_localhost=True)
+        self.assertTrue(g5.is_in_scope("http://localhost/x")[0])
+
     def test_parser_differential_authority_blocked(self):
         from omnicli.deterministic import ScopeGate
         g = ScopeGate()
