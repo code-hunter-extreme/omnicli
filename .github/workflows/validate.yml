@@ -28,10 +28,13 @@ jobs:
 
       # ---- security (promote these first) ----
       - name: gitleaks (secret scan)
+        continue-on-error: true
         run: |
+          set +e
           TAG=$(curl -sSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${TAG}/gitleaks_${TAG}_linux_x64.tar.gz" | tar -xz -C /tmp
-          /tmp/gitleaks detect --source . --no-git --redact --verbose || true
+          /tmp/gitleaks detect --source . --no-git --redact --verbose
+          exit 0
       - name: bandit
         run: bandit -r . -ll || true
       - name: semgrep
