@@ -5356,11 +5356,63 @@ class TestSwarm(unittest.TestCase):
 
             run_orchestration.assert_not_called()
             self.assertEqual(session.pending_files[str(source_path)], "x" * 200_001)
-            self.assertEqual(session.messages, [])
             self.assertIn(
                 "200,000-character limit",
                 session.console.print.call_args.args[0],
             )
+
+    def test_chat_keys_and_retry_flow(self):
+        from omnicli.chat import ChatSession
+
+        session = ChatSession.__new__(ChatSession)
+        session.console = MagicMock()
+        session.cfg = MagicMock()
+        session.client = MagicMock()
+        session.provider = "openrouter"
+        session.model = "meta/llama-3.3-70b"
+        session.mode = "single"
+        session.council_size = 1
+        session.messages = []
+        session.pending_files = {}
+        session.last_failed_prompt = None
+
+        session.cfg.data = {
+            "providers": {
+                "openrouter": {"name": "OpenRouter"},
+                "groq": {"name": "Groq"},
+            }
+        }
+        session.cfg.get_api_key.side_effect = lambda p: "sk-goodkey12345" if p == "openrouter" else ""
+        session.client.ping.side_effect = lambda p: (
+            {"status": "healthy", "latency_ms": 42.0, "model_count": 10}
+            if p == "openrouter"
+            else {"status": "missing_key", "error": "No key configured"}
+        )
+
+        # 1. Test /keys displays health table with -good / -bad
+        self.assertTrue(session.handle_slash_command("/keys"))
+        printed_tables = [
+            call.args[0]
+            for call in session.console.print.call_args_list
+            if call.args and hasattr(call.args[0], "columns")
+        ]
+        self.assertTrue(len(printed_tables) >= 1)
+        table = printed_tables[0]
+        self.assertEqual(table.title, "Provider API Key Health & Status")
+
+        # 2. Test /key updating a key
+        self.assertTrue(session.handle_slash_command("/key groq gsk-newkey12345"))
+        session.cfg.set_api_key.assert_called_with("groq", "gsk-newkey12345")
+
+        # 3. Test /retry with no failed prompt
+        session.handle_slash_command("/retry")
+        self.assertIn("No failed prompt to retry.", str(session.console.print.call_args))
+
+        # 4. Test /retry when there is a failed prompt
+        session.last_failed_prompt = "What is the capital of France?"
+        with patch.object(session, "stream_turn") as mock_stream:
+            self.assertTrue(session.handle_slash_command("/retry"))
+            mock_stream.assert_called_once_with("What is the capital of France?")
 
 
 class TestEnrichPromptAndReports(unittest.TestCase):

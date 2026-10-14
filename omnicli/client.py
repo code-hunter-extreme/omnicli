@@ -129,6 +129,22 @@ class OmniClient:
         if provider_id == "monkeycode":
             return self._list_monkeycode_models(timeout=timeout)
 
+        if provider_id == "databricks":
+            base = self.cfg.get_base_url(provider_id).split("/serving-endpoints")[0].rstrip("/")
+            url = f"{base}/api/2.0/serving-endpoints"
+            headers = self.get_headers(provider_id)
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    res = client.get(url, headers=headers)
+                    if res.status_code == 200:
+                        endpoints = res.json().get("endpoints", [])
+                        return [{"id": ep.get("name", ""), "name": ep.get("name", "")} for ep in endpoints]
+                    if res.status_code in (401, 403):
+                        raise ProviderError(provider_id, res.status_code, "Authentication failed for Databricks")
+                    raise ProviderError(provider_id, res.status_code, res.text[:200])
+            except httpx.RequestError as e:
+                raise ProviderError(provider_id, None, f"Connection error: {e}")
+
         url = self.get_endpoint_url(provider_id, "models")
         headers = self.get_headers(provider_id)
 
@@ -246,7 +262,7 @@ class OmniClient:
             }
 
         t0 = time.perf_counter()
-        if provider_id in ("cloudflare", "monkeycode"):
+        if provider_id in ("cloudflare", "monkeycode", "databricks"):
             try:
                 models = self.list_models(provider_id, timeout=5.0)
                 latency = round((time.perf_counter() - t0) * 1000, 1)

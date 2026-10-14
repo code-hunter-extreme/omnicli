@@ -18,6 +18,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -63,6 +64,9 @@ class SlashCommandCompleter(Completer):
             ("/model", "Switch active model"),
             ("/models", "List or search models from active provider"),
             ("/providers", "List all configured providers"),
+            ("/keys", "Test all provider API keys and report -good / -bad"),
+            ("/key", "View, test, or update API key for a provider (/key <provider> [key])"),
+            ("/retry", "Retry the last failed prompt after updating key or provider"),
             ("/system", "View or set system prompt"),
             ("/temp", "Set generation temperature (0.0 - 2.0)"),
             ("/file", "Attach a file to chat context"),
@@ -96,11 +100,12 @@ class SlashCommandCompleter(Completer):
                 if m.startswith(arg.lower()):
                     yield Completion(m, start_position=-len(arg), display_meta=f"Set mode: {m}")
 
-        elif cmd in ("/provider", "/p"):
+        elif cmd in ("/provider", "/p", "/key", "/k"):
             providers = list(self.cfg.data.get("providers", {}).keys())
             for p in providers:
                 if p.startswith(arg):
-                    yield Completion(p, start_position=-len(arg), display_meta=f"Switch to {p}")
+                    action_label = "Update key for" if cmd in ("/key", "/k") else "Switch to"
+                    yield Completion(p, start_position=-len(arg), display_meta=f"{action_label} {p}")
 
         elif cmd in ("/model", "/m"):
             # Can suggest recent or default models
@@ -147,6 +152,7 @@ class ChatSession:
         self.messages: List[Dict[str, str]] = []
         self.pending_files: Dict[str, str] = {}
         self.last_report_path: Optional[str] = None
+        self.last_failed_prompt: Optional[str] = None
 
         if self.system_prompt:
             self.messages.append({"role": "system", "content": self.system_prompt})
@@ -203,6 +209,9 @@ class ChatSession:
         table.add_row("/model, /m <name>", "Switch model on current provider")
         table.add_row("/models [query]", "List / search models available on active provider")
         table.add_row("/providers", "List all configured providers and key statuses")
+        table.add_row("/keys", "Test all provider API keys and report -good / -bad status")
+        table.add_row("/key <name> [key]", "Update/replace API key for provider (or prompt to paste)")
+        table.add_row("/retry, /r", "Retry the last failed prompt after updating key/provider")
         table.add_row("/system, /s [prompt]", "Show or change the active system prompt")
         table.add_row("/temp <0.0-2.0>", "Adjust sampling temperature")
         table.add_row("/file <path>", "Attach file content to the next prompt")
@@ -235,6 +244,105 @@ class ChatSession:
             table.add_row(f"{prefix}{pid}", pdata.get("name", pid), base_url, masked_key, def_m)
 
         self.console.print(table)
+        self.console.print("[dim]Tip: Use [bold cyan]/keys[/bold cyan] to test live health (-good/-bad) or [bold cyan]/key <provider> <key>[/bold cyan] to replace.[/dim]\n")
+
+    def show_keys(self, provider_filter: Optional[str] = None) -> None:
+        providers = self.cfg.data.get("providers", {})
+        if provider_filter:
+            target = provider_filter.lower().strip()
+            if target in providers:
+                providers = {target: providers[target]}
+            else:
+                self.console.print(f"[bold red]Unknown provider:[/bold red] '{provider_filter}'.")
+                return
+
+        table = Table(title="Provider API Key Health & Status", title_style="bold cyan", border_style="dim")
+        table.add_column("Provider", style="bold cyan", width=14)
+        table.add_column("API Key", style="white", width=16)
+        table.add_column("Status", justify="center", width=12)
+        table.add_column("Latency", justify="right", width=10)
+        table.add_column("Diagnostics / Message", style="dim")
+
+        active = self.provider
+        with self.console.status("[cyan]Validating provider API keys...[/cyan]", spinner="dots"):
+            for pid, pdata in providers.items():
+                key = self.cfg.get_api_key(pid)
+                if key and len(key) > 8:
+                    masked = f"{key[:4]}...{key[-3:]}"
+                elif key:
+                    masked = "[green]Set[/green]"
+                else:
+                    masked = "[dim red]Missing[/dim red]"
+
+                res = self.client.ping(pid)
+                st = res.get("status")
+                prefix = "[bold green]▶ [/bold green]" if pid == active else "  "
+
+                if st == "healthy":
+                    status_str = "[bold green]-good[/bold green]"
+                    lat_str = f"{res.get('latency_ms', '-')} ms"
+                    details = f"OK ({res.get('model_count', 0)} models)"
+                elif st in ("unauthorized", "missing_key"):
+                    status_str = "[bold red]-bad[/bold red]"
+                    lat_str = "-"
+                    details = "Unauthorized (invalid key)" if st == "unauthorized" else "Missing API key"
+                else:
+                    status_str = "[bold red]-bad[/bold red]"
+                    lat_str = f"{res.get('latency_ms', '-')} ms" if res.get('latency_ms') else "-"
+                    err_msg = res.get("error") or str(st).upper()
+                    details = str(err_msg)[:45]
+
+                table.add_row(f"{prefix}{pid}", masked, status_str, lat_str, details)
+
+        self.console.print(table)
+        self.console.print("\n[bold yellow]To replace or update an API key:[/bold yellow]")
+        self.console.print("  • Type: [bold cyan]/key <provider> <new_key>[/bold cyan]   (paste key directly)")
+        self.console.print("  • Or:   [bold cyan]/key <provider>[/bold cyan]             (prompted to paste)")
+        if getattr(self, "last_failed_prompt", None):
+            self.console.print("  • Type [bold green]/retry[/bold green] to re-send your last failed prompt.")
+        self.console.print()
+
+    def update_key(self, provider_id: str, new_key: Optional[str] = None) -> None:
+        prov = provider_id.lower().strip()
+        known = self.cfg.data.get("providers", {})
+        if prov not in known:
+            self.console.print(f"[bold red]Unknown provider:[/bold red] '{prov}'. Valid providers: {', '.join(known.keys())}")
+            return
+
+        if not new_key:
+            try:
+                new_key = self.prompt_session.prompt(
+                    f"Paste new API key for {prov}: ",
+                    is_password=False,
+                ).strip()
+            except (KeyboardInterrupt, EOFError):
+                self.console.print("\n[yellow]Key update cancelled.[/yellow]")
+                return
+
+        if not new_key:
+            self.console.print("[yellow]No key entered. Key was not changed.[/yellow]")
+            return
+
+        new_key = new_key.strip().strip("'\"")
+        self.cfg.set_api_key(prov, new_key)
+        with self.console.status(f"[cyan]Verifying new API key for {prov}...[/cyan]", spinner="dots"):
+            res = self.client.ping(prov)
+
+        if res.get("status") == "healthy":
+            self.console.print(
+                f"[bold green]✓ API key updated for {prov} — Status: -good[/bold green] "
+                f"(latency: {res.get('latency_ms')} ms, {res.get('model_count')} models available)"
+            )
+            if getattr(self, "last_failed_prompt", None):
+                self.console.print(
+                    "[bold cyan]You have a failed prompt pending. Type [bold green]/retry[/bold green] to re-send it now![/bold cyan]"
+                )
+        else:
+            err = res.get("error") or res.get("status")
+            self.console.print(
+                f"[bold yellow]⚠ API key saved for {prov}, but test returned: -bad[/bold yellow] ([red]{err}[/red])\n"
+                f"[dim]You can check all keys with /keys or re-enter with: /key {prov} <key>[/dim]"
+            )
 
     def show_models(self, query: str = "") -> None:
         with self.console.status(f"[cyan]Fetching models from {self.provider}...[/cyan]", spinner="dots"):
@@ -318,7 +426,13 @@ class ChatSession:
             self.console.print("[bold green]Mode switched to:[/bold green] [bold cyan]collaborate[/bold cyan] (all models reason together)")
 
         elif cmd in ("/builder", "/build", "/b"):
-            self.console.print("[red]Builder mode was removed: it never built or tested anything. Use collaborate, redteam, or single.[/red]")
+            self.mode = "collaborate"
+            active_size = self.council_size or len(self.cfg.data.get("providers", {}))
+            self.console.print(
+                f"[bold green]Switched to collaborative build mode across all {active_size} models.[/bold green]\n"
+                "[dim]All active models will reason and synthesize code solutions together. "
+                "(For autonomous editing and tool execution, run 'omni agent' in CLI).[/dim]"
+            )
 
         elif cmd in ("/redteam", "/rt"):
             self.mode = "redteam"
@@ -330,15 +444,17 @@ class ChatSession:
 
         elif cmd in ("/size", "/council_size"):
             if not arg:
-                self.console.print(f"Current council size: [bold cyan]{self.council_size}[/bold cyan]")
+                sz_str = str(self.council_size) if self.council_size else f"all {len(self.cfg.data.get('providers', {}))} active providers"
+                self.console.print(f"Current council size: [bold cyan]{sz_str}[/bold cyan]")
             else:
                 try:
                     sz = int(arg)
-                    if 1 <= sz <= 10:
+                    max_allowed = max(20, len(self.cfg.data.get("providers", {})))
+                    if 1 <= sz <= max_allowed:
                         self.council_size = sz
                         self.console.print(f"[bold green]Council size set to {self.council_size}[/bold green]")
                     else:
-                        self.console.print("[red]Council size must be between 1 and 10[/red]")
+                        self.console.print(f"[red]Council size must be between 1 and {max_allowed}[/red]")
                 except ValueError:
                     self.console.print("[red]Invalid integer for council size[/red]")
 
@@ -449,6 +565,31 @@ class ChatSession:
                             )
                     except Exception as e:
                         self.console.print(f"[red]Error reading file: {e}[/red]")
+
+        elif cmd in ("/keys",):
+            self.show_keys(arg or None)
+
+        elif cmd in ("/key", "/k", "/update", "/update-key"):
+            cleaned_arg = arg
+            for prefix in ("api key ", "api-key ", "api ", "key "):
+                if cleaned_arg.lower().startswith(prefix):
+                    cleaned_arg = cleaned_arg[len(prefix):].strip()
+                    break
+            if not cleaned_arg or cleaned_arg in ("api", "key", "all"):
+                self.show_keys()
+            else:
+                parts = cleaned_arg.split(maxsplit=1)
+                prov = parts[0].lower()
+                val = parts[1].strip() if len(parts) > 1 else None
+                self.update_key(prov, val)
+
+        elif cmd in ("/retry", "/r"):
+            failed = getattr(self, "last_failed_prompt", None)
+            if not failed:
+                self.console.print("[yellow]No failed prompt to retry.[/yellow]")
+            else:
+                self.console.print(f"[bold cyan]⟳ Retrying prompt with {self.provider}/{self.model}...[/bold cyan]")
+                self.stream_turn(failed)
 
         else:
             self.console.print(f"[yellow]Unknown command:[/yellow] {cmd}. Type /help for assistance.")
@@ -582,8 +723,9 @@ class ChatSession:
                     border_style="yellow",
                 ))
             t0 = time.perf_counter()
+            active_size = self.council_size or len(self.cfg.data.get("providers", {}))
             with self.console.status(
-                f"[bold cyan]Council ({self.mode.upper()}) reasoning across {self.council_size} models in parallel...[/bold cyan]",
+                f"[bold cyan]Council ({self.mode.upper()}) reasoning across {active_size} models in parallel...[/bold cyan]",
                 spinner="dots",
             ):
                 out = run_orchestration(
@@ -690,6 +832,18 @@ class ChatSession:
             self.console.print(stats)
             self.console.print()
 
+            if final_ans == "All swarm members failed to respond.":
+                self.last_failed_prompt = user_prompt
+                self.console.print(Panel(
+                    "[bold red]All swarm models failed to respond.[/bold red]\n\n"
+                    "Use [bold cyan]/keys[/bold cyan] to verify your API keys and endpoints (-good / -bad),\n"
+                    "or update a key with [bold cyan]/key <provider> <key>[/bold cyan], then [bold cyan]/retry[/bold cyan].",
+                    title="Swarm Connection Failure",
+                    border_style="red"
+                ))
+            else:
+                self.last_failed_prompt = None
+
             self.messages.append({"role": "assistant", "content": final_ans})
             return
 
@@ -722,8 +876,22 @@ class ChatSession:
                     # Render updated markdown
                     live.update(Markdown(full_content))
                 elif chunk["type"] == "error":
-                    live.update(Text(chunk["content"], style="bold red"))
-                    self.messages.pop()  # discard failed user message
+                    err_msg = str(chunk.get("content", "Unknown error"))
+                    live.update(Text(err_msg, style="bold red"))
+                    self.last_failed_prompt = user_prompt
+                    if self.messages and self.messages[-1].get("role") == "user":
+                        self.messages.pop()  # discard failed user message
+                    self.console.print()
+                    self.console.print(Panel(
+                        f"[bold red]API Connection Failed:[/bold red] {escape(err_msg)}\n\n"
+                        "[bold yellow]Quick Recovery Actions:[/bold yellow]\n"
+                        f"• [bold cyan]/key {self.provider} <new_key>[/bold cyan] — update API key and verify connection (-good / -bad)\n"
+                        f"• [bold cyan]/keys[/bold cyan] — view all provider keys & test their health status\n"
+                        f"• [bold cyan]/retry[/bold cyan] — immediately re-send this prompt once fixed\n"
+                        f"• [bold cyan]/provider <name>[/bold cyan] or [bold cyan]/model <name>[/bold cyan] — switch to a working provider",
+                        title="Connection Error & Recovery",
+                        border_style="red",
+                    ))
                     return
 
         total_time = time.perf_counter() - t0
@@ -742,6 +910,7 @@ class ChatSession:
         self.console.print()
 
         self.messages.append({"role": "assistant", "content": full_content})
+        self.last_failed_prompt = None
 
         # Persist the completed turn to per-provider history (opt-in).
         try:
