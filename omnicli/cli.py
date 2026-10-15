@@ -1210,12 +1210,21 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
             f"{metrics['output_tokens_reported']} output tokens reported; "
             f"provider-reported cost {cost}.[/dim]"
         )
+        # out["rounds"] carries two shapes: deliberate/collaborate rounds
+        # (round/successful_members/failed_members) and red-team stage summaries
+        # (stage/successful_calls/failed_calls). Read both tolerantly so a
+        # completed run never crashes at the final display (KeyError 'round').
         for round_info in out.get("rounds", []):
+            label = round_info.get("round", round_info.get("stage", "?"))
+            ok = round_info.get(
+                "successful_members", round_info.get("successful_calls", 0)
+            )
+            bad = round_info.get(
+                "failed_members", round_info.get("failed_calls", 0)
+            )
+            lat = round_info.get("latency_ms", 0) / 1000
             console.print(
-                f"[dim]Round {round_info['round']}: "
-                f"{round_info['successful_members']} successful / "
-                f"{round_info['failed_members']} failed; "
-                f"{round_info['latency_ms'] / 1000:.1f}s.[/dim]"
+                f"[dim]Round {label}: {ok} successful / {bad} failed; {lat:.1f}s.[/dim]"
             )
         synthesis = metrics.get("synthesis", {})
         if synthesis.get("performed"):
