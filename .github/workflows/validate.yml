@@ -44,6 +44,24 @@ jobs:
       - name: pytest + coverage
         run: coverage run -m pytest -q || true
 
+
+      # ---- optional SaaS scanners (dormant until you add the secret) ----
+      - name: Snyk (SCA + code, if SNYK_TOKEN set)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          [ -z "$SNYK_TOKEN" ] && echo "SNYK_TOKEN not set — skipping Snyk." && exit 0
+          npx --yes snyk test --all-projects || true
+          npx --yes snyk code test || true
+      - name: Socket (supply-chain, if SOCKET_SECURITY_API_KEY set)
+        continue-on-error: true
+        env:
+          SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+        run: |
+          [ -z "$SOCKET_SECURITY_API_KEY" ] && echo "SOCKET_SECURITY_API_KEY not set — skipping Socket." && exit 0
+          npx --yes @socketsecurity/cli scan create . || true
+
       # ---- style / types / dead code / docs (noisiest; promote last) ----
       - name: ruff
         run: ruff check . || true
