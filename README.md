@@ -1,7 +1,7 @@
 # OmniCLI — Local Multi-Provider AI Terminal, Router & Red-Team Agent
 
 A fast, local CLI for querying, comparing, routing, and **orchestrating** across
-7 OpenAI-compatible AI providers — plus an autonomous agent with deterministic
+10 OpenAI-compatible AI providers — plus an autonomous agent with deterministic
 verification tools, cross-model consensus, per-API memory, and a heartbeat.
 
 Providers:
@@ -13,6 +13,13 @@ Providers:
 - **Bynara** (`https://router.bynara.id/v1`)
 - **Apinex** (`https://api.apinex.bond/v1`)
 - **XKiro** (`https://api.xkiro.com/v1`)
+- **Dahl Inference** (`https://inference.dahl.global/v1`)
+- **LLM7 Gateway** (`https://api.llm7.io/v1`)
+- **MonkeyCode AI** (`https://api.monkeycode-ai.net/v1`)
+
+> Adding a provider is one entry in `DEFAULT_PROVIDERS` (`omnicli/config.py`):
+> set `base_url`, `env_key`, and `default_model`; `omni scan` populates the
+> rest (`fallback_models`, `verification_panel`). No other code changes needed.
 
 Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 
