@@ -385,6 +385,76 @@ def cmd_heartbeat(canary: bool, run_tasks: bool, no_write: bool) -> None:
             console.print(f"[dim]Status written to {path}[/dim]")
 
 
+@main.command("credits")
+@click.option("--no-quota", is_flag=True, default=False,
+              help="Only ping status and latency; skip quota lookups")
+def cmd_credits(no_quota: bool) -> None:
+    """Quick per-provider ping plus account quota (used/total) where it exists.
+
+    Quota is shown in each provider's native unit with a source marker:
+    account (live balance), rate (x-ratelimit window), doc (configured cap).
+    Providers with no quota signal show an honest 'n/a' -- never a fake zero.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from omnicli import quota as q
+
+    providers = list(cfg.data.get("providers", {}).keys())
+
+    def probe(pid: str) -> Dict[str, Any]:
+        ping = client.ping(pid)
+        row: Dict[str, Any] = {
+            "provider": pid, "ping": ping, "quota": None,
+            "quota_err": None, "source": "-",
+        }
+        if not no_quota and ping.get("status") == "healthy":
+            try:
+                info = q.fetch_quota(pid, cfg)
+                row["quota"] = info
+                row["source"] = info.source if info else "none"
+            except q.QuotaError as exc:
+                row["quota_err"] = str(exc)
+                row["source"] = "err"
+        return row
+
+    with console.status("[cyan]Pinging providers and reading quotas...[/cyan]", spinner="dots"):
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            futs = {pool.submit(probe, pid): pid for pid in providers}
+            done = {futs[f]: f.result() for f in as_completed(futs)}
+    rows = [done[pid] for pid in providers]
+
+    table = Table(title="OmniCLI Provider Credits & Usage",
+                  title_style="bold cyan", border_style="dim")
+    table.add_column("Provider", style="bold green", width=14)
+    table.add_column("Status", width=12)
+    table.add_column("Latency", justify="right", width=11)
+    table.add_column("Used / Total", width=36)
+    table.add_column("Source", width=10)
+
+    for row in rows:
+        ping = row["ping"]
+        st = ping.get("status")
+        if st == "healthy":
+            status_str = "[bold green]ONLINE[/bold green]"
+        elif st in ("unauthorized", "missing_key"):
+            status_str = "[yellow]AUTH[/yellow]"
+        elif st == "config_needed":
+            status_str = "[yellow]CONFIG[/yellow]"
+        else:
+            status_str = f"[red]{str(st).upper()}[/red]"
+        latency = f"{ping['latency_ms']} ms" if ping.get("latency_ms") else "-"
+        if row["quota_err"]:
+            quota_str = f"[red]err: {row['quota_err']}[/red]"
+        else:
+            quota_str = q.render_quota(row["quota"])
+            info = row["quota"]
+            if info and info.detail:
+                quota_str += f"  [dim]({info.detail})[/dim]"
+        table.add_row(row["provider"], status_str, latency, quota_str, row["source"])
+
+    console.print(table)
+
+
 @main.command("models")
 @click.argument("provider", required=False)
 @click.option("-s", "--search", help="Filter models by search substring")
