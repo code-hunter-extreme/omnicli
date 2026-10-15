@@ -3115,6 +3115,24 @@ class TestInjectableConfigRoot(unittest.TestCase):
             self.assertEqual(reloaded.get_api_key("groq"), "test-key-123")
             self.assertNotEqual(cfg.config_dir.resolve(), CONFIG_DIR.resolve())
 
+    def test_config_file_is_owner_only_and_defaults_not_corrupted(self):
+        """config.json (holds API keys) must be 0600, and mutating a loaded
+        config must not corrupt the module-level DEFAULT_PROVIDERS."""
+        import copy as _copy
+        import os as _os
+        from omnicli.config import ConfigManager, DEFAULT_PROVIDERS
+        with tempfile.TemporaryDirectory() as td:
+            before = _copy.deepcopy(DEFAULT_PROVIDERS)
+            cfg = ConfigManager(config_dir=Path(td) / "c")
+            # 0600, not world-readable
+            mode = _os.stat(cfg.config_file).st_mode & 0o777
+            self.assertEqual(mode, 0o600, oct(mode))
+            # deep-copied defaults: mutating the loaded config leaves the
+            # module default untouched
+            first = next(iter(cfg.data["providers"]))
+            cfg.data["providers"][first]["sentinel"] = "x"
+            self.assertEqual(DEFAULT_PROVIDERS, before)
+
     def test_default_config_root_unchanged(self):
         from omnicli.config import CONFIG_DIR, ConfigManager
         cfg = ConfigManager.__new__(ConfigManager)
