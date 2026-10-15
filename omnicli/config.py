@@ -5,8 +5,10 @@ Handles provider definitions, API keys, endpoints, and persistent settings.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -218,14 +220,14 @@ class ConfigManager:
         if not self.config_file.exists():
             initial_data = {
                 "default_provider": "groq",
-                "providers": dict(DEFAULT_PROVIDERS),
+                "providers": copy.deepcopy(DEFAULT_PROVIDERS),
                 "keys": {},
                 "cloudflare_account_id": "",
                 "system_prompt": "You are a helpful, brilliant, concise AI assistant.",
                 "temperature": 0.7,
                 "timeout": 60,
-                "memory": dict(DEFAULT_MEMORY),
-                "heartbeat": dict(DEFAULT_HEARTBEAT),
+                "memory": copy.deepcopy(DEFAULT_MEMORY),
+                "heartbeat": copy.deepcopy(DEFAULT_HEARTBEAT),
             }
             # Auto-check aider oauth-keys if available
             aider_env = Path.home() / ".aider" / "oauth-keys.env"
@@ -251,16 +253,16 @@ class ConfigManager:
                 data["providers"] = {}
             for k, v in DEFAULT_PROVIDERS.items():
                 if k not in data["providers"]:
-                    data["providers"][k] = dict(v)
+                    data["providers"][k] = copy.deepcopy(v)
             if "keys" not in data:
                 data["keys"] = {}
             # Migrate older configs: add memory/heartbeat blocks if absent.
             changed = False
             if "memory" not in data:
-                data["memory"] = dict(DEFAULT_MEMORY)
+                data["memory"] = copy.deepcopy(DEFAULT_MEMORY)
                 changed = True
             if "heartbeat" not in data:
-                data["heartbeat"] = dict(DEFAULT_HEARTBEAT)
+                data["heartbeat"] = copy.deepcopy(DEFAULT_HEARTBEAT)
                 changed = True
             if changed:
                 self._save(data)
@@ -268,7 +270,7 @@ class ConfigManager:
         except Exception:
             return {
                 "default_provider": "openrouter",
-                "providers": dict(DEFAULT_PROVIDERS),
+                "providers": copy.deepcopy(DEFAULT_PROVIDERS),
                 "keys": {},
                 "cloudflare_account_id": "",
                 "system_prompt": "You are a helpful, brilliant, concise AI assistant.",
@@ -279,8 +281,26 @@ class ConfigManager:
     def _save(self, data: Optional[Dict[str, Any]] = None) -> None:
         if data is None:
             data = self.data
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        # config.json holds provider API keys. Writing in place is unsafe: if the
+        # file already exists world-readable, O_CREAT's mode is ignored and the
+        # keys are written into the permissive file before any chmod (CWE-378).
+        # Write to a private temp file (mkstemp creates it 0600) and atomically
+        # replace, so the keys never land in a readable file and there is no
+        # permissive window. os.replace is atomic within the same directory.
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self.config_dir), prefix=".config-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.config_file)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def save(self) -> None:
         self._save(self.data)
