@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -280,18 +281,26 @@ class ConfigManager:
     def _save(self, data: Optional[Dict[str, Any]] = None) -> None:
         if data is None:
             data = self.data
-        # config.json holds provider API keys — it must be owner-only, never
-        # world-readable (the history file is already 0600). O_CREAT applies the
-        # mode on first write; chmod also tightens a file created before this fix.
-        fd = os.open(
-            self.config_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        # config.json holds provider API keys. Writing in place is unsafe: if the
+        # file already exists world-readable, O_CREAT's mode is ignored and the
+        # keys are written into the permissive file before any chmod (CWE-378).
+        # Write to a private temp file (mkstemp creates it 0600) and atomically
+        # replace, so the keys never land in a readable file and there is no
+        # permissive window. os.replace is atomic within the same directory.
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self.config_dir), prefix=".config-", suffix=".tmp"
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
         try:
-            os.chmod(self.config_file, 0o600)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.config_file)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def save(self) -> None:
         self._save(self.data)

@@ -3133,6 +3133,24 @@ class TestInjectableConfigRoot(unittest.TestCase):
             cfg.data["providers"][first]["sentinel"] = "x"
             self.assertEqual(DEFAULT_PROVIDERS, before)
 
+    def test_save_rewrites_preexisting_world_readable_config_to_0600(self):
+        """If config.json already exists world-readable, a save must not leave
+        API keys in a permissive file — atomic 0600 replace (CWE-378)."""
+        import os as _os
+        from omnicli.config import ConfigManager
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "c"
+            d.mkdir(parents=True)
+            stale = d / "config.json"
+            stale.write_text('{"keys": {}}', encoding="utf-8")
+            _os.chmod(stale, 0o644)  # pre-existing permissive file
+            cfg = ConfigManager(config_dir=d)
+            cfg.set_api_key("groq", "secret-key")  # triggers _save over the existing file
+            mode = _os.stat(cfg.config_file).st_mode & 0o777
+            self.assertEqual(mode, 0o600, oct(mode))
+            reloaded = ConfigManager(config_dir=d)
+            self.assertEqual(reloaded.get_api_key("groq"), "secret-key")
+
     def test_default_config_root_unchanged(self):
         from omnicli.config import CONFIG_DIR, ConfigManager
         cfg = ConfigManager.__new__(ConfigManager)
