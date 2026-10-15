@@ -1,0 +1,86 @@
+name: validate
+
+# Deterministic validation stack (your CLAUDE.md doctrine), as GitHub Actions.
+# v1 is REPORT-ONLY: every step ends with `|| true` so legacy noise never blocks
+# a PR. Promote a tool to a hard gate by deleting its `|| true` once that repo is
+# clean for it (start with gitleaks + bandit, then ruff/flake8, then the rest).
+# Runs on the same code already on GitHub — no external key, no extra egress.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools + project deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install black flake8 pylint mypy bandit ruff vulture interrogate pytest coverage hypothesis semgrep
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          [ -f pyproject.toml ] && pip install -e . || true
+
+      # ---- security (promote these first) ----
+      - name: gitleaks (secret scan)
+        continue-on-error: true
+        run: |
+          set +e
+          TAG=$(curl -sSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${TAG}/gitleaks_${TAG}_linux_x64.tar.gz" | tar -xz -C /tmp
+          /tmp/gitleaks detect --source . --no-git --redact --verbose
+          exit 0
+      - name: bandit
+        run: bandit -r . -ll || true
+      - name: semgrep
+        run: semgrep scan --config p/python --config p/security-audit || true
+
+      # ---- tests (hypothesis + any z3 proofs run inside pytest) ----
+      - name: pytest + coverage
+        run: coverage run -m pytest -q || true
+
+
+      # ---- optional SaaS scanners (dormant until you add the secret) ----
+      - name: Snyk (SCA + code, if SNYK_TOKEN set)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          [ -z "$SNYK_TOKEN" ] && echo "SNYK_TOKEN not set — skipping Snyk." && exit 0
+          npx --yes snyk test --all-projects || true
+          npx --yes snyk code test || true
+      - name: Socket (supply-chain, if SOCKET_SECURITY_API_KEY set)
+        continue-on-error: true
+        env:
+          SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+        run: |
+          [ -z "$SOCKET_SECURITY_API_KEY" ] && echo "SOCKET_SECURITY_API_KEY not set — skipping Socket." && exit 0
+          npx --yes @socketsecurity/cli scan create . || true
+      - name: Semgrep Supply Chain (reachability SCA, if SEMGREP_APP_TOKEN set)
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          [ -z "$SEMGREP_APP_TOKEN" ] && echo "SEMGREP_APP_TOKEN not set — skipping Semgrep Supply Chain." && exit 0
+          semgrep ci || true
+
+      # ---- style / types / dead code / docs (noisiest; promote last) ----
+      - name: ruff
+        run: ruff check . || true
+      - name: flake8
+        run: flake8 . || true
+      - name: black (format check)
+        run: black --check . || true
+      - name: mypy
+        run: mypy . || true
+      - name: pylint
+        run: pylint $(git ls-files '*.py') || true
+      - name: vulture (dead code)
+        run: vulture . || true
+      - name: interrogate (docstring coverage)
+        run: interrogate -v . || true
