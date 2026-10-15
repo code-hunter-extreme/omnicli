@@ -61,6 +61,13 @@ jobs:
         run: |
           [ -z "$SOCKET_SECURITY_API_KEY" ] && echo "SOCKET_SECURITY_API_KEY not set — skipping Socket." && exit 0
           npx --yes @socketsecurity/cli scan create . || true
+      - name: Semgrep Supply Chain (reachability SCA, if SEMGREP_APP_TOKEN set)
+        continue-on-error: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          [ -z "$SEMGREP_APP_TOKEN" ] && echo "SEMGREP_APP_TOKEN not set — skipping Semgrep Supply Chain." && exit 0
+          semgrep ci || true
 
       # ---- style / types / dead code / docs (noisiest; promote last) ----
       - name: ruff
