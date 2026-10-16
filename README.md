@@ -85,7 +85,8 @@ Flags:
 
 - `--redteam` — adversarial system prompt; toolset restricted to the verify set
   (`verify_http`, `verify_code`, `verify_consensus`, `bash`, `read_file`,
-  `consult_provider`). The model must prove claims with tools, not assert them.
+  `list_directory`, `consult_provider`). The model must prove claims with tools,
+  not assert them.
 - `--rotate-families` — after each turn, switch to the next distinct model family
   from a **cross-provider** roster, so consecutive turns use a different family
   *and* a different API (e.g. openrouter → nvidia → cloudflare).
@@ -99,6 +100,11 @@ Flags:
   allowed hosts. GET, HEAD, and OPTIONS remain the only methods allowed by
   default.
 - `--max-turns N` — tool-call budget (default 10).
+
+The agent's optional local Program Registry search uses
+`~/program_registry/core/program_registry.db` (or `~/program_registry.db`);
+set `OMNICLI_REGISTRY_DB` to use a different database path. Set
+`OMNICLI_HTTP_REFERER` to override the OpenRouter application referer..
 
 Interactive red-team is also available in chat: `omni chat --redteam
 [--rotate-families]` (adversarial persona; chat has no tool execution).
@@ -184,6 +190,11 @@ that do not match the supplied file cause a prominent `EVIDENCE GATE: FAIL`
 and CLI exit code `2`. `PASS_GROUNDING_ONLY` means only that the supplied
 outputs passed these citation checks; it is not a security verdict. A red-team
 result without a gate is itself treated as a failure.
+Library callers can set `run_orchestration(..., minimum_families=N)` to require
+independent classified model families in collaboration and red-team modes. The
+selected roster and successful participants are both checked; collaboration
+raises on a shortfall, while red-team returns `EVIDENCE GATE: FAIL`. Unclassified
+models do not count toward requirements of two or more families.
 The offline staged evaluator uses temperature 0, matching the direct baseline;
 the interactive red-team command retains provider defaults unless configured
 otherwise.

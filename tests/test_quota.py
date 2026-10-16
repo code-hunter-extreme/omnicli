@@ -75,7 +75,17 @@ def test_parse_rate_headers_tokens():
     )
     assert info.source == "rate" and info.unit == "tokens/min"
     assert info.total == 8000 and info.remaining == 7927 and info.used == 73
-    assert "req/min" in info.detail
+    assert "req/day" in info.detail
+
+
+def test_parse_bynara_null_requests_month_not_zero():
+    info = quota.parse_bynara(
+        {
+            "quota": {"remaining": 100, "limit": 200},
+            "usage": {"requests_month": None},
+        }
+    )
+    assert info.detail == ""
 
 
 def test_parse_rate_headers_missing_raises():
@@ -91,6 +101,11 @@ def test_render_used_total_tokens():
         unit="tokens", source="account", used=131963, total=100000000
     )
     assert quota.render_quota(info) == "131,963 / 100,000,000 tokens"
+
+
+def test_render_zero_total_preserved():
+    info = quota.QuotaInfo(unit="tokens", source="account", used=0, total=0)
+    assert quota.render_quota(info) == "0 / 0 tokens"
 
 
 def test_render_remaining_only_usd():
@@ -172,3 +187,21 @@ def test_fetch_quota_account_uses_parser(monkeypatch):
     info = quota.fetch_quota("apinex", cfg)
     assert captured["url"] == "https://api.apinex.bond/v1/subscription"
     assert info.total == 3000000 and info.used == 10
+
+
+def test_fetch_quota_malformed_schema_raises_quota_error(monkeypatch):
+    cfg = _FakeCfg(
+        {"apinex": "k"}, {"apinex": {"base_url": "https://api.apinex.bond/v1"}}
+    )
+    monkeypatch.setattr(quota, "_http_get_json", lambda u, k: {"wrong": 1})
+    with pytest.raises(quota.QuotaError, match="unexpected quota schema"):
+        quota.fetch_quota("apinex", cfg)
+
+
+def test_require_http_url_blocks_remote_http_allows_loopback():
+    quota._require_http_url("https://openrouter.ai/api/v1/credits")
+    quota._require_http_url("http://127.0.0.1:3271/v1")
+    quota._require_http_url("http://localhost:8000/v1")
+    with pytest.raises(quota.QuotaError):
+        quota._require_http_url("http://api.example.com/v1/credits")
+

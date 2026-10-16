@@ -63,7 +63,7 @@ Rules:
 6. Use verify_http only for operator-authorized hosts configured for this run. GET, HEAD, and OPTIONS are permitted by default; never use state-changing methods unless the operator explicitly enabled them.
 """
 
-# Red-team tool definitions — the verify_* set only.
+# Red-team tool definitions — bounded verification and read-only inspection tools.
 # When --redteam is active these replace the full TOOL_DEFINITIONS so the model
 # is not distracted by bash/file_ops and stays focused on verification.
 from omnicli.tools import TOOL_DEFINITIONS as _ALL_TOOLS
@@ -77,8 +77,8 @@ _REDTEAM_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] in (
 def verification_toolset() -> List[Dict[str, Any]]:
     """The bounded verify toolset shared by the agent and tooled swarm members.
 
-    Same list the red-team agent loop uses (verify_*, analyze, bash,
-    read_file, consult_provider — no write_file, no registry_search).
+    Same list the red-team agent loop uses (verification, read-only inspection,
+    and provider consultation — no write_file or registry_search).
     Returned as a fresh list so callers cannot mutate the shared set.
     """
     return list(_REDTEAM_TOOLS)

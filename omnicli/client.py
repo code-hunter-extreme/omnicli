@@ -6,10 +6,11 @@ Handles streaming, headers, model discovery, authentication, and error reporting
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from email.utils import parsedate_to_datetime
-from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 import httpx
 
@@ -52,7 +53,10 @@ class OmniClient:
                 headers["Cookie"] = f"monkeycode_ai_session={cookie}"
 
         if provider_id == "openrouter":
-            headers["HTTP-Referer"] = "https://github.com/phantomcore/omnicli"
+            headers["HTTP-Referer"] = os.environ.get(
+                "OMNICLI_HTTP_REFERER",
+                "https://github.com/code-hunter-extreme/omnicli",
+            )
             headers["X-Title"] = "OmniCLI Local Assistant"
 
         return headers

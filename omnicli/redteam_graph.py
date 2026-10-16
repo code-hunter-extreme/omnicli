@@ -303,7 +303,10 @@ class RedTeamGraph:
         state.setdefault("audit_trail", [])
         state.setdefault("unparseable_streak", 0)
         state.setdefault("reprobe_count", 0)
-        node_name: Optional[str] = self._entry
+        paused_stage = state.get("stage")
+        node_name: Optional[str] = (
+            paused_stage if paused_stage in self._nodes else self._entry
+        )
         assert node_name is not None
         while node_name is not None:
             node = self._nodes[node_name]
@@ -327,6 +330,14 @@ class RedTeamGraph:
                             f"{node.policy.timeout_s}s"
                         )
                     updates = node.fn(state, context) or {}
+                    if (
+                        node.policy.timeout_s is not None
+                        and time.perf_counter() - started > node.policy.timeout_s
+                    ):
+                        raise StageAbort(
+                            f"stage {node_name!r} exceeded timeout "
+                            f"{node.policy.timeout_s}s"
+                        )
                     break
                 except (StageAbort, GraphPaused):
                     raise

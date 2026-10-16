@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
@@ -102,8 +103,9 @@ def parse_bynara(payload: Dict[str, Any]) -> QuotaInfo:
     )
     usage = payload.get("usage") or {}
     detail = ""
-    if "requests_month" in usage:
-        detail = f"{int(_num(usage['requests_month']) or 0):,} req/mo"
+    req_mo = _num(usage.get("requests_month"))
+    if req_mo is not None:
+        detail = f"{int(req_mo):,} req/mo"
     return QuotaInfo(
         unit="tokens",
         source="account",
@@ -160,10 +162,10 @@ def parse_rate_headers(headers: Dict[str, str]) -> QuotaInfo:
         (total - remaining) if (total is not None and remaining is not None) else None
     )
     detail = ""
-    if "x-ratelimit-remaining-requests" in low and "x-ratelimit-limit-requests" in low:
-        rr = int(_num(low["x-ratelimit-remaining-requests"]) or 0)
-        lr = int(_num(low["x-ratelimit-limit-requests"]) or 0)
-        detail = f"{rr:,}/{lr:,} req/min"
+    rr = _num(low.get("x-ratelimit-remaining-requests"))
+    lr = _num(low.get("x-ratelimit-limit-requests"))
+    if rr is not None and lr is not None:
+        detail = f"{int(rr):,}/{int(lr):,} req/day"
     return QuotaInfo(
         unit="tokens/min",
         source="rate",
@@ -191,9 +193,15 @@ RATE_HEADER_PROVIDERS = {"groq"}
 
 
 def _require_http_url(url: str) -> None:
-    """Reject any non-http(s) URL before opening it (guards file:/ schemes)."""
-    if not url.lower().startswith(("http://", "https://")):
-        raise QuotaError(f"refusing non-http(s) quota URL: {url[:40]}")
+    """Require https:// for remote quota URLs; allow http:// only on loopback."""
+    parsed = urllib.parse.urlsplit(url or "")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https" and host:
+        return
+    if scheme == "http" and host in ("127.0.0.1", "localhost", "::1"):
+        return
+    raise QuotaError(f"refusing non-https/non-loopback quota URL: {url[:40]}")
 
 
 def _http_get_json(url: str, api_key: str) -> Dict[str, Any]:
@@ -263,7 +271,11 @@ def fetch_quota(provider_id: str, cfg: Any) -> Optional[QuotaInfo]:
     if provider_id in ACCOUNT_SPECS:
         path, parser = ACCOUNT_SPECS[provider_id]
         base = cfg.get_base_url(provider_id).rstrip("/")
-        return parser(_http_get_json(base + path, api_key))
+        payload = _http_get_json(base + path, api_key)
+        try:
+            return parser(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QuotaError(f"unexpected quota schema: {exc}") from exc
 
     if provider_id in RATE_HEADER_PROVIDERS:
         base = cfg.get_base_url(provider_id)
@@ -295,11 +307,11 @@ def render_quota(info: Optional[QuotaInfo]) -> str:
     if info is None:
         return "n/a"
     u = info.unit
-    if info.used is not None and info.total:
+    if info.used is not None and info.total is not None:
         return f"{_fmt_amount(info.used, u)} / {_fmt_amount(info.total, u)} {u}"
     if info.used is not None:
         return f"{_fmt_amount(info.used, u)} {u} used"
-    if info.remaining is not None and info.total:
+    if info.remaining is not None and info.total is not None:
         used = info.total - info.remaining
         return f"{_fmt_amount(used, u)} / {_fmt_amount(info.total, u)} {u}"
     if info.remaining is not None:

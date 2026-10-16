@@ -209,9 +209,28 @@ class AuditCheckpoint:
             },
         )
 
+    @staticmethod
+    def _member_has_error(member: Dict[str, Any]) -> bool:
+        if member.get("error"):
+            return True
+        if member.get("role") == "REDTEAM_PIPELINE" and member.get("answer"):
+            try:
+                state = json.loads(member["answer"])
+            except Exception:
+                return False
+            if isinstance(state, dict):
+                return bool(
+                    state.get("attack_errors")
+                    or state.get("challenge_error")
+                    or state.get("adaptive_probe_error")
+                    or state.get("format_correction_errors")
+                )
+        return False
+
     def save_final(self, final: Optional[str]) -> None:
         failed_members = sum(
-            bool(member.get("error")) for member in self.load_members().values()
+            self._member_has_error(member)
+            for member in self.load_members().values()
         )
         status = "partial" if failed_members else "completed"
         self._set_status(status, final)

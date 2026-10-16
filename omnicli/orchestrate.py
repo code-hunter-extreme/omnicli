@@ -224,8 +224,6 @@ def build_swarm(
 
     swarm: List[Tuple[str, str]] = []
     chosen_families: set = set()
-    idx: Dict[str, int] = {pid: 0 for pid in providers}
-    active = [pid for pid in providers if per_provider[pid]]
 
     # Pass 1: Every active provider gets 1 slot (preferring unused families if available).
     for pid in providers:
@@ -1146,6 +1144,48 @@ Agreement between models is not proof. Independently review every candidate and 
     return report_file
 
 
+def _selected_model_families(
+    swarm: List[Tuple[str, str]], minimum_families: int
+) -> List[str]:
+    families = sorted({
+        family
+        for _, model in swarm
+        if (family := classify_family(model)) != "other"
+    })
+    if minimum_families == 1 and not families and swarm:
+        return ["other"]
+    return families
+
+
+def _successful_model_families(
+    swarm: List[Tuple[str, str]],
+    members: List[Dict[str, Any]],
+    minimum_families: int,
+) -> List[str]:
+    successful = {
+        (member.get("provider"), member.get("model"))
+        for member in members
+        if not member.get("error") and str(member.get("answer") or "").strip()
+    }
+    families = sorted({
+        classify_family(model)
+        for provider, model in swarm
+        if (provider, model) in successful and classify_family(model) != "other"
+    })
+    if minimum_families == 1 and not families and successful:
+        return ["other"]
+    return families
+
+
+def _validate_minimum_families(minimum_families: int) -> None:
+    if (
+        not isinstance(minimum_families, int)
+        or isinstance(minimum_families, bool)
+        or minimum_families < 1
+    ):
+        raise ValueError("minimum_families must be an integer of at least 1")
+
+
 def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = None,
                       max_tokens: int = 512, synth: bool = True,
                       judge: Optional[Tuple[str, str]] = None,
@@ -1155,13 +1195,34 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
                       member_tools: Optional[List[Dict[str, Any]]] = None,
                       tool_kwargs: Optional[Dict[str, Any]] = None,
                       max_tool_turns: int = 3,
-                      system: Optional[str] = None) -> Dict[str, Any]:
+                      system: Optional[str] = None,
+                      minimum_families: int = 1) -> Dict[str, Any]:
     """Models work together on one task: parallel fan-out + claim-merge."""
+    _validate_minimum_families(minimum_families)
+    selected_swarm = swarm if swarm is not None else build_swarm(cfg, size=size)
+    selected_families = _selected_model_families(
+        selected_swarm, minimum_families
+    )
+    if len(selected_families) < minimum_families:
+        raise RuntimeError(
+            "Insufficient independent model families selected for collaboration: "
+            f"required {minimum_families}, found {len(selected_families)} "
+            f"({', '.join(selected_families) or 'none classified'})."
+        )
     members = run_swarm(
         cfg, client, prompt, system=system, size=size, max_tokens=max_tokens,
-        checkpoint=checkpoint, swarm=swarm, member_tools=member_tools,
+        checkpoint=checkpoint, swarm=selected_swarm, member_tools=member_tools,
         tool_kwargs=tool_kwargs, max_tool_turns=max_tool_turns,
     )
+    passing_families = _successful_model_families(
+        selected_swarm, members, minimum_families
+    )
+    if len(passing_families) < minimum_families:
+        raise RuntimeError(
+            "Insufficient independent model families completed collaboration: "
+            f"required {minimum_families}, completed {len(passing_families)} "
+            f"({', '.join(passing_families) or 'none'})."
+        )
     synthesis_telemetry: Dict[str, Any] = {}
     final = (
         synthesize(
@@ -1170,7 +1231,17 @@ def swarm_collaborate(cfg: Any, client: Any, prompt: str, size: Optional[int] = 
         )
         if synth else None
     )
-    return {"members": members, "final": final, "synthesis": synthesis_telemetry}
+    return {
+        "members": members,
+        "final": final,
+        "synthesis": synthesis_telemetry,
+        "orchestration_gate": {
+            "status": "PASS",
+            "minimum_families": minimum_families,
+            "selected_families": selected_families,
+            "passing_families": passing_families,
+        },
+    }
 
 
 def _is_throttle_error(message: object) -> bool:
@@ -1217,12 +1288,51 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                   checkpoint: Optional[Any] = None,
                   swarm: Optional[List[Tuple[str, str]]] = None,
                   source_files: Optional[Dict[str, str]] = None,
-                  temperature: Optional[float] = None) -> Dict[str, Any]:
-    """Run independent attack reviews, cross-examination, then evidence-led synthesis."""
+                  temperature: Optional[float] = None,
+                  minimum_families: int = 1) -> Dict[str, Any]:
+    """Run independent attack reviews, cross-examination, then evidence-led synthesis.
+
+    ``minimum_families`` is checked both against the selected roster and the
+    members that actually pass the evidence gate. This lets callers require
+    genuine multi-family review without treating configured-but-failed models
+    as participants.
+    """
+    if (
+        not isinstance(minimum_families, int)
+        or isinstance(minimum_families, bool)
+        or minimum_families < 1
+    ):
+        raise ValueError("minimum_families must be an integer of at least 1")
+
+    def failed_run(
+        message: str,
+        sources: Dict[str, str],
+        selected_families: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        families = list(selected_families or [])
+        evidence_gate = assess_evidence_gate(sources, [], [message], [])
+        evidence_gate["minimum_families"] = minimum_families
+        evidence_gate["selected_families"] = families
+        return {
+            "members": [],
+            "final": f"EVIDENCE GATE: FAIL\n\n{message}",
+            "rounds": [],
+            "metrics": {
+                "selected_families": families,
+                "passing_families": [],
+                "minimum_families": minimum_families,
+            },
+            "evidence_gate": evidence_gate,
+            "attack_validations": [],
+            "challenge_validations": [],
+            "challenge_outcomes": [],
+        }
+
     started = time.perf_counter()
     sources = source_files or extract_sources_from_prompt(goal)
     if not sources:
         evidence_gate = assess_evidence_gate({}, [], [], [])
+        evidence_gate["minimum_families"] = minimum_families
         return {
             "members": [],
             "final": (
@@ -1240,12 +1350,24 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
     source_facts_text = json.dumps(source_facts, sort_keys=True)
     swarm = swarm if swarm is not None else build_swarm(cfg, size=size)
     if not swarm:
-        return {
-            "members": [],
-            "final": "No red-team members are configured.",
-            "rounds": [],
-            "metrics": {},
-        }
+        return failed_run("No red-team members are configured.", sources)
+    selected_families = sorted({
+        family
+        for _, model in swarm
+        if (family := classify_family(model)) != "other"
+    })
+    selected_family_count = len(selected_families)
+    if minimum_families == 1 and selected_family_count == 0 and swarm:
+        selected_families = ["other"]
+        selected_family_count = 1
+    if selected_family_count < minimum_families:
+        return failed_run(
+            "Insufficient independent model families selected: "
+            f"required {minimum_families}, found {selected_family_count} "
+            f"({', '.join(selected_families) or 'none classified'}).",
+            sources,
+            selected_families,
+        )
 
     def saved_state(pair: Tuple[str, str]) -> Dict[str, Any]:
         if not checkpoint:
@@ -1825,7 +1947,19 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                 for item in retry_outcomes
             )
             original = state.get("challenge", {}).get("answer", "")
-            state["challenge"]["answer"] = "\n\n".join(
+            challenge_slot = state.setdefault(
+                "challenge",
+                {
+                    "provider": result["provider"],
+                    "model": result["model"],
+                    "family": result.get(
+                        "family", classify_family(result["model"])
+                    ),
+                    "answer": "",
+                    "error": None,
+                },
+            )
+            challenge_slot["answer"] = "\n\n".join(
                 part for part in (original, recovery["answer"]) if part
             )
         if result.get("error"):
@@ -1834,7 +1968,14 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             state.pop("challenge_error", None)
         state["challenge_recovery"] = recovery
         if checkpoint:
-            challenge = state.get("challenge", {})
+            challenge = state.get("challenge") or {
+                "provider": result["provider"],
+                "model": result["model"],
+                "family": result.get(
+                    "family", classify_family(result["model"])
+                ),
+                "error": state.get("challenge_error"),
+            }
             checkpoint.save_member({
                 **challenge,
                 "role": "REDTEAM_PIPELINE",
@@ -2028,6 +2169,31 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         candidate_triage,
         verdicts=typed_judgment["verdicts"],
     )
+    passing_member_names = set(evidence_gate["passing_members"])
+    passing_families = sorted({
+        member["family"]
+        for member in members
+        if f"{member['provider']}:{member['model']}" in passing_member_names
+        and member.get("family") != "other"
+    })
+    if minimum_families == 1 and not passing_families and passing_member_names:
+        passing_families = ["other"]
+    evidence_gate["minimum_families"] = minimum_families
+    evidence_gate["selected_families"] = selected_families
+    evidence_gate["passing_families"] = passing_families
+    if len(passing_families) < minimum_families:
+        failure = (
+            "Insufficient independent model families passed the evidence gate: "
+            f"required {minimum_families}, passed {len(passing_families)} "
+            f"({', '.join(passing_families) or 'none'})."
+        )
+        evidence_gate["status"] = "FAIL"
+        evidence_gate["failed_checks"].append(failure)
+        evidence_gate["security_conclusion"] = "NOT_ASSESSED"
+        evidence_gate["meaning"] = (
+            "The required independent-family review did not complete; no "
+            "qualified security conclusion is available."
+        )
     provider_warnings = evidence_gate["provider_warnings"]
     if not isinstance(provider_warnings, list):
         raise TypeError(
@@ -2258,6 +2424,9 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             if len(set(swarm)) > 1
             else "same-model self-critique; not independent corroboration"
         ),
+        "selected_families": selected_families,
+        "passing_families": passing_families,
+        "minimum_families": minimum_families,
         "synthesis": synthesis_telemetry,
     }
     return {
@@ -2299,6 +2468,7 @@ def run_orchestration(
     tool_kwargs: Optional[Dict[str, Any]] = None,
     max_tool_turns: int = 3,
     system: Optional[str] = None,
+    minimum_families: int = 1,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2328,6 +2498,9 @@ def run_orchestration(
         )
     is_redteam = normalized in ("redteam", "red", "rt")
     is_deliberate = normalized in ("deliberate", "discussion", "boardroom")
+    _validate_minimum_families(minimum_families)
+    if is_deliberate and minimum_families != 1:
+        raise ValueError("minimum_families is not supported in deliberate mode")
     if member_tools is not None and (is_redteam or is_deliberate):
         warnings.warn(
             f"member_tools applies to collaborate only; {normalized} stages "
@@ -2378,6 +2551,15 @@ def run_orchestration(
     checkpoint = None
     if checkpoint_path:
         from omnicli.audit_state import AuditCheckpoint
+        _tool_names = (
+            [
+                t.get("function", {}).get("name")
+                for t in member_tools
+                if isinstance(t, dict)
+            ]
+            if member_tools is not None
+            else None
+        )
         checkpoint = AuditCheckpoint(
             checkpoint_path,
             normalized,
@@ -2385,8 +2567,14 @@ def run_orchestration(
             resume=resume,
             options={
                 "synth": synth,
+                "synth_method": synth_method,
                 "max_tokens": max_tokens,
                 "swarm": selected_swarm,
+                "minimum_families": minimum_families,
+                "system": system,
+                "member_tools": _tool_names,
+                "tool_kwargs": tool_kwargs,
+                "max_tool_turns": max_tool_turns,
             },
         )
 
@@ -2397,6 +2585,7 @@ def run_orchestration(
                     cfg, client, enriched, size=size, max_tokens=max_tokens,
                     synth=synth, judge=judge, checkpoint=checkpoint,
                     swarm=selected_swarm, source_files=sources_for_validation,
+                    minimum_families=minimum_families,
                 )
                 result["run_id"] = checkpoint.run_id
                 result["events"] = checkpoint.events()
@@ -2426,6 +2615,7 @@ def run_orchestration(
                 cfg, client, enriched, size=size, max_tokens=max_tokens,
                 synth=synth, judge=judge, checkpoint=checkpoint,
                 swarm=selected_swarm, source_files=sources_for_validation,
+                minimum_families=minimum_families,
             )
             if synth and res.get("final") and report_path is not None:
                 rep_path = generate_redteam_report(
@@ -2441,6 +2631,7 @@ def run_orchestration(
                 swarm=selected_swarm, synth_method=synth_method,
                 member_tools=member_tools, tool_kwargs=tool_kwargs,
                 max_tool_turns=max_tool_turns, system=system,
+                minimum_families=minimum_families,
             )
 
         if checkpoint:

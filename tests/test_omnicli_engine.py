@@ -51,6 +51,18 @@ class TestProviderAuthHeaders(unittest.TestCase):
         self.assertEqual(scheme, "Bearer")
         self.assertEqual(token, "demo-key")
 
+    def test_openrouter_referer_can_be_configured(self):
+        from omnicli.client import OmniClient
+
+        cfg = MagicMock()
+        cfg.get_api_key.return_value = None
+        client = OmniClient(cfg)
+        with patch.dict(os.environ, {"OMNICLI_HTTP_REFERER": "https://example.test/omni"}):
+            self.assertEqual(
+                client.get_headers("openrouter")["HTTP-Referer"],
+                "https://example.test/omni",
+            )
+
 
 class TestProviderTransientRetries(unittest.TestCase):
     def _client(self):
@@ -430,6 +442,41 @@ class TestConsensusVoteMath(unittest.TestCase):
         self.assertEqual(r["true_positives"], 3)
         self.assertEqual(r["total_queried"], 3)
         self.assertEqual(r["tp_ratio"], 1.0)
+
+    def test_single_member_panel_cannot_be_consensus(self):
+        client = FakeClient(["VERDICT: TRUE_POSITIVE"])
+        v = CrossModelConsensusVerifier(client)
+        r = v.verify_finding("claim", "evidence", models=[("p", "m0")])
+        self.assertEqual(r["verdict"], "INCONCLUSIVE")
+
+    def test_two_member_panel_cannot_be_consensus(self):
+        client = FakeClient(["VERDICT: TRUE_POSITIVE"] * 2)
+        v = CrossModelConsensusVerifier(client)
+        r = v.verify_finding("claim", "evidence", models=self._panel(2))
+        self.assertEqual(r["verdict"], "INCONCLUSIVE")
+
+    def test_duplicate_panel_members_do_not_inflate_consensus(self):
+        client = FakeClient(["VERDICT: TRUE_POSITIVE"] * 3)
+        v = CrossModelConsensusVerifier(client)
+        r = v.verify_finding(
+            "claim", "evidence",
+            models=[("p", "m0"), ("p", "m0"), ("p", "m0")],
+        )
+        self.assertEqual(r["verdict"], "INCONCLUSIVE")
+        self.assertEqual(r["total_queried"], 1)
+
+    def test_same_family_panel_cannot_be_consensus(self):
+        client = FakeClient(["VERDICT: TRUE_POSITIVE"] * 3)
+        v = CrossModelConsensusVerifier(client)
+        r = v.verify_finding(
+            "claim", "evidence",
+            models=[
+                ("groq", "meta/llama-3.3-70b"),
+                ("cloudflare", "@cf/meta/llama-3.1-8b"),
+                ("xkiro", "llama-4-scout"),
+            ],
+        )
+        self.assertEqual(r["verdict"], "INCONCLUSIVE")
 
     def test_all_false_positive_rejects(self):
         client = FakeClient(["VERDICT: FALSE_POSITIVE"] * 3)
@@ -1001,6 +1048,72 @@ class TestCliModeWiring(unittest.TestCase):
                 self.assertFalse(run.call_args.kwargs["synth"])
                 self.assertEqual(run.call_args.kwargs["provider"], "p")
                 self.assertEqual(run.call_args.kwargs["swarm"], [("p", "openai/test")])
+
+    def test_cli_imports_without_serve_extra(self):
+        """Base install (no fastapi/uvicorn) must still import the CLI:
+        the proxy is an optional [serve] extra, imported lazily."""
+        import subprocess as _sp
+        code = (
+            "import sys\n"
+            "class B:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'fastapi' or name.startswith('fastapi.'):\n"
+            "            raise ImportError('blocked fastapi')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, B())\n"
+            "from omnicli.cli import main\n"
+            "print('IMPORT_OK')\n"
+        )
+        r = _sp.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            cwd=ROOT, timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("IMPORT_OK", r.stdout)
+
+    def test_set_key_prompts_hidden_when_key_omitted(self):
+        with patch("omnicli.cli.cfg") as fake_cfg:
+            fake_cfg.data = {"providers": {"groq": {}}}
+            result = self.runner.invoke(
+                self.main, ["config", "set-key", "groq"], input="sekrit-key\n"
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        fake_cfg.set_api_key.assert_called_once_with("groq", "sekrit-key")
+        self.assertNotIn("sekrit-key", result.output)
+
+    def _redteam_payloads(self, extra_args):
+        payload = {
+            "members": [], "final": None,
+            "evidence_gate": {
+                "status": "PASS_GROUNDING_ONLY",
+                "security_conclusion": "NOT_ASSESSED",
+                "failed_checks": [],
+            },
+        }
+        with self.runner.isolated_filesystem():
+            Path("sentinel_secret.py").write_text(
+                "SENTINEL_DO_NOT_SEND = 1\n", encoding="utf-8"
+            )
+            with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
+                    patch("omnicli.orchestrate.run_orchestration", return_value=payload) as run:
+                result = self.runner.invoke(
+                    self.main,
+                    ["swarm", "--redteam", *extra_args, "--raw", "--provider", "p", "audit", "this"],
+                )
+        return result, run
+
+    def test_redteam_does_not_autoscan_cwd_by_default(self):
+        result, run = self._redteam_payloads([])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("Auto-scanned", result.output)
+        sources = run.call_args.kwargs.get("source_files") or {}
+        self.assertNotIn("SENTINEL_DO_NOT_SEND", "".join(sources.values()))
+
+    def test_redteam_scan_cwd_is_explicit_opt_in(self):
+        result, run = self._redteam_payloads(["--scan-cwd"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        sources = run.call_args.kwargs.get("source_files") or {}
+        self.assertIn("SENTINEL_DO_NOT_SEND", "".join(sources.values()))
 
     def test_swarm_enrich_files_flag_is_forwarded_with_disclosure(self):
         with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "openai/test")]), \
@@ -2830,6 +2943,31 @@ class TestBashGuardrail(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(_bash_denied(cmd))
 
+    def test_bash_runs_in_workspace_not_home(self):
+        import os as _os
+        from omnicli.tools import tool_bash
+        with tempfile.TemporaryDirectory() as ws:
+            prev = _os.getcwd()
+            _os.chdir(ws)
+            try:
+                out = tool_bash("pwd", allow_shell=True)
+            finally:
+                _os.chdir(prev)
+        self.assertIn(str(Path(ws).resolve()), out)
+
+    def test_bash_cannot_read_own_key_stores(self):
+        from omnicli.tools import tool_bash, _bash_denied
+        for cmd in (
+            "cat ~/.config/omnicli/config.json",
+            "cat /home/u/.config/omnicli/config.json",
+            "cat ~/.config/trio/keys.env",
+            "grep -r KEY ~/.aider/oauth-keys.env",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(_bash_denied(cmd))
+                out = tool_bash(cmd, allow_shell=True)
+                self.assertIn("refused by safety policy", out)
+
 
 # ── ScopeGate SSRF resolution guard ───────────────────────────────────────────
 
@@ -3150,6 +3288,45 @@ class TestInjectableConfigRoot(unittest.TestCase):
             self.assertEqual(mode, 0o600, oct(mode))
             reloaded = ConfigManager(config_dir=d)
             self.assertEqual(reloaded.get_api_key("groq"), "secret-key")
+
+    def test_load_tightens_permissive_config_without_save(self):
+        """Merely loading a pre-existing 0644 config must tighten it to
+        0600: existing installs must not stay world-readable until the
+        next write happens to occur."""
+        import os as _os
+        from omnicli.config import ConfigManager
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "c"
+            d.mkdir(parents=True)
+            stale = d / "config.json"
+            stale.write_text(
+                '{"keys": {"groq": "old-secret"}, "memory": {}, "heartbeat": {}}',
+                encoding="utf-8",
+            )
+            _os.chmod(stale, 0o664)
+            cfg = ConfigManager(config_dir=d)
+            self.assertEqual(cfg.get_api_key("groq"), "old-secret")
+            mode = _os.stat(cfg.config_file).st_mode & 0o777
+            self.assertEqual(mode, 0o600, oct(mode))
+
+    def test_corrupt_config_is_backed_up_with_warning(self):
+        """A corrupt config must never be silently discarded: the original
+        bytes are preserved in a backup and a warning is emitted."""
+        import io as _io
+        from contextlib import redirect_stderr
+        from omnicli.config import ConfigManager
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "c"
+            d.mkdir(parents=True)
+            bad = d / "config.json"
+            bad.write_text("{not json at all", encoding="utf-8")
+            err = _io.StringIO()
+            with redirect_stderr(err):
+                ConfigManager(config_dir=d)
+            backups = sorted(d.glob("config.json.corrupt-*"))
+            self.assertTrue(backups, "corrupt config backup missing")
+            self.assertEqual(backups[-1].read_text(encoding="utf-8"), "{not json at all")
+            self.assertIn("corrupt", err.getvalue().lower())
 
     def test_default_config_root_unchanged(self):
         from omnicli.config import CONFIG_DIR, ConfigManager

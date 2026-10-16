@@ -153,6 +153,141 @@ def test_council_survives_throttled_member():
     )
 
 
+def test_redteam_without_members_returns_failed_evidence_gate():
+    review = swarm_redteam(
+        None,
+        _ProviderFake({}),
+        "Review vuln.py for sql injection.",
+        swarm=[],
+        source_files=dict(SOURCE),
+    )
+    assert review["evidence_gate"]["status"] == "FAIL"
+    assert any(
+        "No red-team members are configured." in failure
+        for failure in review["evidence_gate"]["failed_checks"]
+    )
+
+
+def test_minimum_families_rejects_single_family_roster_before_calls():
+    client = _ProviderFake({"a": BLOCK, "b": BLOCK})
+    review = swarm_redteam(
+        None,
+        client,
+        "Review vuln.py for sql injection.",
+        swarm=[("a", "openai/gpt-4o"), ("b", "openai/o3-mini")],
+        source_files=dict(SOURCE),
+        minimum_families=2,
+    )
+    assert review["evidence_gate"]["status"] == "FAIL"
+    assert review["metrics"]["minimum_families"] == 2
+    assert client.calls == []
+
+
+def test_minimum_families_requires_two_passing_families():
+    client = _ProviderFake({"slow": "429", "fast": BLOCK})
+    review = swarm_redteam(
+        None,
+        client,
+        "Review vuln.py for sql injection.",
+        swarm=[("slow", "meta/llama-3.3-70b"), ("fast", "openai/gpt-4o")],
+        source_files=dict(SOURCE),
+        minimum_families=2,
+    )
+    assert review["evidence_gate"]["status"] == "FAIL"
+    assert review["evidence_gate"]["selected_families"] == ["meta", "openai"]
+    assert review["evidence_gate"]["passing_families"] == ["openai"]
+    assert any(
+        "required 2, passed 1" in failure
+        for failure in review["evidence_gate"]["failed_checks"]
+    )
+
+
+def test_dispatcher_forwards_minimum_families_to_redteam():
+    from unittest.mock import patch
+
+    from omnicli.orchestrate import run_orchestration
+
+    result = {"members": [], "final": "stub"}
+    with patch("omnicli.orchestrate.swarm_redteam", return_value=result) as redteam:
+        assert run_orchestration(
+            "redteam",
+            None,
+            None,
+            "review source",
+            swarm=[("a", "openai/gpt-4o"), ("b", "meta/llama-3.3-70b")],
+            source_files=dict(SOURCE),
+            minimum_families=2,
+        ) is result
+    assert redteam.call_args.kwargs["minimum_families"] == 2
+
+
+def test_dispatcher_forwards_minimum_families_to_collaboration():
+    from unittest.mock import patch
+
+    from omnicli.orchestrate import run_orchestration
+
+    result = {"members": [], "final": "stub"}
+    with patch(
+        "omnicli.orchestrate.swarm_collaborate", return_value=result
+    ) as collaborate:
+        assert run_orchestration(
+            "collaborate",
+            None,
+            None,
+            "compare analysis",
+            swarm=[("a", "openai/gpt-4o"), ("b", "meta/llama-3.3-70b")],
+            minimum_families=2,
+        ) is result
+    assert collaborate.call_args.kwargs["minimum_families"] == 2
+
+
+def test_collaboration_requires_distinct_selected_families():
+    client = _ProviderFake({"a": BLOCK, "b": BLOCK})
+    from omnicli.orchestrate import swarm_collaborate
+
+    try:
+        swarm_collaborate(
+            None,
+            client,
+            "Compare the candidate.",
+            synth=False,
+            swarm=[("a", "openai/gpt-4o"), ("b", "openai/o3-mini")],
+            minimum_families=2,
+        )
+    except RuntimeError as exc:
+        assert "required 2, found 1" in str(exc)
+    else:
+        raise AssertionError("single-family collaboration unexpectedly passed")
+    assert client.calls == []
+
+
+def test_collaboration_requires_distinct_successful_families():
+    from omnicli.orchestrate import swarm_collaborate
+
+    class OneFamilySucceeds:
+        def chat_complete(self, provider_id, **_kwargs):
+            if provider_id == "slow":
+                raise RuntimeError("provider unavailable")
+            return {"choices": [{"message": {"content": "analysis"} }]}
+
+    try:
+        swarm_collaborate(
+            None,
+            OneFamilySucceeds(),
+            "Compare the candidate.",
+            synth=False,
+            swarm=[
+                ("fast", "openai/gpt-4o"),
+                ("slow", "meta/llama-3.3-70b"),
+            ],
+            minimum_families=2,
+        )
+    except RuntimeError as exc:
+        assert "required 2, completed 1" in str(exc)
+    else:
+        raise AssertionError("one-family collaboration unexpectedly passed")
+
+
 class _JudgeThrottleFake(_ProviderFake):
     """Attack/challenge succeed; only the supplemental judge is throttled."""
 

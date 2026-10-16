@@ -18,7 +18,6 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -914,6 +913,14 @@ class ChatSession:
                 self.last_failed_prompt = None
 
             self.messages.append({"role": "assistant", "content": final_ans})
+            if self.last_failed_prompt is None:
+                try:
+                    from omnicli.memory import append_history
+
+                    append_history(self.cfg, self.provider, "user", user_prompt)
+                    append_history(self.cfg, self.provider, "assistant", final_ans)
+                except Exception:
+                    pass
             return
 
         full_content = ""

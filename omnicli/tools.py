@@ -24,9 +24,16 @@ from omnicli.deterministic import (
 )
 
 
-REGISTRY_DB_PATH = Path("/home/phantomcore/program_registry/core/program_registry.db")
-if not REGISTRY_DB_PATH.exists():
-    REGISTRY_DB_PATH = Path("/home/phantomcore/program_registry.db")
+def registry_db_path() -> Path:
+    """Resolve the optional local registry database without a machine-specific path."""
+    configured = os.environ.get("OMNICLI_REGISTRY_DB", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    candidates = (
+        Path.home() / "program_registry" / "core" / "program_registry.db",
+        Path.home() / "program_registry.db",
+    )
+    return next((path for path in candidates if path.exists()), candidates[0])
 
 
 def tool_verify_http(
@@ -198,6 +205,11 @@ _BASH_DENY_PATTERNS = [
     r"\bchown\s+-R\b[^\n]*\s+/\s*$",                    # chown -R ... /
     r"(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(ba)?sh",   # pipe a download into a shell
     r">\s*/etc/",                                       # overwrite system config
+    # The agent's own credential stores: a prompt-injected model must never
+    # read back the API keys it runs on (cat via any home spelling).
+    r"\.config/omnicli\b",
+    r"\.config/trio/keys\.env\b",
+    r"oauth-keys\.env\b",
 ]
 
 
@@ -239,7 +251,9 @@ def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=str(Path.home()),
+            # Workspace (cwd), never the home directory: file tools are
+            # jailed to the workspace, and the shell starts there too.
+            cwd=str(Path.cwd()),
         )
         out = res.stdout
         err = res.stderr
@@ -500,15 +514,16 @@ def tool_write_file(path: str, content: str) -> str:
 
 def tool_registry_search(query: str, limit: int = 10) -> str:
     """Search the Program Registry database (~6,400 tools and programs)."""
-    if not REGISTRY_DB_PATH.exists():
-        return f"Program registry database not found at {REGISTRY_DB_PATH}"
+    db_path = registry_db_path()
+    if not db_path.exists():
+        return f"Program registry database not found at {db_path}"
 
     try:
         try:
             limit = int(limit) if limit not in (None, "None", "") else 10
         except (ValueError, TypeError):
             limit = 10
-        conn = sqlite3.connect(str(REGISTRY_DB_PATH))
+        conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
         # Query programs table
         c.execute(
