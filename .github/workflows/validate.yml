@@ -23,8 +23,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install black flake8 pylint mypy bandit ruff vulture interrogate pytest coverage hypothesis semgrep
-          [ -f requirements.txt ] && pip install -r requirements.txt || true
-          [ -f pyproject.toml ] && pip install -e . || true
+          pip install -e ".[dev]"
 
       # ---- security (promote these first) ----
       - name: gitleaks (secret scan)
@@ -41,8 +40,8 @@ jobs:
         run: semgrep scan --config p/python --config p/security-audit || true
 
       # ---- tests (hypothesis + any z3 proofs run inside pytest) ----
-      - name: pytest + coverage
-        run: coverage run -m pytest -q || true
+      - name: pytest + coverage (hard gate)
+        run: coverage run -m pytest -q
 
 
       # ---- optional SaaS scanners (dormant until you add the secret) ----

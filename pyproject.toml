@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnicli"
+version = "0.1.0"
+description = "Local multi-provider AI terminal, router and red-team agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "click",
+    "httpx",
+    "prompt_toolkit",
+    "rich",
+]
+
+[project.optional-dependencies]
+serve = [
+    "fastapi",
+    "uvicorn",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+omni = "omnicli.cli:main"
+omnicli = "omnicli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omnicli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "human_gate: requires a human-completed artifact (skipped until it exists)",
+]
