@@ -922,9 +922,29 @@ class CrossModelConsensusVerifier:
         (e.g. repeated from the evidence text) does not vote.
 
         Returns consensus vote, per-model critiques, and honest ratios.
+
+        A CONSENSUS_* verdict additionally requires a real panel: at least
+        3 deduplicated members spanning at least 3 distinct voices, where a
+        voice is the model's family when classifiable (three Llama variants
+        are one voice) else the provider:model pair. Smaller or
+        single-family panels can only ever be INCONCLUSIVE — one model, or
+        one family, cannot corroborate itself.
         """
-        model_panel = models or self._default_panel()
+        model_panel = list(dict.fromkeys(models or self._default_panel()))
         total_queried = len(model_panel)
+        try:
+            from omnicli.scanner import classify_family
+        except Exception:
+            classify_family = lambda _m: ""  # noqa: E731 - degrade to pair voices
+
+        def _voice(provider, model_id):
+            family = (classify_family(model_id or "") or "").lower()
+            return family if family not in ("", "other", "unknown") else (
+                f"{provider}:{model_id or 'default'}"
+            )
+
+        panel_voices = {_voice(p, m) for p, m in model_panel}
+        panel_is_consensus_grade = total_queried >= 3 and len(panel_voices) >= 3
 
         system_prompt = (
             "You are a rigorous, skeptical application security verifier. "
@@ -982,7 +1002,9 @@ class CrossModelConsensusVerifier:
         fp_ratio = round(fp_count / total_queried, 2)
 
         majority = (total_queried // 2) + 1
-        if tp_count == 0 and fp_count == 0:
+        if not panel_is_consensus_grade:
+            consensus_verdict = "INCONCLUSIVE"
+        elif tp_count == 0 and fp_count == 0:
             consensus_verdict = "INCONCLUSIVE"
         elif tp_count >= majority and tp_count > fp_count:
             consensus_verdict = "CONSENSUS_CONFIRMED"
@@ -997,6 +1019,7 @@ class CrossModelConsensusVerifier:
             "false_positives":  fp_count,
             "inconclusive":     inc_count,
             "total_queried":    total_queried,
+            "panel_voices":     sorted(panel_voices),
             "tp_ratio":         tp_ratio,
             "fp_ratio":         fp_ratio,
             "votes":            votes,

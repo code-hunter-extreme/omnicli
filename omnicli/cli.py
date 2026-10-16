@@ -17,7 +17,10 @@ from rich.table import Table
 from omnicli.chat import ChatSession
 from omnicli.client import OmniClient
 from omnicli.config import ConfigManager
-from omnicli.proxy import start_proxy
+
+# NOTE: omnicli.proxy (fastapi/uvicorn, the [serve] extra) is imported
+# lazily inside cmd_serve so a base install without the extra still
+# imports and runs every other command.
 
 console = Console()
 cfg = ConfigManager()
@@ -513,6 +516,14 @@ def cmd_models(provider: Optional[str], search: Optional[str]) -> None:
 @click.option("--port", default=8000, type=int, help="Port to listen on")
 def cmd_serve(host: str, port: int) -> None:
     """Run local OpenAI-compatible proxy server for external tools."""
+    try:
+        from omnicli.proxy import start_proxy
+    except ImportError as exc:
+        raise click.ClickException(
+            "The proxy server needs the [serve] extra "
+            "(fastapi + uvicorn): pip install 'omnicli[serve]' "
+            f"or pip install fastapi uvicorn. Import error: {exc}"
+        ) from exc
     start_proxy(host=host, port=port)
 
 
@@ -546,10 +557,19 @@ def config_show() -> None:
 
 @cmd_config.command("set-key")
 @click.argument("provider")
-@click.argument("key")
-def config_set_key(provider: str, key: str) -> None:
-    """Set API key for a provider."""
+@click.argument("key", required=False, default=None)
+def config_set_key(provider: str, key: Optional[str] = None) -> None:
+    """Set API key for a provider.
+
+    Omit KEY to be prompted with hidden input, so secrets never land in
+    shell history or `ps` output. Passing KEY positionally still works
+    for scripting but is discouraged.
+    """
     prov = provider.lower()
+    if key is None:
+        key = click.prompt(
+            f"API key for {prov}", hide_input=True, confirmation_prompt=False
+        )
     if prov not in cfg.data.get("providers", {}):
         console.print(f"[yellow]Warning: Provider '{prov}' is not yet in provider list. Adding it.[/yellow]")
     cfg.set_api_key(prov, key)
@@ -1045,6 +1065,10 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--dir", "--folder", "source_dir",
               type=click.Path(exists=True, file_okay=False),
               help="Supply target directory to load code sources for review")
+@click.option("--scan-cwd", is_flag=True, default=False,
+              help="Redteam only: explicitly opt in to scanning the current "
+              "working directory for source files when no --source-file/--dir "
+              "is given (contents are sent to providers; never on by default)")
 @click.option("--report-path", type=click.Path(), default="reports",
               help="Red-team report destination: file path or directory (default: ./reports)")
 @click.argument("prompt", nargs=-1, required=True)
@@ -1052,7 +1076,8 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
               redteam: bool, raw: bool, enrich_files: bool, member_tools: bool,
               allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
-              source_dir: Optional[str], report_path: str, prompt: tuple) -> None:
+              source_dir: Optional[str], scan_cwd: bool,
+              report_path: str, prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
@@ -1094,11 +1119,14 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
 
     active_mode = "redteam" if redteam else ("collaborate" if flag_collaborate else mode)
 
-    # In red-team mode, if no sources were explicitly provided, auto-discover project sources in cwd
-    if active_mode == "redteam" and not source_files:
+    # In red-team mode the cwd is scanned ONLY on explicit --scan-cwd opt-in:
+    # local files must never be sent to providers implicitly.
+    cwd_scanned = False
+    if active_mode == "redteam" and not source_files and scan_cwd:
         cwd = Path.cwd()
         dir_files = scan_directory_sources(cwd, max_chars=200_000)
         if dir_files:
+            cwd_scanned = True
             source_files.update(dir_files)
             console.print(Panel(
                 f"[dim]Auto-scanned current directory: {escape(str(cwd))} ({len(dir_files)} source files loaded)[/dim]",
@@ -1126,8 +1154,16 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
             f"- {escape(path)} ({len(content):,} characters)"
             for path, content in source_files.items()
         )
+        _how = (
+            "These files were auto-scanned from the current directory "
+            "because you passed --scan-cwd; they will be sent to the "
+            "configured model providers:"
+            if cwd_scanned else
+            "These explicitly selected files will be sent to the "
+            "configured model providers:"
+        )
         console.print(Panel(
-            f"These explicitly selected files will be sent to the configured model providers:\n"
+            f"{_how}\n"
             f"{disclosed_files}",
             title="Red-Team Source Disclosure",
             border_style="yellow",

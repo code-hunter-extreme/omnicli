@@ -8,7 +8,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -217,6 +220,15 @@ class ConfigManager:
             self.history_file.touch(mode=0o600, exist_ok=True)
 
     def _load(self) -> Dict[str, Any]:
+        if self.config_file.exists():
+            # Self-heal installs created before atomic 0600 saves: a config
+            # holding API keys must never stay group/world-readable merely
+            # because no write happens this run.
+            try:
+                if os.stat(self.config_file).st_mode & 0o077:
+                    os.chmod(self.config_file, 0o600)
+            except OSError:
+                pass
         if not self.config_file.exists():
             initial_data = {
                 "default_provider": "groq",
@@ -267,7 +279,26 @@ class ConfigManager:
             if changed:
                 self._save(data)
             return data
-        except Exception:
+        except Exception as exc:
+            # Never silently discard a corrupt config (it may hold the only
+            # copy of the user's keys): preserve the bytes and say so.
+            backup = self.config_file.with_name(
+                f"config.json.corrupt-{int(time.time())}"
+            )
+            try:
+                shutil.copyfile(self.config_file, backup)
+                try:
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    pass
+                where = f" Original preserved at {backup}."
+            except OSError:
+                where = " Backup copy FAILED; the corrupt file is untouched."
+            print(
+                f"Warning: config file {self.config_file} is corrupt "
+                f"({exc}); falling back to defaults for this run.{where}",
+                file=sys.stderr,
+            )
             return {
                 "default_provider": "openrouter",
                 "providers": copy.deepcopy(DEFAULT_PROVIDERS),
