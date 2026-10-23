@@ -103,9 +103,11 @@ def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
 @click.option("-p", "--provider", help="Provider ID (groq, openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
 @click.option("-m", "--model", help="Model identifier")
 @click.option("-s", "--system", help="System prompt")
-@click.option("-t", "--temperature", type=float, default=0.7, help="Sampling temperature (0.0 - 2.0)")
+@click.option("-t", "--temperature", type=click.FloatRange(min=0.0, max=2.0),
+              default=0.7, help="Sampling temperature (0.0 - 2.0)")
 @click.option("-f", "--file", "input_file", type=click.Path(exists=True), help="Attach file or directory content")
-@click.option("--max-tokens", type=int, default=2048, help="Max tokens to generate (default: 2048)")
+@click.option("--max-tokens", type=click.IntRange(min=1), default=2048,
+              help="Max tokens to generate (default: 2048)")
 @click.option("--no-stream", is_flag=True, help="Disable streaming output")
 @click.option("--raw", is_flag=True, help="Output raw text without rich markdown formatting")
 @click.argument("prompt_words", nargs=-1, required=False)
@@ -241,31 +243,51 @@ def run_one_shot(
         sys.stderr.write("\nInterrupted.\n")
 
 
+def _resolve_mode_flags(
+    mode: Optional[str],
+    flag_modes: Dict[str, bool],
+    default: str = "collaborate",
+) -> str:
+    """Resolve --mode and boolean aliases, rejecting conflicting requests."""
+    requested = {name for name, enabled in flag_modes.items() if enabled}
+    if mode:
+        requested.add(mode)
+    if len(requested) > 1:
+        raise click.UsageError(
+            "Choose one mode, not several: " + ", ".join(sorted(requested))
+        )
+    return next(iter(requested), default)
+
+
 @main.command("chat")
 @click.option("-p", "--provider", help="Provider ID")
 @click.option("-m", "--model", help="Model name")
 @click.option("-s", "--system", help="System prompt")
-@click.option("-t", "--temperature", type=float, default=0.7, help="Temperature")
-@click.option("--mode", type=click.Choice(["collaborate", "redteam", "single"]), default="collaborate",
-              help="Council mode: collaborate (all models), redteam (adversarial), or single")
+@click.option("-t", "--temperature", type=click.FloatRange(min=0.0, max=2.0),
+              default=0.7, help="Temperature (0.0 - 2.0)")
+@click.option("--mode", type=click.Choice(["collaborate", "redteam", "single"]), default=None,
+              help="Council mode: collaborate (all models), redteam (adversarial), or single "
+                   "(default: collaborate)")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Set mode to collaborate")
 @click.option("--redteam", is_flag=True, default=False,
               help="Adversarial security-analyst persona (no tools; proof-demanding)")
 @click.option("--single", "flag_single", is_flag=True, default=False, help="Set mode to single-model chat")
-@click.option("--size", type=int, default=None, help="Council size for multi-model orchestration (default: all active providers)")
+@click.option("--size", type=click.IntRange(min=1), default=None,
+              help="Council size for multi-model orchestration (default: all active providers)")
 @click.option("--rotate-families", is_flag=True, default=False,
               help="Switch model family each turn from the scanned roster")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
-             temperature: float, mode: str, flag_collaborate: bool,
+             temperature: float, mode: Optional[str], flag_collaborate: bool,
              redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool) -> None:
     """Start an interactive chat session with multi-model orchestration."""
-    active_mode = mode
-    if flag_single:
-        active_mode = "single"
-    elif redteam:
-        active_mode = "redteam"
-    elif flag_collaborate:
-        active_mode = "collaborate"
+    active_mode = _resolve_mode_flags(
+        mode,
+        {
+            "collaborate": flag_collaborate,
+            "redteam": redteam,
+            "single": flag_single,
+        },
+    )
 
     session = ChatSession(
         provider=provider,
@@ -513,7 +535,8 @@ def cmd_models(provider: Optional[str], search: Optional[str]) -> None:
 
 @main.command("serve")
 @click.option("--host", default="127.0.0.1", help="Host interface to bind")
-@click.option("--port", default=8000, type=int, help="Port to listen on")
+@click.option("--port", default=8000, type=click.IntRange(min=1, max=65535),
+              help="Port to listen on")
 def cmd_serve(host: str, port: int) -> None:
     """Run local OpenAI-compatible proxy server for external tools."""
     try:
@@ -615,9 +638,9 @@ def config_add_provider(name: str, base_url: str, key: Optional[str], model: str
 
 @main.command("scan")
 @click.option("-p", "--provider", help="Scan a single provider (default: all)")
-@click.option("--panel-size", type=int, default=3, show_default=True,
+@click.option("--panel-size", type=click.IntRange(min=1), default=3, show_default=True,
               help="Max models in verification panel per provider")
-@click.option("--max-per-family", type=int, default=2, show_default=True,
+@click.option("--max-per-family", type=click.IntRange(min=1), default=2, show_default=True,
               help="Max fallback models per family per provider")
 def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> None:
     """Scan provider /models endpoints, classify by family, write fallback rosters to config.
@@ -1003,7 +1026,8 @@ def cmd_workflow_run(workflow_file: str, max_workers: int, output: Optional[str]
 @main.command("agent")
 @click.option("-p", "--provider", help="Supervisor provider (default: openrouter or nvidia)")
 @click.option("-m", "--model", help="Supervisor model")
-@click.option("--max-turns", type=int, default=10, help="Max tool call turns (default 10)")
+@click.option("--max-turns", type=click.IntRange(min=1), default=10,
+              help="Max tool call turns (default 10)")
 @click.option("--redteam", is_flag=True, default=False,
               help="Adversarial system prompt + verify_* tools as the primary toolset")
 @click.option("--rotate-families", is_flag=True, default=False,
@@ -1040,9 +1064,11 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 
 
 @main.command("swarm")
-@click.option("-n", "--size", type=int, default=None, help="Number of swarm members (default: all active providers)")
-@click.option("--mode", type=click.Choice(["collaborate", "redteam", "deliberate"]), default="collaborate",
-              help="Mode: parallel claim-merge, redteam, or two-round deliberate discussion")
+@click.option("-n", "--size", type=click.IntRange(min=1), default=None,
+              help="Number of swarm members (default: all active providers)")
+@click.option("--mode", type=click.Choice(["collaborate", "redteam", "deliberate"]), default=None,
+              help="Mode: parallel claim-merge, redteam, or two-round deliberate discussion "
+                   "(default: collaborate)")
 @click.option("--collaborate", "flag_collaborate", is_flag=True, default=False, help="Run collaborative swarm")
 @click.option("--redteam", is_flag=True, default=False,
               help="Multi-model adversarial red-team review (different families together)")
@@ -1069,30 +1095,69 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               help="Redteam only: explicitly opt in to scanning the current "
               "working directory for source files when no --source-file/--dir "
               "is given (contents are sent to providers; never on by default)")
-@click.option("--report-path", type=click.Path(), default="reports",
-              help="Red-team report destination: file path or directory (default: ./reports)")
+@click.option("--report-path", type=click.Path(), default=None,
+              help="Red-team report destination: file path or directory "
+                   "(default: ./reports; redteam only)")
 @click.argument("prompt", nargs=-1, required=True)
-def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
+def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
               redteam: bool, raw: bool, enrich_files: bool, member_tools: bool,
               allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               source_dir: Optional[str], scan_cwd: bool,
-              report_path: str, prompt: tuple) -> None:
+              report_path: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
     from rich.markup import escape
     from omnicli import orchestrate as orch
     from omnicli.tools import scan_directory_sources
     task = " ".join(prompt).strip()
+    active_mode = _resolve_mode_flags(
+        mode,
+        {"collaborate": flag_collaborate, "redteam": redteam},
+    )
+    if scan_cwd and active_mode != "redteam":
+        raise click.UsageError("--scan-cwd is only supported in red-team mode")
+    if report_path is not None and active_mode != "redteam":
+        raise click.UsageError("--report-path is only supported in red-team mode")
+    if allowed_hosts and (not member_tools or active_mode != "collaborate"):
+        raise click.UsageError(
+            "--allowed-hosts requires --member-tools in collaborate mode"
+        )
+    if resume and not checkpoint:
+        raise click.UsageError("--resume requires --checkpoint PATH")
+    if checkpoint and active_mode == "deliberate":
+        raise click.UsageError("--checkpoint is not supported with --mode deliberate yet")
+    if active_mode == "redteam" and enrich_files:
+        console.print(
+            "[yellow]--enrich-files is ignored in red-team mode; use "
+            "--source-file or --dir so citations can be grounded.[/yellow]"
+        )
+    if active_mode == "redteam" and raw and report_path is not None:
+        console.print(
+            "[yellow]--report-path has no effect with --raw because synthesis "
+            "is skipped.[/yellow]"
+        )
+    report_destination = (
+        report_path or "reports"
+    ) if active_mode == "redteam" else None
+
     source_files = {}
     total_source_chars = 0
-
+    explicit_sources = bool(source_paths or source_dir)
     all_inputs = list(source_paths)
     if source_dir:
         all_inputs.append(source_dir)
+    seen_inputs = set()
 
     for source_path in all_inputs:
         path = Path(source_path)
+        try:
+            input_key = str(path.resolve())
+        except OSError:
+            input_key = str(path.absolute())
+        if input_key in seen_inputs:
+            continue
+        seen_inputs.add(input_key)
         if path.is_dir():
             remaining = max(0, 200_000 - total_source_chars)
             dir_files = scan_directory_sources(path, max_chars=remaining)
@@ -1117,32 +1182,32 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
                 )
             source_files[str(path)] = content
 
-    active_mode = "redteam" if redteam else ("collaborate" if flag_collaborate else mode)
-
     # In red-team mode the cwd is scanned ONLY on explicit --scan-cwd opt-in:
     # local files must never be sent to providers implicitly.
     cwd_scanned = False
-    if active_mode == "redteam" and not source_files and scan_cwd:
-        cwd = Path.cwd()
-        dir_files = scan_directory_sources(cwd, max_chars=200_000)
-        if dir_files:
-            cwd_scanned = True
-            source_files.update(dir_files)
-            console.print(Panel(
-                f"[dim]Auto-scanned current directory: {escape(str(cwd))} ({len(dir_files)} source files loaded)[/dim]",
-                title="Red-Team Directory Auto-Discovery",
-                border_style="yellow",
-            ))
+    if active_mode == "redteam" and scan_cwd:
+        if explicit_sources:
+            console.print(
+                "[yellow]--scan-cwd ignored because explicit source inputs "
+                "were supplied.[/yellow]"
+            )
+        else:
+            cwd = Path.cwd()
+            dir_files = scan_directory_sources(cwd, max_chars=200_000)
+            if dir_files:
+                cwd_scanned = True
+                source_files.update(dir_files)
+                console.print(Panel(
+                    f"[dim]Auto-scanned current directory: {escape(str(cwd))} ({len(dir_files)} source files loaded)[/dim]",
+                    title="Red-Team Directory Auto-Discovery",
+                    border_style="yellow",
+                ))
 
     swarm = orch.build_swarm(cfg, size=size, provider=provider)
     if not swarm:
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
         return
 
-    if checkpoint and active_mode == "deliberate":
-        raise click.UsageError("--checkpoint is not supported with --mode deliberate yet")
-    if resume and not checkpoint:
-        raise click.UsageError("--resume requires --checkpoint PATH")
     roster = ", ".join(f"{p}:{m.split('/')[-1]} ({orch.classify_family(m)})" for p, m in swarm)
     console.print(Panel(
         f"[bold cyan]Swarm {active_mode.upper()}[/bold cyan] — {len(swarm)} members\n"
@@ -1215,7 +1280,7 @@ def cmd_swarm(size: Optional[int], mode: str, flag_collaborate: bool,
                 active_mode, cfg, client, task, size=size, synth=not raw,
                 checkpoint_path=checkpoint, resume=resume,
                 provider=provider, swarm=swarm, source_files=source_files,
-                enrich_files=enrich_files, report_path=report_path,
+                enrich_files=enrich_files, report_path=report_destination,
                 member_tools=member_tool_defs, tool_kwargs=member_tool_kwargs,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:

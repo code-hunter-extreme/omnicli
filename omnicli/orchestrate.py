@@ -22,10 +22,12 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import re
+import sys
+import threading
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from omnicli.agent import call_model_with_tools
 from omnicli.evidence import (
@@ -34,6 +36,7 @@ from omnicli.evidence import (
     candidate_reference_id,
     canonical_finding_category,
     extract_sources_from_prompt,
+    strip_source_blocks_from_prompt,
     parse_challenge_triage,
     triage_grounded_findings,
     validate_quoted_findings,
@@ -258,7 +261,18 @@ def build_swarm(
                     break
                 queue = remaining.get(pid, [])
                 if queue:
-                    swarm.append((pid, queue.pop(0)))
+                    # Prefer a family not already in the swarm; otherwise
+                    # take the next model in roster order.
+                    pick_index = next(
+                        (
+                            index for index, model in enumerate(queue)
+                            if classify_family(model) not in chosen_families
+                        ),
+                        0,
+                    )
+                    model = queue.pop(pick_index)
+                    swarm.append((pid, model))
+                    chosen_families.add(classify_family(model))
                     progressed = True
             if not progressed:
                 break
@@ -505,8 +519,18 @@ def _split_claims(answer: str) -> List[str]:
     return claims
 
 
+_CLAIM_PUNCT_RE = re.compile(r"[^\w\s]+", re.UNICODE)
+
+
 def _claim_key(claim: str) -> str:
-    return " ".join(claim.lower().split())
+    """Normalize case and punctuation for conservative lexical dedup.
+
+    This is intentionally not semantic matching: paraphrases stay separate.
+    It only collapses formatting differences like trailing periods, markdown
+    emphasis, and bullet punctuation.
+    """
+    normalized = _CLAIM_PUNCT_RE.sub(" ", claim.lower())
+    return " ".join(normalized.split())
 
 
 def merge_claims(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -570,7 +594,8 @@ def render_claim_merge(merged: Dict[str, Any]) -> str:
     lines = [
         f"Deterministic claim-merge over {member_count} member output(s).",
         "Agreement between members is not proof; single-source claims are "
-        "unresolved, not refuted.",
+        "unresolved, not refuted. Claims are matched lexically "
+        "(case/punctuation-insensitive), so paraphrases may remain separate.",
         "",
         f"## Claims with multi-member support ({len(supported)})",
     ]
@@ -1826,9 +1851,70 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             challenge_assignments[reviewer].append(candidate_id)
             challenge_loads[reviewer] += 1
 
+    def is_self_review(
+        provider: str, model: str, candidate_id: str
+    ) -> bool:
+        reporter = f"{provider}:{model}"
+        return reporter in set(
+            candidate_index.get(candidate_id, {}).get("reported_by", [])
+        )
+
+    challenge_review_stats = {
+        "candidate_count": len(candidate_index),
+        "review_assignments": 0,
+        "independent_assignments": 0,
+        "self_review_assignments": 0,
+        "candidates_with_independent_review": 0,
+        "candidates_with_only_self_review": 0,
+    }
+    for candidate_id in candidate_index:
+        assigned_reviewers = [
+            pair for pair, ids in challenge_assignments.items()
+            if candidate_id in ids
+        ]
+        independent = [
+            pair for pair in assigned_reviewers
+            if not is_self_review(pair[0], pair[1], candidate_id)
+        ]
+        self_only = [
+            pair for pair in assigned_reviewers
+            if is_self_review(pair[0], pair[1], candidate_id)
+        ]
+        challenge_review_stats["review_assignments"] += len(assigned_reviewers)
+        challenge_review_stats["independent_assignments"] += len(independent)
+        challenge_review_stats["self_review_assignments"] += len(self_only)
+        if independent:
+            challenge_review_stats["candidates_with_independent_review"] += 1
+        elif self_only:
+            challenge_review_stats["candidates_with_only_self_review"] += 1
+    if not candidate_index:
+        challenge_independence = "no candidates to challenge"
+        if len(set(swarm)) <= 1:
+            challenge_independence += (
+                "; single-model review is not independent corroboration"
+            )
+    elif challenge_review_stats["review_assignments"] == 0:
+        challenge_independence = "no challenge reviews assigned; not corroboration"
+    elif challenge_review_stats["self_review_assignments"] == 0:
+        challenge_independence = (
+            "independent: no assigned candidate was reviewed by its author"
+        )
+    elif challenge_review_stats["independent_assignments"] == 0:
+        challenge_independence = (
+            "self-critique only; not independent corroboration"
+        )
+    else:
+        challenge_independence = (
+            "mixed: some assigned reviews were self-review; not fully independent"
+        )
+
     def challenge_prompt_for(provider: str, model: str, _tag: str) -> str:
         assigned = [
-            {"candidate_id": candidate_id, **candidate_index[candidate_id]}
+            {
+                "candidate_id": candidate_id,
+                "self_review": is_self_review(provider, model, candidate_id),
+                **candidate_index[candidate_id],
+            }
             for candidate_id in challenge_assignments[(provider, model)]
         ]
         return (
@@ -1850,7 +1936,9 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             "EVIDENCE: exact FILE / LINE / QUOTE when available\n"
             "SAFE TEST: a non-destructive check that would confirm or refute it\n"
             "Do not skip an assigned candidate. Use only assigned IDs; do not add "
-            "candidates. These are challenge opinions, not security verdicts. "
+            "candidates. If self_review is true, say SELF-REVIEW in REASON and "
+            "do not treat your own agreement as corroboration. These are "
+            "challenge opinions, not security verdicts. "
             "If no candidates were assigned, state NO CANDIDATES TO CHALLENGE. "
             "Do not infer safety from a missing quote or from model agreement."
         )
@@ -1873,15 +1961,25 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             "REASON, EVIDENCE, and SAFE TEST fields."
         )
 
+    def challenge_role(provider: str, model: str, _tag: str) -> str:
+        assigned = challenge_assignments[(provider, model)]
+        if not assigned:
+            return f"CHALLENGER — no candidates assigned — {provider}:{model}"
+        if len(swarm) <= 1:
+            return f"SELF-CRITIQUE — {provider}:{model}"
+        self_review = any(
+            is_self_review(provider, model, candidate_id)
+            for candidate_id in assigned
+        )
+        label = "CHALLENGER — includes self-review" if self_review else "INDEPENDENT CHALLENGER"
+        return f"{label} — {provider}:{model}"
+
     challenge_results = run_stage(
         "cross_examination",
         challenge_pending,
         _REDTEAM_CHALLENGE_SYSTEM,
         challenge_prompt_for,
-        lambda provider, model, _tag: (
-            f"INDEPENDENT CHALLENGER — {provider}:{model}"
-            if len(swarm) > 1 else f"SELF-CRITIQUE — {provider}:{model}"
-        ),
+        challenge_role,
     )
     for result in challenge_results:
         result["assigned_candidate_ids"] = challenge_assignments[
@@ -2079,6 +2177,9 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                     **outcome,
                     "provider": provider,
                     "model": model,
+                    "self_review": is_self_review(
+                        provider, model, outcome["candidate_id"]
+                    ),
                 })
         challenge_validation = validate_quoted_findings(answer, sources)
         challenge_validation["status"] = "challenge_opinions"
@@ -2093,6 +2194,14 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
         )
         challenge_validation["assigned_candidate_ids"] = sorted(assigned_ids)
         challenge_validation["reviewed_candidate_ids"] = sorted(reviewed_ids)
+        challenge_validation["self_review_candidate_ids"] = sorted(
+            candidate_id for candidate_id in assigned_ids
+            if is_self_review(provider, model, candidate_id)
+        )
+        challenge_validation["independent_candidate_ids"] = sorted(
+            candidate_id for candidate_id in assigned_ids
+            if not is_self_review(provider, model, candidate_id)
+        )
         challenge_validation["stage"] = "cross_examination"
         challenge_validation["provider"] = provider
         challenge_validation["model"] = model
@@ -2356,10 +2465,15 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
                         if part
                     )
                     reviewer_text = f" by {reviewer}" if reviewer else ""
+                    independence_text = (
+                        " (self-review; not independent)"
+                        if review.get("self_review") else ""
+                    )
                     reason_text = f" — {review['reason']}" if review.get("reason") else ""
                     report_lines.append(
                         "  Model challenge opinion (not verification): "
-                        f"{review['status'].upper()}{reviewer_text}{reason_text}"
+                        f"{review['status'].upper()}{reviewer_text}"
+                        f"{independence_text}{reason_text}"
                     )
                     if review.get("safe_test"):
                         report_lines.append(
@@ -2419,11 +2533,8 @@ def swarm_redteam(cfg: Any, client: Any, goal: str, size: Optional[int] = None,
             else None
         ),
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-        "challenge_independence": (
-            "cross-model"
-            if len(set(swarm)) > 1
-            else "same-model self-critique; not independent corroboration"
-        ),
+        "challenge_independence": challenge_independence,
+        "challenge_independence_detail": challenge_review_stats,
         "selected_families": selected_families,
         "passing_families": passing_families,
         "minimum_families": minimum_families,
@@ -2469,6 +2580,7 @@ def run_orchestration(
     max_tool_turns: int = 3,
     system: Optional[str] = None,
     minimum_families: int = 1,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2488,7 +2600,16 @@ def run_orchestration(
 
     system (collaborate only): system prompt delivered as a real system
     role message to every member — never flattened into the user prompt.
+
+    timeout: total wall-clock budget for the entire orchestration in seconds.
+    If set, the orchestration is bounded by a concrete deadline enforced
+    via a daemon worker thread; overruns raise a TimeoutError so the
+    lane health/circuit breaker can engage. A timeout of 0.0 or negative
+    refuses to dispatch entirely.
     """
+    if timeout is not None:
+        if timeout <= 0.0:
+            raise ValueError(f"timeout must be > 0, got {timeout}")
     normalized = (mode or "collaborate").lower().strip()
     if normalized in ("builder", "build", "b"):
         raise ValueError(
@@ -2499,6 +2620,38 @@ def run_orchestration(
     is_redteam = normalized in ("redteam", "red", "rt")
     is_deliberate = normalized in ("deliberate", "discussion", "boardroom")
     _validate_minimum_families(minimum_families)
+
+    def _run_with_deadline(
+        label: str, timeout_s: Optional[float], fn: Callable, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Bound a call in a daemon worker thread with a hard deadline.
+
+        Mirrors Oracle's E0-2 `_run_with_deadline`: a concrete deadline bounds
+        the call in a daemon worker; overruns raise TimeoutError so lane
+        health/breaker engage. The worker is abandoned on timeout (daemon
+        thread; a late result is discarded).
+        """
+        if timeout_s is None:
+            return fn(*args, **kwargs)
+
+        result_box: Dict[str, Any] = {}
+        exc_box: Dict[str, BaseException] = {}
+
+        def _worker() -> None:
+            try:
+                result_box["result"] = fn(*args, **kwargs)
+            except BaseException as e:
+                exc_box["exc"] = e
+
+        worker = threading.Thread(target=_worker, daemon=True, name=f"omnicli-{label}")
+        worker.start()
+        worker.join(timeout_s)
+        if worker.is_alive():
+            # Worker still running past deadline — abandon it (daemon thread)
+            raise TimeoutError(f"{label}: timed out after {timeout_s:.1f}s — orchestration worker abandoned (daemon thread)")
+        if exc_box:
+            raise exc_box["exc"]
+        return result_box["result"]
     if is_deliberate and minimum_families != 1:
         raise ValueError("minimum_families is not supported in deliberate mode")
     if member_tools is not None and (is_redteam or is_deliberate):
@@ -2511,7 +2664,7 @@ def run_orchestration(
     # File enrichment is explicit opt-in only: it sends local file contents
     # to model providers, so it never runs by default (and never for
     # redteam, which takes explicit source_files instead).
-    enriched = (
+    base_prompt = (
         prompt
         if (is_redteam or not enrich_files)
         else enrich_prompt_with_files(prompt)
@@ -2520,15 +2673,34 @@ def run_orchestration(
         path.replace("\\", "/"): content
         for path, content in (source_files or {}).items()
     }
-    if normalized_sources:
-        enriched += "\n\n" + "\n\n".join(
+    prompt_sources = extract_sources_from_prompt(base_prompt)
+    # The checkpoint prompt records supplied source so resume detects a
+    # changed source set. Only append sources the prompt does not already
+    # carry, and never inject these blocks into the red-team goal itself:
+    # redteam renders its own line map from source_files, so appending here
+    # would send every file to the model twice.
+    checkpoint_prompt = base_prompt
+    append_sources = {
+        path: content for path, content in normalized_sources.items()
+        if prompt_sources.get(path) != content
+    }
+    if append_sources:
+        checkpoint_prompt += "\n\n" + "\n\n".join(
             f"### Source file: {path}\n```text\n{content}\n```"
-            for path, content in normalized_sources.items()
+            for path, content in sorted(append_sources.items())
         )
     sources_for_validation = {
-        **extract_sources_from_prompt(enriched),
+        **prompt_sources,
         **normalized_sources,
     }
+    if is_redteam:
+        run_prompt = (
+            strip_source_blocks_from_prompt(base_prompt) or "Review the supplied source."
+            if prompt_sources else base_prompt
+        )
+    else:
+        run_prompt = checkpoint_prompt
+
     if normalized in ("deliberate", "discussion", "boardroom"):
         if checkpoint_path:
             raise ValueError(
@@ -2539,113 +2711,125 @@ def run_orchestration(
             if swarm is not None
             else build_swarm(cfg, size=size, provider=provider)
         )
-        return swarm_deliberate(
-            cfg, client, enriched, size=size, max_tokens=max_tokens,
-            judge=judge, swarm=selected_swarm,
-            source_files=sources_for_validation, synth=synth,
-        )
-    if swarm is not None:
-        selected_swarm = list(swarm)
-    else:
-        selected_swarm = build_swarm(cfg, size=size, provider=provider)
-    checkpoint = None
-    if checkpoint_path:
-        from omnicli.audit_state import AuditCheckpoint
-        _tool_names = (
-            [
-                t.get("function", {}).get("name")
-                for t in member_tools
-                if isinstance(t, dict)
-            ]
-            if member_tools is not None
-            else None
-        )
-        checkpoint = AuditCheckpoint(
-            checkpoint_path,
-            normalized,
-            enriched,
-            resume=resume,
-            options={
-                "synth": synth,
-                "synth_method": synth_method,
-                "max_tokens": max_tokens,
-                "swarm": selected_swarm,
-                "minimum_families": minimum_families,
-                "system": system,
-                "member_tools": _tool_names,
-                "tool_kwargs": tool_kwargs,
-                "max_tool_turns": max_tool_turns,
-            },
-        )
+        def _deliberate_orchestration() -> Dict[str, Any]:
+            return swarm_deliberate(
+                cfg, client, run_prompt, size=size, max_tokens=max_tokens,
+                judge=judge, swarm=selected_swarm,
+                source_files=sources_for_validation, synth=synth,
+            )
+        if timeout is not None:
+            return _run_with_deadline("orchestration", timeout, _deliberate_orchestration)
+        return _deliberate_orchestration()
 
-    try:
-        if checkpoint and checkpoint.completed:
+    # ---- Main orchestration logic (wrapped with timeout if configured) ----
+    def _main_orchestration() -> Dict[str, Any]:
+        if swarm is not None:
+            selected_swarm = list(swarm)
+        else:
+            selected_swarm = build_swarm(cfg, size=size, provider=provider)
+        checkpoint = None
+        if checkpoint_path:
+            from omnicli.audit_state import AuditCheckpoint
+            _tool_names = (
+                [
+                    t.get("function", {}).get("name")
+                    for t in member_tools
+                    if isinstance(t, dict)
+                ]
+                if member_tools is not None
+                else None
+            )
+            checkpoint = AuditCheckpoint(
+                checkpoint_path,
+                normalized,
+                checkpoint_prompt,
+                resume=resume,
+                options={
+                    "synth": synth,
+                    "synth_method": synth_method,
+                    "max_tokens": max_tokens,
+                    "swarm": selected_swarm,
+                    "minimum_families": minimum_families,
+                    "system": system,
+                    "member_tools": _tool_names,
+                    "tool_kwargs": tool_kwargs,
+                    "max_tool_turns": max_tool_turns,
+                },
+            )
+
+        try:
+            if checkpoint and checkpoint.completed:
+                if normalized in ("redteam", "red", "rt"):
+                    result = swarm_redteam(
+                        cfg, client, run_prompt, size=size, max_tokens=max_tokens,
+                        synth=synth, judge=judge, checkpoint=checkpoint,
+                        swarm=selected_swarm, source_files=sources_for_validation,
+                        minimum_families=minimum_families,
+                    )
+                    result["run_id"] = checkpoint.run_id
+                    result["events"] = checkpoint.events()
+                    if synth and result.get("final") and report_path is not None:
+                        report = generate_redteam_report(
+                            prompt, result["final"], result.get("members", []),
+                            evidence_gate=result.get("evidence_gate"),
+                            output_path=report_path,
+                        )
+                        result["report_path"] = str(report)
+                    return result
+                members = list(checkpoint.load_members().values())
+                result = {
+                    "members": members,
+                    "final": checkpoint.final,
+                    "final_evidence_validation": None,
+                    "run_id": checkpoint.run_id,
+                    "events": checkpoint.events(),
+                }
+                return result
+
+            if checkpoint:
+                checkpoint.record_event("collection_started", {"members": len(selected_swarm)})
+
             if normalized in ("redteam", "red", "rt"):
-                result = swarm_redteam(
-                    cfg, client, enriched, size=size, max_tokens=max_tokens,
+                res = swarm_redteam(
+                    cfg, client, run_prompt, size=size, max_tokens=max_tokens,
                     synth=synth, judge=judge, checkpoint=checkpoint,
                     swarm=selected_swarm, source_files=sources_for_validation,
                     minimum_families=minimum_families,
                 )
-                result["run_id"] = checkpoint.run_id
-                result["events"] = checkpoint.events()
-                if synth and result.get("final") and report_path is not None:
-                    report = generate_redteam_report(
-                        prompt, result["final"], result.get("members", []),
-                        evidence_gate=result.get("evidence_gate"),
+                if synth and res.get("final") and report_path is not None:
+                    rep_path = generate_redteam_report(
+                        prompt, res["final"], res.get("members", []),
+                        evidence_gate=res.get("evidence_gate"),
                         output_path=report_path,
                     )
-                    result["report_path"] = str(report)
-                return result
-            members = list(checkpoint.load_members().values())
-            result = {
-                "members": members,
-                "final": checkpoint.final,
-                "final_evidence_validation": None,
-                "run_id": checkpoint.run_id,
-                "events": checkpoint.events(),
-            }
-            return result
-
-        if checkpoint:
-            checkpoint.record_event("collection_started", {"members": len(selected_swarm)})
-
-        if normalized in ("redteam", "red", "rt"):
-            res = swarm_redteam(
-                cfg, client, enriched, size=size, max_tokens=max_tokens,
-                synth=synth, judge=judge, checkpoint=checkpoint,
-                swarm=selected_swarm, source_files=sources_for_validation,
-                minimum_families=minimum_families,
-            )
-            if synth and res.get("final") and report_path is not None:
-                rep_path = generate_redteam_report(
-                    prompt, res["final"], res.get("members", []),
-                    evidence_gate=res.get("evidence_gate"),
-                    output_path=report_path,
+                    res["report_path"] = str(rep_path)
+            else:
+                res = swarm_collaborate(
+                    cfg, client, checkpoint_prompt, size=size, max_tokens=max_tokens,
+                    synth=synth, judge=judge, checkpoint=checkpoint,
+                    swarm=selected_swarm, synth_method=synth_method,
+                    member_tools=member_tools, tool_kwargs=tool_kwargs,
+                    max_tool_turns=max_tool_turns, system=system,
+                    minimum_families=minimum_families,
                 )
-                res["report_path"] = str(rep_path)
-        else:
-            res = swarm_collaborate(
-                cfg, client, enriched, size=size, max_tokens=max_tokens,
-                synth=synth, judge=judge, checkpoint=checkpoint,
-                swarm=selected_swarm, synth_method=synth_method,
-                member_tools=member_tools, tool_kwargs=tool_kwargs,
-                max_tool_turns=max_tool_turns, system=system,
-                minimum_families=minimum_families,
-            )
 
-        if checkpoint:
-            checkpoint.record_event(
-                "synthesis_completed" if synth else "synthesis_skipped", {}
-            )
-            checkpoint.save_final(res.get("final"))
-            res["run_id"] = checkpoint.run_id
-            res["events"] = checkpoint.events()
-        return res
-    except Exception as exc:
-        if checkpoint:
-            checkpoint.mark_failed(str(exc))
-        raise
-    finally:
-        if checkpoint:
-            checkpoint.close()
+            if checkpoint:
+                checkpoint.record_event(
+                    "synthesis_completed" if synth else "synthesis_skipped", {}
+                )
+                checkpoint.save_final(res.get("final"))
+                res["run_id"] = checkpoint.run_id
+                res["events"] = checkpoint.events()
+            return res
+        except Exception as exc:
+            if checkpoint:
+                checkpoint.mark_failed(str(exc))
+            raise
+        finally:
+            if checkpoint:
+                checkpoint.close()
+
+    if timeout is not None:
+        return _run_with_deadline("orchestration", timeout, _main_orchestration)
+    else:
+        return _main_orchestration()

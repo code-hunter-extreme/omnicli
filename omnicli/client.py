@@ -170,6 +170,8 @@ class OmniClient:
                 if isinstance(data, dict):
                     if "data" in data and isinstance(data["data"], list):
                         return data["data"]
+                    if "models" in data and isinstance(data["models"], list):
+                        return data["models"]
                     if "result" in data and isinstance(data["result"], list):
                         return data["result"]
                     return []

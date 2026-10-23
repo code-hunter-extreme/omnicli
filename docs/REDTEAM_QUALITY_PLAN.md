@@ -187,9 +187,11 @@ outputs; disputed cases return to development and require a new held-out case.
   through the actual cross-model attack/challenge pipeline; absent explicit
   `--model` options, it uses OmniCLI's existing active default swarm.
   Held-out `--quality-gate` additionally runs per-model staged comparisons for
-  per-family metrics; those one-member challenges are self-critique, not
-  independent corroboration. A four-case pilot did not evaluate the full
-  roster and cannot establish orchestration quality.
+  per-family metrics; one-member challenges are self-critique, not independent
+  corroboration. Challenge assignments now carry a per-candidate `self_review`
+  flag, and the run metrics distinguish independent, mixed, and self-only
+  review. A four-case pilot did not evaluate the full roster and cannot
+  establish orchestration quality.
   No additional council or roster-selection flags were added.
 - The staged prompt now explicitly tells models to omit the five-digit line
   display prefix from source quotes. The grounding validator may strip that

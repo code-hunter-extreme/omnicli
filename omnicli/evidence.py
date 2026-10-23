@@ -83,6 +83,16 @@ def extract_sources_from_prompt(prompt: str) -> Dict[str, str]:
     }
 
 
+def strip_source_blocks_from_prompt(prompt: str) -> str:
+    """Remove labeled source blocks while preserving the surrounding task text.
+
+    Red-team stages render their own line-numbered source map from the parsed
+    source files. Keeping the original blocks in the goal as well would send
+    every file to the model twice.
+    """
+    return _SOURCE_BLOCK.sub("", prompt or "").strip()
+
+
 def candidate_reference_id(
     path: str,
     start_line: object,
@@ -802,6 +812,30 @@ def anchor_auth_candidate_to_mutation(
     return anchored
 
 
+def _reported_by_set(value: object) -> set[str]:
+    """Normalize a candidate's reporter list to ``provider:model`` strings."""
+    result: set[str] = set()
+    if not isinstance(value, (list, tuple)):
+        return result
+    for item in value:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            result.add(f"{item[0]}:{item[1]}")
+        elif isinstance(item, str) and item:
+            result.add(item)
+    return result
+
+
+def _review_is_self_review(
+    candidate: Mapping[str, object],
+    review: Mapping[str, object],
+) -> bool:
+    """Prefer the explicit flag, but infer it for older/foreign outcomes."""
+    if "self_review" in review:
+        return bool(review.get("self_review"))
+    reporter = f"{review.get('provider')}:{review.get('model')}"
+    return reporter in _reported_by_set(candidate.get("reported_by"))
+
+
 def triage_grounded_findings(
     validations: list[Mapping[str, object]],
     source_facts: list[Mapping[str, object]],
@@ -818,7 +852,7 @@ def triage_grounded_findings(
             ]
 
     findings: Dict[tuple[object, ...], Dict[str, object]] = {}
-    challenge_by_id: Dict[str, list[Dict[str, str]]] = {}
+    challenge_by_id: Dict[str, list[Dict[str, object]]] = {}
     for outcome in challenge_outcomes or []:
         candidate_id = outcome.get("candidate_id")
         status = outcome.get("status")
@@ -837,6 +871,10 @@ def triage_grounded_findings(
                 **(
                     {"model": str(outcome["model"])}
                     if outcome.get("model") else {}
+                ),
+                **(
+                    {"self_review": True}
+                    if outcome.get("self_review") else {}
                 ),
             })
     auth_claim = re.compile(
@@ -897,7 +935,22 @@ def triage_grounded_findings(
                     if len(challenge_statuses) == 1
                     else "mixed"
                 )
-                candidate["challenge_reviews"] = reviews
+                self_reviews = sum(
+                    _review_is_self_review(candidate, review)
+                    for review in reviews
+                )
+                candidate["challenge_independence"] = (
+                    "self_only" if self_reviews == len(reviews)
+                    else "mixed" if self_reviews
+                    else "independent"
+                )
+                candidate["challenge_reviews"] = [
+                    {
+                        **review,
+                        "self_review": _review_is_self_review(candidate, review),
+                    }
+                    for review in reviews
+                ]
             if not grounded:
                 candidate.update({
                     "status": "unsupported_citation",
@@ -981,6 +1034,9 @@ def triage_grounded_findings(
                 if not existing.get("challenge_reviews") and candidate.get("challenge_reviews"):
                     existing["challenge_reviews"] = candidate["challenge_reviews"]
                     existing["challenge_status"] = candidate.get("challenge_status")
+                    existing["challenge_independence"] = candidate.get(
+                        "challenge_independence"
+                    )
     return list(findings.values())
 
 

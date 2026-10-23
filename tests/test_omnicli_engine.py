@@ -1019,7 +1019,7 @@ class TestCliModeWiring(unittest.TestCase):
             (["--mode", "collaborate"], "collaborate"),
             (["--mode", "deliberate"], "deliberate"),
             (["--redteam"], "redteam"),
-            (["--collaborate", "--redteam"], "redteam"),
+            (["--collaborate"], "collaborate"),
         ]
         for options, expected_mode in cases:
             with self.subTest(options=options), \
@@ -1195,9 +1195,11 @@ class TestCliModeWiring(unittest.TestCase):
         from omnicli import orchestrate as orch
         tools = [{"type": "function", "function": {"name": "read_file"}}]
         with patch("omnicli.orchestrate.swarm_redteam",
-                   return_value={"members": [], "final": None}), \
+                   return_value={"members": [{"provider": "test", "model": "test-model", "family": "test"}], "final": "stub"}), \
                 patch("omnicli.orchestrate.swarm_deliberate",
-                      return_value={"members": [], "final": None}):
+                      return_value={"members": [{"provider": "test", "model": "test-model", "family": "test"}], "final": "stub", "rounds": []}), \
+                patch("omnicli.orchestrate.swarm_collaborate",
+                      return_value={"members": [{"provider": "test", "model": "test-model", "family": "test"}], "final": "stub", "rounds": []}):
             with self.assertWarnsRegex(UserWarning, "collaborate only"):
                 orch.run_orchestration(
                     "redteam", object(), object(), "task", synth=False,
@@ -1208,10 +1210,6 @@ class TestCliModeWiring(unittest.TestCase):
                     "deliberate", object(), object(), "task", synth=False,
                     swarm=[("p", "m")], member_tools=tools,
                 )
-        with patch("omnicli.orchestrate.swarm_collaborate",
-                   return_value={"members": [], "final": None}), \
-                patch("omnicli.orchestrate.swarm_redteam",
-                      return_value={"members": [], "final": None}):
             with warnings.catch_warnings():
                 warnings.simplefilter("error")
                 orch.run_orchestration(
@@ -5521,6 +5519,13 @@ class TestSwarm(unittest.TestCase):
             s.council_size = 3
 
             s.handle_slash_command("/builder")
+            self.assertEqual(s.mode, "collaborate")
+            self.assertTrue(any(
+                "Builder mode was removed" in str(call)
+                for call in s.console.print.call_args_list
+            ))
+
+            s.handle_slash_command("/mode builder")
             self.assertEqual(s.mode, "collaborate")
 
             s.handle_slash_command("/redteam")

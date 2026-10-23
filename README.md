@@ -29,10 +29,10 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 
 | Command | What it does | Single vs. multi-API |
 |---|---|---|
-| `omni` / `omni chat` | Interactive streaming REPL with **live multi-model council orchestration** (`collaborate`, `builder`, `redteam`) or `single` | **multi** or single |
+| `omni` / `omni chat` | Interactive streaming REPL with **live multi-model council orchestration** (`collaborate`, `redteam`) or `single` | **multi** or single |
 | `omni ask "<prompt>"` | One-shot query (also `omni "<prompt>"`) | single |
 | `omni agent "<goal>"` | Autonomous tool-using agent | **multi** (delegates, auto-fallback, cross-provider rotate) |
-| `omni swarm "<task>"` | Many models, different families, **in parallel** → merged (`collaborate`, `builder`, `redteam`) | **multi** |
+| `omni swarm "<task>"` | Many models, family-diverse, **in parallel** → merged (`collaborate`, `redteam`, `deliberate`) | **multi** |
 | `omni verify consensus "<claim>"` | Blind vote across models/providers | **multi** |
 | `omni verify http\|code` | Deterministic HTTP / code verification | single |
 | `omni scan` | Discover `/models` per provider, build rosters | **multi** |
@@ -45,9 +45,10 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 > **Terms, not commands:** there is no `omni talk|council|judge|build|orchestration`
 > command (`omni --help` lists the real set). `council` is chat/swarm terminology
 > for the multi-model member set; `judge` is a pipeline stage (synthesis/
-> adjudication role); `builder` is a swarm mode (`--builder`, `/builder`), not a
-> command; `orchestration` is the dispatcher (`run_orchestration`, modes at
-> `cli.py --mode`, dispatched from `chat.py`).
+> adjudication role); `orchestration` is the dispatcher (`run_orchestration`,
+> modes at `cli.py --mode`, dispatched from `chat.py`). Builder mode was
+> removed; the command and slash command now explain that instead of silently
+> running a different mode.
 
 ---
 
@@ -117,14 +118,12 @@ The headline orchestration: run several models from **different families across
 all providers in parallel**, then bring them together.
 
 Modes:
-- **`collaborate` (default)** — Models work together constructively. Parallel fanout + merged consensus.
-- **`builder` (`--builder`)** — Council split: Builders/Architects propose the design/implementation while Red-Team Breakers stress-test and attack in parallel. The synthesizer produces a hardened build fortifying against the attacks.
-- **`redteam` (`--redteam`)** — Adversarial audit council probing for vulnerabilities, consolidated by severity.
+- **`collaborate` (default)** — Models work together constructively. Parallel fanout plus a deterministic claim merge (not consensus).
+- **`redteam` (`--redteam`)** — Adversarial audit council probing for vulnerabilities, consolidated by an evidence-fed judge and a deterministic evidence gate.
 - **`deliberate`** — Two bounded rounds: parallel independent proposals, then parallel critiques that receive the complete prior-round transcript, followed by a chair summary that preserves disagreement.
 
 ```bash
-omni swarm "design a token-bucket rate limiter"          # collaborate: parallel + synthesized answer
-omni swarm --builder "design an OAuth2 PKCE auth engine" # builder: architects propose, red-team attacks, synthesized into hardened build
+omni swarm "design a token-bucket rate limiter"          # collaborate: parallel + deterministic merge
 omni swarm --redteam --source-file ./src/auth.py "audit authz bugs" # ground citations against source
 omni swarm --mode deliberate "compare approaches for this design"
 omni swarm -n 5 "..."                                     # 5 members
@@ -132,15 +131,22 @@ omni swarm --raw "..."                                    # show each member, sk
 omni swarm -p openrouter "..."                            # restrict to one provider's families
 ```
 
-Each member is a distinct family (e.g. google + meta + openai), queried
-concurrently; a synthesis pass merges agreements and flags disagreements.
-`--builder` couples constructive architects with breaker red-teamers into a fortified solution.
+Conflicting mode flags are rejected instead of silently choosing one.
+
+Members are chosen to maximize distinct model families across providers
+(e.g. google + meta + openai) and are queried concurrently. If the requested
+size exceeds the available family-diverse roster, additional members reuse a
+family; use `minimum_families` in library calls when a hard floor is required.
+The merge groups claims lexically (case/punctuation-insensitive), so
+paraphrases can remain separate and agreement is not proof.
 `--redteam` runs a staged review: each member performs separate passes over
 authentication/authorization, tainted-input sinks, sensitive-data handling, and
 state/concurrency/resource risks (even when only one member is configured).
-The challenge stage assigns concise, source-grounded candidate cards across
-independent reviewers instead of sending the entire multi-model transcript to
-every challenger. Each assignment must be dispositioned; challenge results are
+The challenge stage assigns concise, source-grounded candidate cards to
+non-author reviewers when another member exists instead of sending the entire
+multi-model transcript to every challenger. If only authors are available, the
+assignment is labeled `self_review` and is never counted as independent
+corroboration. Each assignment must be dispositioned; challenge results are
 retained as model opinions, not proof. OmniCLI then uses deterministic
 source/route facts to deduplicate and screen cited model hypotheses. A generic
 missing-auth claim on a literal-only public health route
@@ -158,9 +164,11 @@ run tests or HTTP probes, and model agreement alone is never proof. Use
 needed; HTTP checks still require an explicit host allowlist.
 For source grounding, supply files explicitly with repeatable `--source-file`
 options. Unlike general-purpose swarm modes, red-team mode does not search
-prompt-mentioned paths or attach local project files implicitly. Selected
-source files are sent to configured model providers and are listed before the
-calls begin. Red-team answers are asked for structured `FINDING` / `FILE` /
+prompt-mentioned paths or attach local project files implicitly. Directory
+scans skip credential-like filenames (for example `.env`, `credentials.json`,
+and `secrets.yaml`) and symlinks that resolve outside the scanned root; naming
+an individual file explicitly still reads it. Selected source files are sent
+to configured model providers and are listed before the calls begin. Red-team answers are asked for structured `FINDING` / `FILE` /
 `LINE` / `QUOTE` blocks; OmniCLI checks quotes against the cited starting line
 and the full cited range, and rejects ranges wider than eight lines. Empty
 replies and silent no-finding replies fail the evidence gate; a completed
@@ -320,12 +328,12 @@ recorded, never fatal.
 ## Chat REPL commands
 
 **Mode Switching (Live Orchestration):**
-- `/mode [collaborate|builder|redteam|single]` — change orchestration council mode
-- `/collaborate`, `/c` — all models reason together in parallel, synthesized consensus
-- `/builder`, `/b` — builders construct implementations, red-team attacks in parallel, hardened build
-- `/redteam`, `/rt` — adversarial audit council, ranked vulnerabilities
+- `/mode [collaborate|redteam|single]` — change orchestration council mode
+- `/collaborate`, `/c` — all models reason together in parallel, deterministic claim merge
+- `/redteam`, `/rt` — adversarial audit council, evidence-gated findings
 - `/single` — direct 1-on-1 single-model chat
 - `/size <1-10>` — set council member count (e.g. `/size 4`)
+- `/builder`, `/b` — removed; prints an explanation instead of silently mixing modes
 
 **Session & Providers:**
 `/provider` · `/model` · `/models [query]` · `/providers` · `/system` · `/temp` ·

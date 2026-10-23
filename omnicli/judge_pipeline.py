@@ -37,32 +37,70 @@ ModelCall = Callable[
 ]
 
 
-def _source_excerpt(
+MAX_JUDGE_SOURCE_CHARS = 60_000
+
+
+def _number_source(path: str, source: str, max_chars: int) -> str:
+    """Render one source file with stable line numbers, bounded by max_chars."""
+    header = f"FILE: {path}\n"
+    budget = max(0, max_chars - len(header))
+    lines: List[str] = []
+    used = 0
+    truncated = False
+    for index, text in enumerate(source.splitlines(), start=1):
+        rendered = f"{index:05d} | {text}"
+        if used + len(rendered) + 1 > budget:
+            truncated = True
+            break
+        lines.append(rendered)
+        used += len(rendered) + 1
+    if truncated:
+        lines.append("... [source truncated to fit judge context budget]")
+    return header + "\n".join(lines)
+
+
+def _source_context(
     sources: Mapping[str, str],
     candidate: Mapping[str, Any],
-    radius: int = 8,
+    max_chars: int = MAX_JUDGE_SOURCE_CHARS,
 ) -> str:
-    path = str(candidate.get("file", ""))
-    source = next(
-        (
-            text
-            for source_path, text in sources.items()
-            if str(source_path).replace("\\", "/") == path.replace("\\", "/")
+    """Return full supplied source context, citing file first.
+
+    The typed judge makes the final UPHOLD/KILL call, so an eight-line excerpt
+    is not enough: guards, middleware, decorators, and callers often live far
+    from the cited sink. For normal-sized reviews this includes every supplied
+    file; large reviews preserve the cited file first and label omitted files.
+    """
+    cited_path = str(candidate.get("file", "")).replace("\\", "/")
+    ordered = sorted(
+        sources.items(),
+        key=lambda item: (
+            0 if str(item[0]).replace("\\", "/") == cited_path else 1,
+            str(item[0]),
         ),
-        None,
     )
-    if not isinstance(source, str):
-        return "(cited source file is unavailable)"
-    try:
-        line = int(candidate.get("start_line") or 1)
-    except (TypeError, ValueError):
-        line = 1
-    lines = source.splitlines()
-    start = max(0, line - radius - 1)
-    stop = min(len(lines), line + radius)
-    return "\n".join(
-        f"{index + 1:05d} | {text}" for index, text in enumerate(lines[start:stop], start)
-    )
+    sections: List[str] = []
+    omitted: List[str] = []
+    remaining = max_chars
+    cited_seen = False
+    for path, source in ordered:
+        normalized = str(path).replace("\\", "/")
+        is_cited = normalized == cited_path
+        if is_cited:
+            cited_seen = True
+        if not isinstance(source, str) or remaining <= 0:
+            omitted.append(normalized)
+            continue
+        rendered = _number_source(normalized, source, remaining)
+        sections.append(rendered)
+        remaining -= len(rendered) + 2
+    if not cited_seen:
+        sections.insert(0, f"(cited source file is unavailable: {cited_path})")
+    if omitted:
+        sections.append(
+            "OMITTED FILES (judge context budget): " + ", ".join(omitted)
+        )
+    return "\n\n".join(sections) if sections else "(no supplied source available)"
 
 
 def run_candidate_judge_graph(
@@ -102,6 +140,15 @@ def run_candidate_judge_graph(
             "unverified": str(item.get("unverified", "")),
             "original_status": str(item.get("status", "unverified_candidate")),
             "challenge_reviews": list(item.get("challenge_reviews", [])),
+            "reported_by": [
+                (str(pair[0]), str(pair[1]))
+                for pair in (item.get("reported_by") or [])
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ] + [
+                tuple(pair.split(":", 1))
+                for pair in (item.get("reported_by") or [])
+                if isinstance(pair, str) and ":" in pair
+            ],
         })
 
     call_records: List[Dict[str, Any]] = []
@@ -132,7 +179,7 @@ def run_candidate_judge_graph(
             )
             entry: Dict[str, Any] = {
                 "candidate": candidate,
-                "reported_by": "existing scenario/adaptive/challenge pipeline",
+                "reported_by": list(candidate.get("reported_by") or []),
                 "cross_check": deterministic_cross_check(candidate, source_facts),
                 "engine_votes": {vote.engine: vote.vote for vote in votes},
                 "global_verdict": {
@@ -159,8 +206,15 @@ def run_candidate_judge_graph(
         }
 
     def judge_node(state: Dict[str, Any], _context: Any) -> Dict[str, Any]:
-        pairs = [designated_judge] if designated_judge else list(swarm)
-        if not pairs and state.get("candidates"):
+        # A designated judge is a preference, not a blank cheque to judge its
+        # own candidate. The pool keeps the full roster available for
+        # failover when the designated member authored or challenged a
+        # candidate.
+        preferred = [designated_judge] if designated_judge else []
+        pool = list(dict.fromkeys(
+            pair for pair in [*preferred, *swarm] if pair
+        ))
+        if not pool and state.get("candidates"):
             raise ValueError("No configured model is available for candidate judging.")
         judgment_results = []
         judge_ballots: Dict[str, List[Ballot]] = {}
@@ -175,11 +229,23 @@ def run_candidate_judge_graph(
                 and review.get("provider")
                 and review.get("model")
             }
-            independent_pairs = [pair for pair in pairs if pair not in review_pairs]
-            roster = list(independent_pairs) + [
-                pair for pair in pairs if pair not in independent_pairs
+            author_pairs = set(candidate.get("reported_by") or [])
+            independent_pairs = [
+                pair for pair in pool
+                if pair not in author_pairs and pair not in review_pairs
             ]
-            ordered = list(dict.fromkeys(roster))
+            non_author_pairs = [
+                pair for pair in pool if pair not in author_pairs
+            ]
+            non_reviewer_pairs = [
+                pair for pair in pool if pair not in review_pairs
+            ]
+            ordered = list(dict.fromkeys(
+                independent_pairs
+                + non_author_pairs
+                + non_reviewer_pairs
+                + pool
+            ))
             max_attempts = min(3, len(ordered))
             prompt = (
                 "### CANDIDATE FINDING UNDER REVIEW\n"
@@ -190,10 +256,12 @@ def run_candidate_judge_graph(
                 f"QUOTE: `{candidate['quote']}`\n"
                 f"Quote grounded at cited location: {candidate['grounded']}\n\n"
                 f"{build_evidence_section(entry)}\n\n"
-                "### AUTHORITATIVE SOURCE EXCERPT\n"
-                f"```text\n{_source_excerpt(sources, candidate)}\n```\n\n"
+                "### AUTHORITATIVE SOURCE CONTEXT\n"
+                "Use this full supplied source to trace reachability and guards; "
+                "the cited file is shown first.\n"
+                f"```text\n{_source_context(sources, candidate)}\n```\n\n"
                 f"{judge_calibration_prompt()}\n\n"
-                "Judge the supplied candidate, not the source as a whole. "
+                "Judge the supplied candidate against the source context. "
                 "Return one JUDGMENT: UPHOLD or JUDGMENT: KILL block and "
                 "concise REASONING grounded in the supplied code."
             )
@@ -229,6 +297,15 @@ def run_candidate_judge_graph(
                     "KILL",
                 }:
                     break
+            selected_pair = (provider, model)
+            if selected_pair in author_pairs:
+                judge_independence = "author"
+            elif selected_pair in review_pairs:
+                judge_independence = "challenge-reviewer"
+            else:
+                judge_independence = "independent"
+            if call_record:
+                call_record["judge_independence"] = judge_independence
             judgment_results.append(call_record)
             vote = parsed["judgment"]
             notes: List[str] = []
@@ -236,6 +313,16 @@ def run_candidate_judge_graph(
                 notes.append(
                     f"Judge failed over after {attempts - 1} unsuccessful "
                     f"attempt(s); final judge {provider}:{model}."
+                )
+            if judge_independence == "author":
+                notes.append(
+                    "No non-author judge was available; the judging model "
+                    "authored this candidate."
+                )
+            elif judge_independence == "challenge-reviewer":
+                notes.append(
+                    "Selected judge also challenged this candidate; the "
+                    "verdict is not independent."
                 )
             ballots: List[Ballot] = []
             all_parseable = all_parseable and vote in {"UPHOLD", "KILL"}
@@ -296,6 +383,7 @@ def run_candidate_judge_graph(
                 "judgment": parsed,
                 "provider": judgment.get("provider"),
                 "model": judgment.get("model"),
+                "judge_independence": judgment.get("judge_independence"),
                 "provider_error": judgment.get("error"),
                 "verdict": verdict,
                 "ballots": [
@@ -370,8 +458,8 @@ def run_candidate_judge_graph(
             or result.get("parsed_judgment", {}).get("judgment") == "UNPARSEABLE"
         ],
         "reviewer_independence": (
-            "challenge-reviewer-avoiding when another configured member exists; "
-            "not proof of independence from initial attack authors"
+            "judge selection avoids candidate authors and challenge reviewers "
+            "when another configured member exists; fallback is labeled"
         ),
         "graph_status": "completed",
     }

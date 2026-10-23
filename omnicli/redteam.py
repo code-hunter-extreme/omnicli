@@ -366,8 +366,10 @@ _JUDGE_SYSTEM = (
     "evidence and is auto-killed.\n"
     "- If you KILL a candidate while the evidence converges (cross-check "
     "SUPPORTED, an engine found a sink/taint fact at the cited location, no "
-    "contradicting fact), your KILL contradicts the evidence and is flipped "
-    "to UPHOLD.\n"
+    "contradicting fact), your KILL is normally flipped to UPHOLD. Exception: "
+    "if your REASONING identifies a specific neutralizing control or an "
+    "unreachable data path, that is not a contradiction; state the control "
+    "explicitly and the KILL is preserved for review.\n"
     "No other adjustment exists: format, phrasing, and which facts you "
     "mention never change a verdict.\n"
     "CATEGORY COHERENCE: your REASONING must establish the claimed CATEGORY. "
@@ -416,7 +418,17 @@ _JUDGMENT_RES = (
         re.IGNORECASE | re.MULTILINE,
     ),
 )
-_FIELD_RE_TEMPLATE = r"^\s*\*{{0,2}}\s*{name}\s*\*{{0,2}}\s*:\s*(.+?)\s*$"
+# A field value continues until the next known field label. This is what
+# makes multi-line REASONING survive parsing instead of being truncated to
+# its first line.
+_FIELD_START_RE = re.compile(
+    r"^\s*\*{0,2}\s*(?:"
+    r"JUDG?MENTS?|VERDICT|SINK-REACHABLE|GUARD-ABSENT|"
+    r"DETERMINISTIC-SIGNAL-ADDRESSED|REASONING|"
+    r"FACT\s+[A-Za-z0-9_-]+|CONTRADICTORY-CODE"
+    r")\s*\*{0,2}\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # FACT ruling lines: the judge must address every deterministic fact in the
 # case file. DISAGREE requires a verbatim contradictory quote on the same
@@ -457,6 +469,26 @@ def _strip_fences(text: str) -> str:
     return re.sub(r"```[a-zA-Z0-9_-]*\s*", "", text or "")
 
 
+def _field_value(clean: str, field_name: str) -> Optional[str]:
+    """Return one judgment field, including any continuation lines.
+
+    Values stop at the next recognized field label so a multi-line REASONING
+    block cannot swallow later FACT/CONTRADICTORY-CODE lines.
+    """
+    field_re = re.compile(
+        rf"^\s*\*{{0,2}}\s*{re.escape(field_name)}\s*\*{{0,2}}\s*:\s*",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    match = field_re.search(clean)
+    if not match:
+        return None
+    rest = clean[match.end():]
+    next_field = _FIELD_START_RE.search(rest)
+    value = rest[:next_field.start()] if next_field else rest
+    lines = [line.strip() for line in value.strip().splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
 def parse_judgment(text: str) -> Dict[str, Any]:
     """Parse one judge block into a structured verdict record.
 
@@ -485,13 +517,9 @@ def parse_judgment(text: str) -> Dict[str, Any]:
         ("deterministic_signal_addressed", "DETERMINISTIC-SIGNAL-ADDRESSED"),
         ("reasoning", "REASONING"),
     ):
-        field_match = re.search(
-            _FIELD_RE_TEMPLATE.format(name=re.escape(field_name)),
-            clean,
-            re.IGNORECASE | re.MULTILINE,
-        )
-        if field_match:
-            record[key] = field_match.group(1).strip()
+        value = _field_value(clean, field_name)
+        if value is not None:
+            record[key] = value
     return record
 
 
@@ -825,26 +853,106 @@ _CATEGORY_CONCEPTS = {
         "login", "permission", "role", "guard",
         "unauthenticated", "privilege", "access control", "session",
         "login_required", "missing auth", "no auth", "bypass",
-        "unauthorized access",
+        "unauthorized access", "authorization", "authenticated", "idor",
+        "insecure direct object", "object ownership", "ownership", "tenant",
+        "rbac", "scope check", "admin", "privileged", "authorize",
     ),
     "sensitive_data_exposure": (
         "secret", "token", "password", "expos", "leak", "return", "log",
         "client", "response", "credential", "api_key", "apikey",
+        "jsonify", "render", "print", "traceback", "exception message",
     ),
     "sql_injection": (
         "sql", "injection", "query", "parameter", "cursor", "execute",
-        "select", "where",
+        "select", "where", "interpolat", "concatenat", "f-string",
+        "format string", "database",
     ),
     "command_injection": (
         "command", "shell", "subprocess", "injection", "os.system", "popen",
+        "exec(", "execve", "execvp", "spawn", "bash", "sh -c",
     ),
     "path_traversal": (
         "path", "traversal", "file", "directory", "../", "open(",
+        "normalize", "os.path.join", "path.join", "joinpath", "filename",
+        "relative path", "absolute path", "send_file",
     ),
     "unsafe_deserialization": (
         "pickle", "yaml", "deserial", "loads", "marshal",
+        "unpickle", "arbitrary object",
     ),
 }
+
+# A judge KILL may identify a concrete neutralizing control even when the
+# deterministic evidence converges. In that case the evidence does not
+# contradict the judge: it simply does not model the control. Never override
+# that KILL automatically.
+#
+# Bare keywords are not enough: "there is no validation" must not be treated
+# as a mitigating control. These patterns locate a control mention, then the
+# helper below rejects it when a nearby negation says the control is absent.
+_JUDGE_MITIGATION_TOKEN_RE = re.compile(
+    r"\b(?:guard(?:ed|s)?|parameteri[sz](?:e|ed|ation)|parameter\s+bindings?|"
+    r"bound\s+parameters?|placeholders?|allow-?lists?|"
+    r"saniti[sz](?:e|ed|es|ing|ation|er)|escap(?:e|ed|es|ing|er)|"
+    r"encod(?:e|ed|es|ing|er)|validat(?:e|ed|es|ing|ion|or)|"
+    r"prepared\s+statements?|stored\s+procedures?|query\s+builder|"
+    r"orm|authenticat(?:e|ed|ion)|authorization\s+checks?|"
+    r"access\s+controls?|permission\s+checks?|login_required|"
+    r"permission_required|middlewares?|decorators?|is_admin|is_owner|"
+    r"ownership\s+checks?|tenant\s+checks?|csrf|nonce|auto-?escap(?:e|ed|es|ing|er)|"
+    r"csp|content\s+security\s+policy|safe_load|hardcoded|"
+    r"constant\s+literal|fixed\s+literal)\b",
+    re.IGNORECASE,
+)
+_JUDGE_NEGATION_RE = re.compile(
+    r"\b(?:no|not|without|missing|absent|never|lack(?:s|ed|ing)?|"
+    r"fail(?:s|ed|ing)?\s+to|cannot|can't|doesn't|don't|didn't|"
+    r"isn't|aren't|wasn't|weren't|unable\s+to|none)\b",
+    re.IGNORECASE,
+)
+_JUDGE_SUFFIX_NEGATION_RE = re.compile(
+    r"^\s*(?:is|are|was|were|has|have|had|gets?|got|does|do|did)?\s*"
+    r"(?:not\b|n't\b|missing\b|absent\b|disabled\b|removed\b|"
+    r"bypassed\b|never\b|none\b|unused\b|fails?\b)",
+    re.IGNORECASE,
+)
+_JUDGE_UNREACHABLE_RE = re.compile(
+    r"\b(?:unreachable|not\s+reachable|never\s+reachable|dead\s+code|"
+    r"never\s+called|not\s+(?:called|invoked)|"
+    r"cannot\s+(?:reach|control)|not\s+attacker[- ]controlled)\b",
+    re.IGNORECASE,
+)
+
+
+def _judge_names_mitigation(reasoning: str) -> bool:
+    """True when the judge positively names a control or unreachable path.
+
+    Negative statements such as "no validation" or "the guard is missing" are
+    not mitigations; treating them as such would preserve a KILL that the
+    converging evidence contradicts.
+    """
+    text = reasoning or ""
+    for match in _JUDGE_UNREACHABLE_RE.finditer(text):
+        prefix = text[max(0, match.start() - 40):match.start()]
+        if not re.search(r"\b(?:not|never)\s+$", prefix, re.IGNORECASE):
+            return True
+    for match in _JUDGE_MITIGATION_TOKEN_RE.finditer(text):
+        prefix = text[max(0, match.start() - 120):match.start()]
+        # A causal connector starts a new claim: "no injection because the
+        # query is parameterized" is a positive control mention.
+        segment = re.split(
+            r"[.;!?]|\b(?:because|since|so|therefore|thus|hence|but|"
+            r"however|although|though)\b",
+            prefix,
+            flags=re.IGNORECASE,
+        )[-1]
+        if _JUDGE_NEGATION_RE.search(segment):
+            continue
+        suffix = text[match.end():match.end() + 80]
+        if _JUDGE_SUFFIX_NEGATION_RE.search(suffix):
+            continue
+        return True
+    return False
 
 
 def _evidence_facts(entry: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -955,6 +1063,12 @@ def contradiction_flip(
         and anchored
         and not contradicting
     ):
+        if judge_reasoning and _judge_names_mitigation(judge_reasoning):
+            return (
+                "KILL",
+                "contradiction flip withheld: judge KILL identifies a possible "
+                "neutralizing control or unreachable path; human review needed",
+            )
         return (
             "UPHOLD",
             "contradiction flip: judge KILL contradicts converging evidence "

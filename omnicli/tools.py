@@ -361,12 +361,40 @@ def tool_list_directory(path: str = ".", max_depth: int = 2) -> str:
         return format_tool_error("E_IO", f"Error listing directory: {e}")
 
 
+_SENSITIVE_FILE_RE = re.compile(
+    r"(?:^|/)(?:"
+    r"\.env(?:\..*)?|"
+    r"\.netrc|\.npmrc|\.pypirc|"
+    r"id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|"
+    r"credentials?(?:\..*)?|secrets?(?:\..*)?|"
+    r"tokens?(?:\..*)?|passwords?(?:\..*)?"
+    r")$|\.(?:pem|key|p12|pfx|jks|keystore|kdbx)$",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_path(relative_path: str) -> bool:
+    """True for obvious credential/private-key filenames.
+
+    Directory scans are broad and opt-in; silently shipping an `.env` or a
+    private key to a model provider is not an acceptable default. An explicit
+    single-file read can still include it when the operator names it.
+    """
+    return bool(_SENSITIVE_FILE_RE.search(relative_path.replace("\\", "/")))
+
+
 def scan_directory_sources(
     directory: str | Path = ".",
     max_chars: int = 200_000,
     allowed_extensions: Optional[Set[str]] = None,
+    include_sensitive: bool = False,
 ) -> Dict[str, str]:
-    """Scan directory recursively and load readable source files up to max_chars limit."""
+    """Scan directory recursively and load readable source files up to max_chars.
+
+    Symlinked files that resolve outside the scanned root are skipped, and
+    credential-like filenames are excluded unless ``include_sensitive`` is
+    explicitly set.
+    """
     p = Path(directory).expanduser().resolve()
     if not p.is_dir():
         return {}
@@ -397,6 +425,14 @@ def scan_directory_sources(
                 rel_path = str(fpath.relative_to(p)).replace("\\", "/")
             except ValueError:
                 rel_path = str(fpath).replace("\\", "/")
+            if not include_sensitive and _is_sensitive_path(rel_path):
+                continue
+            if fpath.is_symlink():
+                try:
+                    if not fpath.resolve().is_relative_to(p):
+                        continue
+                except OSError:
+                    continue
 
             try:
                 # Skip giant binary or data files (> 200KB)
@@ -443,7 +479,7 @@ def tool_read_file(path: str, max_lines: int = 300) -> str:
             max_lines = 300
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             lines = [f.readline() for _ in range(max_lines)]
-        total_chars = sum(len(l) for l in lines)
+        total_chars = sum(len(line) for line in lines)
         header = f"--- {p} (showing first {len(lines)} lines, {total_chars} chars) ---\n"
         return header + "".join(lines)
     except Exception as e:

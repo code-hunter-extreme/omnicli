@@ -179,6 +179,60 @@ DEFAULT_PROVIDERS = {
             {"model": "monkeycode-basic/deepseek-flash", "family": "deepseek"},
         ],
     },
+    "freebuff": {
+        "name": "FreeBuff",
+        "base_url": "https://freebuff.com/api/v1",
+        "env_key": "FREEBUFF_API_KEY",
+        "default_model": "default",
+        "description": "FreeBuff AI Model Gateway",
+        "requires_auth_for_models": True,
+        "fallback_models": [],
+        "verification_panel": [],
+    },
+    "freeai": {
+        "name": "FreeAI",
+        "base_url": "https://api.free.ai/v1",
+        "env_key": "FREEAI_API_KEY",
+        "default_model": "default",
+        "description": "FreeAI Chat Gateway",
+        "requires_auth_for_models": True,
+        "fallback_models": [],
+        "verification_panel": [],
+    },
+    "deepinfra": {
+        "name": "DeepInfra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "env_key": "DEEPINFRA_API_KEY",
+        "default_model": "meta-llama/Meta-Llama-3.1-405B-Instruct",
+        "description": "DeepInfra high-performance inference (405B, 70B, 8B models)",
+        "requires_auth_for_models": True,
+        "fallback_models": [
+            "meta-llama/Meta-Llama-3.1-70B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        ],
+        "verification_panel": [
+            {"model": "meta-llama/Meta-Llama-3.1-405B-Instruct", "family": "meta"},
+            {"model": "meta-llama/Meta-Llama-3.1-70B-Instruct", "family": "meta"},
+        ],
+    },
+    "pollinations": {
+        "name": "Pollinations",
+        "base_url": "https://text.pollinations.ai/openai/v1",
+        "env_key": "POLLINATIONS_API_KEY",
+        "default_model": "gpt-4o-mini",
+        "description": "Pollinations.AI - Free/Open AI models (gpt-4o, gpt-4o-mini, llama-3.1-405b, flux, etc.)",
+        "requires_auth_for_models": False,
+        "fallback_models": [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "llama-3.1-405b",
+        ],
+        "verification_panel": [
+            {"model": "gpt-4o-mini", "family": "openai"},
+            {"model": "gpt-4o", "family": "openai"},
+        ],
+    },
 }
 
 # Per-provider memory (context injection + optional history). File entries are

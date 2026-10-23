@@ -76,7 +76,6 @@ class SlashCommandCompleter(Completer):
             ("/clear", "Clear chat history"),
             ("/forget", "Delete persisted history for the active provider"),
             ("/ping", "Test latency to all providers"),
-            ("/builder", "Collaborative build mode (all models reason together)"),
             ("/help", "Show available commands"),
             ("/exit", "Exit the chat session"),
         ]
@@ -139,6 +138,10 @@ class ChatSession:
         self.redteam = redteam
         self.rotate_families = rotate_families
         self.mode = "redteam" if redteam else mode.lower().strip()
+        if self.mode in ("builder", "build", "b"):
+            raise ValueError(
+                "Builder mode was removed. Use collaborate, redteam, or single."
+            )
         self.council_size = council_size
         if system_prompt:
             self.system_prompt = system_prompt
@@ -420,7 +423,12 @@ class ChatSession:
                 self.console.print(f"Current mode: [bold cyan]{self.mode}[/bold cyan] (options: collaborate, redteam, single)")
             else:
                 m = arg.lower()
-                if m in ("collaborate", "redteam", "single"):
+                if m in ("builder", "build", "b"):
+                    self.console.print(
+                        "[yellow]Builder mode was removed: it never built or "
+                        "tested anything. Use /collaborate or /redteam.[/yellow]"
+                    )
+                elif m in ("collaborate", "redteam", "single"):
                     self.mode = m
                     self.console.print(f"[bold green]Mode switched to:[/bold green] [bold cyan]{self.mode}[/bold cyan]")
                 else:
@@ -431,12 +439,10 @@ class ChatSession:
             self.console.print("[bold green]Mode switched to:[/bold green] [bold cyan]collaborate[/bold cyan] (all models reason together)")
 
         elif cmd in ("/builder", "/build", "/b"):
-            self.mode = "collaborate"
-            active_size = self.council_size or len(self.cfg.data.get("providers", {}))
             self.console.print(
-                f"[bold green]Switched to collaborative build mode across all {active_size} models.[/bold green]\n"
-                "[dim]All active models will reason and synthesize code solutions together. "
-                "(For autonomous editing and tool execution, run 'omni agent' in CLI).[/dim]"
+                "[yellow]Builder mode was removed: it never built or tested "
+                "anything. Use /collaborate for multi-model reasoning or "
+                "/redteam for adversarial review.[/yellow]"
             )
 
         elif cmd in ("/redteam", "/rt"):
