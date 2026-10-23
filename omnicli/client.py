@@ -149,6 +149,42 @@ class OmniClient:
             except httpx.RequestError as e:
                 raise ProviderError(provider_id, None, f"Connection error: {e}")
 
+        # Pollinations: use /models endpoint (not /v1/models which returns HTML)
+        # Returns: [{"name": "...", "description": "...", "reasoning": true, ...}]
+        if provider_id == "pollinations":
+            url = self.cfg.get_base_url(provider_id).rstrip("/") + "/models"
+            headers = self.get_headers(provider_id)
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    res = client.get(url, headers=headers)
+                    if res.status_code in (401, 403):
+                        raise ProviderError(
+                            provider_id, res.status_code,
+                            f"Authentication required for {provider_id}. "
+                            f"Set key via: omni config set-key {provider_id} <KEY>",
+                        )
+                    if res.status_code != 200:
+                        raise ProviderError(provider_id, res.status_code, res.text[:300])
+
+                    data = res.json()
+                    # Transform Pollinations format to OpenAI-compatible format
+                    if isinstance(data, list):
+                        return [
+                            {
+                                "id": m.get("name", ""),
+                                "object": "model",
+                                "owned_by": "pollinations",
+                                "description": m.get("description", ""),
+                                "reasoning": m.get("reasoning", False),
+                                "tier": m.get("tier", ""),
+                                "community": m.get("community", False),
+                            }
+                            for m in data
+                        ]
+                    return []
+            except httpx.RequestError as e:
+                raise ProviderError(provider_id, None, f"Network connection failed: {e}")
+
         url = self.get_endpoint_url(provider_id, "models")
         headers = self.get_headers(provider_id)
 
