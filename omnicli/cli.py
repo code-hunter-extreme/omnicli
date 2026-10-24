@@ -110,6 +110,11 @@ def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
               help="Max tokens to generate (default: 2048)")
 @click.option("--no-stream", is_flag=True, help="Disable streaming output")
 @click.option("--raw", is_flag=True, help="Output raw text without rich markdown formatting")
+@click.option("--ground/--no-ground", "ground", default=True,
+              help="Ground the prompt in relevance-ranked local files from "
+              "the current workspace (default on; skipped when --file or "
+              "piped input already supplies context). Attached files are "
+              "sent to the provider; use --no-ground to disable.")
 @click.argument("prompt_words", nargs=-1, required=False)
 def cmd_ask(
     provider: Optional[str],
@@ -120,6 +125,7 @@ def cmd_ask(
     max_tokens: int,
     no_stream: bool,
     raw: bool,
+    ground: bool,
     prompt_words: tuple,
 ) -> None:
     """Execute a prompt or query models directly."""
@@ -155,6 +161,22 @@ def cmd_ask(
         except Exception as e:
             console.print(f"[bold red]Failed to read attached file/directory:[/bold red] {e}")
             sys.exit(1)
+
+    if ground and prompt and not input_file and not piped_input:
+        from omnicli.grounding import build_grounding
+        grounding = build_grounding(prompt)
+        if grounding.get("block"):
+            attached_names = ", ".join(
+                item["path"] for item in grounding["attached"]
+            ) or "(workspace map only)"
+            # Disclosure on stderr so --raw stdout stays machine-clean.
+            click.echo(
+                f"[omnicli] grounded on {len(grounding['attached'])} local "
+                f"file(s) from {grounding['workspace']}: {attached_names} "
+                "(--no-ground to disable)",
+                err=True,
+            )
+            prompt = f"{prompt}\n\n{grounding['block']}"
 
     if not prompt:
         console.print("[yellow]No prompt provided. Launching interactive chat...[/yellow]")
@@ -276,9 +298,15 @@ def _resolve_mode_flags(
               help="Council size for multi-model orchestration (default: all active providers)")
 @click.option("--rotate-families", is_flag=True, default=False,
               help="Switch model family each turn from the scanned roster")
+@click.option("--ground/--no-ground", "ground", default=True,
+              help="Ground each turn in relevance-ranked local files from "
+              "the current workspace (default on; skipped when /file or "
+              "/folder attachments are pending; redteam keeps its explicit "
+              "source handling). Use --no-ground to disable.")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
              temperature: float, mode: Optional[str], flag_collaborate: bool,
-             redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool) -> None:
+             redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool,
+             ground: bool) -> None:
     """Start an interactive chat session with multi-model orchestration."""
     active_mode = _resolve_mode_flags(
         mode,
@@ -298,6 +326,7 @@ def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str
         rotate_families=rotate_families,
         mode=active_mode,
         council_size=size,
+        ground_local=ground,
     )
     session.run()
 
@@ -963,7 +992,12 @@ def cmd_workflow() -> None:
 @click.argument("workflow_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--max-workers", type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("--output", type=click.Path(dir_okay=False), help="Write the complete JSON result.")
-def cmd_workflow_run(workflow_file: str, max_workers: int, output: Optional[str]) -> None:
+@click.option("--ground/--no-ground", "ground", default=True,
+              help="Ground tasks in local workspace files (default on; "
+              "per-task \"ground\": false or \"files\": [...] in the workflow "
+              "JSON refines it; --no-ground disables for every task)")
+def cmd_workflow_run(workflow_file: str, max_workers: int, output: Optional[str],
+                     ground: bool) -> None:
     """Execute a JSON workflow DAG; independent tasks run concurrently."""
     import json
     from omnicli.workflow import run_workflow, validate_workflow
@@ -974,10 +1008,31 @@ def cmd_workflow_run(workflow_file: str, max_workers: int, output: Optional[str]
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
+    # One workspace index for the whole run; tasks rank it per prompt.
+    workspace_root = Path.cwd()
+    workspace_index = None
+    if ground and any(t.get("ground", True) or t.get("files") for t in tasks):
+        from omnicli.grounding import index_workspace
+        from omnicli.tools import resolve_workspace_root
+        workspace_root = resolve_workspace_root()
+        workspace_index = index_workspace(workspace_root)
+
     def execute(task: dict, dependency_outputs: dict) -> str:
         provider_id = (task.get("provider") or cfg.get_default_provider()).lower()
         model_id = task.get("model") or cfg.get_default_model(provider_id)
         prompt_parts = [task["prompt"]]
+        if ground and workspace_index is not None and (
+            task.get("files") or task.get("ground", True)
+        ):
+            from omnicli.grounding import build_grounding
+            grounding = build_grounding(
+                task["prompt"],
+                root=workspace_root,
+                index=workspace_index,
+                explicit_files=task.get("files") or None,
+            )
+            if grounding.get("block"):
+                prompt_parts.append(grounding["block"])
         if dependency_outputs:
             prompt_parts.append("### Completed dependency outputs\n")
             for dependency, result in dependency_outputs.items():
@@ -1040,11 +1095,21 @@ def cmd_workflow_run(workflow_file: str, max_workers: int, output: Optional[str]
               help="Authorize an HTTP target host for agent verification; repeat for each host")
 @click.option("--allow-mutating-http", is_flag=True, default=False,
               help="Allow state-changing verify_http methods on explicitly allowed hosts")
+@click.option("--ground/--no-ground", "ground", default=True,
+              help="Pre-ground the goal in relevance-ranked local files from "
+              "the current workspace before the first model call (default "
+              "on; attached files are sent to providers). Use --no-ground "
+              "to disable.")
+@click.option("--workspace", "workspace_root",
+              type=click.Path(exists=True, file_okay=False),
+              help="Local project workspace root (default: nearest Git/project "
+              "root at or above the current directory).")
 @click.argument("goal", nargs=-1, required=True)
 def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               redteam: bool, rotate_families: bool, allow_shell: bool,
               allow_local: bool, allowed_hosts: tuple,
-              allow_mutating_http: bool, goal: tuple) -> None:
+              allow_mutating_http: bool, ground: bool,
+              workspace_root: Optional[str], goal: tuple) -> None:
     """Run an autonomous agent equipped with local tools and cross-provider delegation."""
     from omnicli.agent import AgentRunner
     task_goal = " ".join(goal).strip()
@@ -1059,6 +1124,8 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
         allow_local=allow_local,
         allowed_hosts=list(allowed_hosts),
         allow_mutating_http=allow_mutating_http,
+        ground_local=ground,
+        workspace_root=workspace_root,
     )
     runner.run(task_goal)
 
@@ -1077,8 +1144,9 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               help="Attach local files referenced by path-like words in the prompt "
               "(contents are sent to providers; never on by default; ignored for redteam)")
 @click.option("--member-tools", is_flag=True, default=False,
-              help="Give each collaborate member the verify toolset: bounded agent "
-              "tool-loop per member, members still in parallel (collaborate only)")
+              help="Give each collaborate member the bounded verification and "
+              "read-only local-inspection toolset (find/search/read): bounded "
+              "agent tool-loop per member, still in parallel (collaborate only)")
 @click.option("--allowed-hosts", multiple=True,
               help="Hosts tooled members may probe with verify_http (repeatable; "
               "required before any member HTTP probe)")
@@ -1095,6 +1163,15 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
               help="Redteam only: explicitly opt in to scanning the current "
               "working directory for source files when no --source-file/--dir "
               "is given (contents are sent to providers; never on by default)")
+@click.option("--ground/--no-ground", "ground", default=True,
+              help="Ground the task in relevance-ranked local files from the "
+              "current workspace (default on for collaborate/deliberate; "
+              "attached files are disclosed before dispatch and sent to "
+              "providers; skipped when --source-file/--dir are given; "
+              "never applied to redteam). Use --no-ground to disable.")
+@click.option("--ground-max-chars", type=click.IntRange(min=1000), default=60000,
+              show_default=True,
+              help="Character budget for attached local grounding sources")
 @click.option("--report-path", type=click.Path(), default=None,
               help="Red-team report destination: file path or directory "
                    "(default: ./reports; redteam only)")
@@ -1103,7 +1180,8 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
               redteam: bool, raw: bool, enrich_files: bool, member_tools: bool,
               allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
-              source_dir: Optional[str], scan_cwd: bool,
+              source_dir: Optional[str], scan_cwd: bool, ground: bool,
+              ground_max_chars: int,
               report_path: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
@@ -1203,6 +1281,37 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
                     border_style="yellow",
                 ))
 
+    # Local grounding (collaborate/deliberate): members work on the
+    # operator's actual files, ranked by prompt relevance, instead of
+    # answering from general knowledge. Explicit choices always win over
+    # the default: --source-file/--dir and the opt-in --enrich-files.
+    prebuilt_grounding = None
+    if active_mode != "redteam" and ground and not explicit_sources and not enrich_files:
+        from omnicli.grounding import build_grounding
+        prebuilt_grounding = build_grounding(
+            task, max_chars=ground_max_chars
+        )
+        if prebuilt_grounding.get("block"):
+            attached_lines = "\n".join(
+                f"- {escape(item['path'])} ({item['chars']:,} chars"
+                f"{', excerpt' if item['excerpt'] else ''}; {escape(item['reason'])})"
+                for item in prebuilt_grounding["attached"]
+            ) or "- (workspace map only; no file matched the task terms)"
+            console.print(Panel(
+                "Local Grounding: these workspace files were read locally "
+                "and will be sent to the configured model providers "
+                "(--no-ground to disable):\n"
+                f"{attached_lines}",
+                title="Local Grounding Disclosure",
+                border_style="yellow",
+            ))
+        else:
+            console.print(
+                "[dim]Local grounding: no readable source files found in "
+                "the current workspace.[/dim]"
+            )
+            prebuilt_grounding = None
+
     swarm = orch.build_swarm(cfg, size=size, provider=provider)
     if not swarm:
         console.print("[red]No models available for a swarm. Run 'omni scan' first.[/red]")
@@ -1244,7 +1353,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
             title="Source Files Disclosure",
             border_style="yellow",
         ))
-    if enrich_files and active_mode != "redteam":
+    if enrich_files and active_mode != "redteam" and not prebuilt_grounding:
         enrich_paths = orch.enrichment_candidate_paths(task)
         console.print(Panel(
             "Local files matched by path-like words in the prompt will be "
@@ -1282,6 +1391,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
                 provider=provider, swarm=swarm, source_files=source_files,
                 enrich_files=enrich_files, report_path=report_destination,
                 member_tools=member_tool_defs, tool_kwargs=member_tool_kwargs,
+                grounding=prebuilt_grounding,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc

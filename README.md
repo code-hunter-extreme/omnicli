@@ -133,6 +133,22 @@ omni swarm -p openrouter "..."                            # restrict to one prov
 
 Conflicting mode flags are rejected instead of silently choosing one.
 
+**Local grounding (default on).** User-facing commands work on your local
+files instead of answering from general knowledge: before any model call,
+`omni swarm` (collaborate/deliberate), `omni ask`, `omni agent`, `omni chat`,
+and `omni workflow run` deterministically index the current workspace, rank
+files by prompt relevance (named paths first, then identifier/path/content
+matches), and attach the winners with authoritative line numbers plus a
+workspace map. Members are instructed to answer from those sources and cite
+`path:line`. Attached files are always disclosed before dispatch (they are
+sent to the configured providers); credential-like filenames are excluded.
+Disable per run with `--no-ground`. Explicit context always wins
+(`--source-file`/`--dir`/`-f`/`--enrich-files`, chat `/file`/`/folder`,
+workflow task `"files": [...]`; per-task `"ground": false` opts one task out). Red-team
+never auto-grounds — it still requires explicit sources — and the library
+API (`run_orchestration`) stays bare unless `ground_local=`/`grounding=` is
+passed, so programmatic callers never get cwd contents implicitly.
+
 Members are chosen to maximize distinct model families across providers
 (e.g. google + meta + openai) and are queried concurrently. If the requested
 size exceeds the available family-diverse roster, additional members reuse a

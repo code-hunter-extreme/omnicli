@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Set
 
 _TASK_FIELDS = {
     "id", "prompt", "depends_on", "writes", "provider", "model", "max_tokens",
+    "ground", "files",
 }
 _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -60,11 +61,23 @@ def validate_workflow(workflow: Any) -> List[Dict[str, Any]]:
             value = task.get(field)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"Workflow task {task_id} has an invalid {field}.")
+        ground = task.get("ground", True)
+        if not isinstance(ground, bool):
+            raise ValueError(f"Workflow task {task_id} ground must be a boolean.")
+        files = task.get("files", [])
+        if (
+            not isinstance(files, list)
+            or any(not isinstance(item, str) or not item.strip() for item in files)
+            or len(set(files)) != len(files)
+        ):
+            raise ValueError(f"Workflow task {task_id} has invalid files.")
         by_id[task_id] = {
             **task,
             "depends_on": depends_on,
             "writes": writes,
             "max_tokens": max_tokens,
+            "ground": ground,
+            "files": files,
         }
 
     for task_id, task in by_id.items():

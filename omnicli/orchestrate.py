@@ -15,6 +15,13 @@ bounded agent tool-loop (same transport + tool dispatch as the sequential
 agent) while members run in parallel — fan-out WITH tool verification.
 Red-team and deliberate stages stay tool-less by design (structured prompts
 with deterministic grounding instead); only collaborate wires member tools.
+
+Local grounding: run_orchestration(..., ground_local=True) or a prebuilt
+``grounding=`` dict attaches relevance-ranked local workspace files (see
+omnicli.grounding) to collaborate/deliberate prompts so members answer
+from the operator's files with path:line citations. The library default
+stays off — user-facing CLIs enable and disclose it; red-team never
+auto-grounds and explicit source_files always win.
 """
 
 from __future__ import annotations
@@ -2581,6 +2588,9 @@ def run_orchestration(
     system: Optional[str] = None,
     minimum_families: int = 1,
     timeout: Optional[float] = None,
+    ground_local: Any = False,
+    grounding: Optional[Dict[str, Any]] = None,
+    ground_max_chars: int = 60_000,
 ) -> Dict[str, Any]:
     """Unified dispatcher for collaborate, red-team, and deliberate modes.
 
@@ -2606,6 +2616,16 @@ def run_orchestration(
     via a daemon worker thread; overruns raise a TimeoutError so the
     lane health/circuit breaker can engage. A timeout of 0.0 or negative
     refuses to dispatch entirely.
+
+    ground_local / grounding (collaborate + deliberate only): attach
+    relevance-ranked local files (see omnicli.grounding) so members work
+    on the operator's files instead of answering from general knowledge.
+    ``ground_local=True`` grounds in the cwd, a path grounds there; or
+    pass a prebuilt ``grounding`` dict from build_grounding() (callers
+    that must disclose attachments before dispatch). The LIBRARY default
+    stays off: programmatic callers never get cwd contents implicitly.
+    Explicit ``source_files`` win (auto-grounding is skipped). Red-team
+    ignores both — it only ever takes explicit sources.
     """
     if timeout is not None:
         if timeout <= 0.0:
@@ -2661,14 +2681,44 @@ def run_orchestration(
             UserWarning,
             stacklevel=2,
         )
-    # File enrichment is explicit opt-in only: it sends local file contents
-    # to model providers, so it never runs by default (and never for
-    # redteam, which takes explicit source_files instead).
-    base_prompt = (
-        prompt
-        if (is_redteam or not enrich_files)
-        else enrich_prompt_with_files(prompt)
-    )
+    # Local grounding: relevance-ranked workspace files appended to the
+    # prompt, superseding path-word enrichment (it does the same job
+    # better: ranked, line-numbered, with a workspace map). Never for
+    # redteam (explicit sources only) and never when the caller already
+    # chose source_files explicitly.
+    active_grounding: Optional[Dict[str, Any]] = None
+    if is_redteam:
+        if ground_local or grounding is not None:
+            warnings.warn(
+                "ground_local/grounding are ignored in red-team mode; "
+                "red-team review takes explicit source_files instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+    elif not source_files:
+        if grounding is not None:
+            active_grounding = grounding
+        elif ground_local:
+            from omnicli.grounding import build_grounding as _build_grounding
+            ground_root = (
+                ground_local
+                if isinstance(ground_local, (str, Path))
+                else None
+            )
+            active_grounding = _build_grounding(
+                prompt, root=ground_root, max_chars=ground_max_chars
+            )
+    grounding_block = (active_grounding or {}).get("block") or ""
+    if grounding_block:
+        base_prompt = f"{prompt}\n\n{grounding_block}"
+    elif is_redteam or not enrich_files:
+        # File enrichment stays explicit opt-in (--enrich-files): it sends
+        # local file contents to providers, so it never runs by default.
+        base_prompt = prompt
+    else:
+        base_prompt = enrich_prompt_with_files(prompt)
+    from omnicli.grounding import public_grounding as _public_grounding
+    public_ground = _public_grounding(active_grounding) if grounding_block else None
     normalized_sources = {
         path.replace("\\", "/"): content
         for path, content in (source_files or {}).items()
@@ -2712,11 +2762,13 @@ def run_orchestration(
             else build_swarm(cfg, size=size, provider=provider)
         )
         def _deliberate_orchestration() -> Dict[str, Any]:
-            return swarm_deliberate(
+            result = swarm_deliberate(
                 cfg, client, run_prompt, size=size, max_tokens=max_tokens,
                 judge=judge, swarm=selected_swarm,
                 source_files=sources_for_validation, synth=synth,
             )
+            result["grounding"] = public_ground
+            return result
         if timeout is not None:
             return _run_with_deadline("orchestration", timeout, _deliberate_orchestration)
         return _deliberate_orchestration()
@@ -2754,6 +2806,10 @@ def run_orchestration(
                     "member_tools": _tool_names,
                     "tool_kwargs": tool_kwargs,
                     "max_tool_turns": max_tool_turns,
+                    "grounded_files": [
+                        item["path"]
+                        for item in (public_ground or {}).get("attached", [])
+                    ],
                 },
             )
 
@@ -2783,6 +2839,7 @@ def run_orchestration(
                     "final_evidence_validation": None,
                     "run_id": checkpoint.run_id,
                     "events": checkpoint.events(),
+                    "grounding": public_ground,
                 }
                 return result
 
@@ -2813,6 +2870,7 @@ def run_orchestration(
                     minimum_families=minimum_families,
                 )
 
+            res["grounding"] = public_ground
             if checkpoint:
                 checkpoint.record_event(
                     "synthesis_completed" if synth else "synthesis_skipped", {}

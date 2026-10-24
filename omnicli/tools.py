@@ -9,13 +9,14 @@ Provides standard OpenAI function schemas and local execution for:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 from omnicli.deterministic import (
@@ -34,6 +35,126 @@ def registry_db_path() -> Path:
         Path.home() / "program_registry.db",
     )
     return next((path for path in candidates if path.exists()), candidates[0])
+
+
+_VCS_MARKERS = (".git", ".hg", ".svn")
+_PROJECT_MARKERS = (
+    "pyproject.toml", "setup.py", "setup.cfg", "package.json",
+    "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "composer.json", "Gemfile",
+    "mix.exs", "rebar.config", "dune-project", "CMakeLists.txt",
+    "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel",
+)
+_WORKSPACE_IGNORED_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", "venv", ".venv", "env",
+    "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "dist", "build", ".egg-info", ".idea", ".vscode", ".tox", ".nox",
+    ".cache", "target", "vendor",
+}
+_BINARY_SUFFIXES = {
+    ".7z", ".a", ".avi", ".bin", ".bmp", ".bz2", ".class", ".db", ".dll",
+    ".dylib", ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg",
+    ".mkv", ".mov", ".mp3", ".mp4", ".o", ".pdf", ".png", ".pyc", ".pyo",
+    ".rar", ".so", ".sqlite", ".sqlite3", ".tar", ".tgz", ".wasm", ".webp",
+    ".xz", ".zip",
+}
+_TEXT_FILENAMES = {
+    "BUILD", "CMakeLists.txt", "Dockerfile", "Gemfile", "Jenkinsfile",
+    "Makefile", "MODULE.bazel", "Rakefile", "Vagrantfile", "WORKSPACE",
+    "WORKSPACE.bazel",
+}
+
+
+def resolve_workspace_root(start: Optional[str | Path] = None) -> Path:
+    """Resolve the active local workspace/project root.
+
+    Resolution order: ``OMNICLI_WORKSPACE`` when it names a directory, the
+    nearest ancestor containing a VCS marker, the nearest ancestor with a
+    common project marker, then the starting directory itself. This mirrors
+    a local coding CLI launched from a repository subdirectory. A marker in
+    the user's home directory is not treated as a parent project root unless
+    the process was started there.
+    """
+    configured = os.environ.get("OMNICLI_WORKSPACE", "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        try:
+            configured_path = configured_path.resolve()
+        except OSError:
+            configured_path = configured_path.absolute()
+        if configured_path.is_dir():
+            return configured_path
+        if configured_path.is_file():
+            return configured_path.parent
+
+    try:
+        start_path = Path(start).expanduser() if start else Path.cwd()
+    except Exception:
+        start_path = Path.cwd()
+    if not start_path.is_absolute():
+        start_path = Path.cwd() / start_path
+    try:
+        start_path = start_path.resolve()
+    except OSError:
+        start_path = start_path.absolute()
+    if start_path.is_file() or (not start_path.exists() and start_path.suffix):
+        start_path = start_path.parent
+
+    try:
+        home = Path.home().resolve()
+    except Exception:
+        home = None
+
+    ancestors = [start_path, *start_path.parents]
+    for markers in (_VCS_MARKERS, _PROJECT_MARKERS):
+        for candidate in ancestors:
+            if home is not None and candidate == home and candidate != start_path:
+                break
+            if any((candidate / marker).exists() for marker in markers):
+                return candidate
+    return start_path
+
+
+def resolve_workspace_path(
+    path: str | Path,
+    workspace_root: Optional[str | Path] = None,
+) -> Path:
+    """Resolve an operator/model path against CWD or the workspace root.
+
+    Existing paths keep shell-like CWD semantics. If a relative path does not
+    exist below CWD but exists below the discovered project root (the common
+    case when OmniCLI is launched from a subdirectory and the model uses a
+    repository-relative path), the repository path wins.
+    """
+    root = (
+        Path(workspace_root).expanduser().resolve()
+        if workspace_root else resolve_workspace_root()
+    )
+    raw = Path(path).expanduser() if str(path) else Path(".")
+    if raw.is_absolute():
+        return raw.resolve()
+
+    cwd = Path.cwd().resolve()
+    if str(raw) in ("", "."):
+        return cwd
+    cwd_candidate = (cwd / raw).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    root_candidate = (root / raw).resolve()
+    if root_candidate.exists():
+        return root_candidate
+    if raw.parts:
+        first = raw.parts[0]
+        if (root / first).is_dir() and not (cwd / first).exists():
+            return root_candidate
+    return root_candidate
+
+
+def _coerce_workspace_root(workspace_root: Optional[str | Path] = None) -> Path:
+    """Use an explicit workspace root as-is; otherwise discover it."""
+    if workspace_root:
+        return Path(workspace_root).expanduser().resolve()
+    return resolve_workspace_root()
 
 
 def tool_verify_http(
@@ -130,15 +251,18 @@ def tool_verify_code(
     must_not_contain: Optional[List[str]] = None,
     target_function: Optional[str] = None,
     check_type: Optional[str] = None,
+    workspace_root: Optional[str | Path] = None,
 ) -> str:
     """Execute deterministic code pattern verification and return verdict."""
+    root = _coerce_workspace_root(workspace_root)
+    resolved = resolve_workspace_path(path, workspace_root=root)
     res = CodeVerifier.verify_file(
-        file_path=path,
+        file_path=str(resolved),
         must_contain=_coerce_patterns(must_contain),
         must_not_contain=_coerce_patterns(must_not_contain),
         target_function=target_function,
         check_type=check_type,
-        allowed_dirs=[Path.cwd()],
+        allowed_dirs=[root],
     )
     res["verification_type"] = "literal_source_pattern"
     res["security_vulnerability_confirmed"] = False
@@ -152,11 +276,14 @@ def tool_verify_code(
 def tool_analyze_python_security(
     path: str,
     target_function: Optional[str] = None,
+    workspace_root: Optional[str | Path] = None,
 ) -> str:
     """Analyze Python source for direct input-to-SQL interpolation candidates."""
+    root = _coerce_workspace_root(workspace_root)
+    resolved = resolve_workspace_path(path, workspace_root=root)
     res = PythonSecurityAnalyzer.analyze_file(
-        file_path=path,
-        allowed_dirs=[Path.cwd()],
+        file_path=str(resolved),
+        allowed_dirs=[root],
         target_function=target_function,
     )
     res["verification_type"] = "python_ast_security_pattern"
@@ -221,7 +348,12 @@ def _bash_denied(command: str) -> Optional[str]:
     return None
 
 
-def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str:
+def tool_bash(
+    command: str,
+    timeout: int = 30,
+    allow_shell: bool = False,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
     """Execute a bash command in the local environment.
 
     Shell execution is OFF by default: the agent must be started with
@@ -251,9 +383,9 @@ def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str
             capture_output=True,
             text=True,
             timeout=timeout,
-            # Workspace (cwd), never the home directory: file tools are
-            # jailed to the workspace, and the shell starts there too.
-            cwd=str(Path.cwd()),
+            # The shell starts in the project workspace, not at an
+            # arbitrary process directory or the home directory.
+            cwd=str(_coerce_workspace_root(workspace_root)),
         )
         out = res.stdout
         err = res.stderr
@@ -271,10 +403,13 @@ def tool_bash(command: str, timeout: int = 30, allow_shell: bool = False) -> str
         return f"Error executing bash: {e}"
 
 
-def check_workspace_jail(path: str | Path, workspace_root: Optional[Path] = None) -> Path:
+def check_workspace_jail(
+    path: str | Path,
+    workspace_root: Optional[str | Path] = None,
+) -> Path:
     """Resolve a path and require it to remain inside the active workspace."""
-    p = Path(path).expanduser().resolve()
-    root = Path(workspace_root or Path.cwd()).expanduser().resolve()
+    root = _coerce_workspace_root(workspace_root)
+    p = resolve_workspace_path(path, workspace_root=root)
     try:
         p.relative_to(root)
     except ValueError:
@@ -296,10 +431,14 @@ def format_tool_error(code: str, message: str, remedy: str = "") -> str:
     return f"Error: {message}\n" + json.dumps(err, indent=2)
 
 
-def tool_list_directory(path: str = ".", max_depth: int = 2) -> str:
+def tool_list_directory(
+    path: str = ".",
+    max_depth: int = 2,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
     """List directory contents (files and folders) within the project workspace."""
     try:
-        p = check_workspace_jail(path)
+        p = check_workspace_jail(path, workspace_root=workspace_root)
     except PermissionError as pe:
         return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
 
@@ -383,6 +522,139 @@ def _is_sensitive_path(relative_path: str) -> bool:
     return bool(_SENSITIVE_FILE_RE.search(relative_path.replace("\\", "/")))
 
 
+def _fallback_gitignore_match(relative_path: str, patterns: List[str]) -> bool:
+    """Best-effort root .gitignore matching for non-git executable fallback."""
+    ignored = False
+    rel = relative_path.replace("\\", "/")
+    parts = rel.split("/")
+    for raw in patterns:
+        pattern = raw.strip()
+        if not pattern or pattern.startswith("#"):
+            continue
+        negated = pattern.startswith("!")
+        if negated:
+            pattern = pattern[1:]
+        directory_only = pattern.endswith("/")
+        pattern = pattern.strip("/")
+        if not pattern:
+            continue
+        if "/" in pattern:
+            matched = fnmatch.fnmatch(rel, pattern) or rel.startswith(pattern + "/")
+        else:
+            matched = any(fnmatch.fnmatch(part, pattern) for part in parts)
+        if matched and (not directory_only or len(parts) > 1):
+            ignored = not negated
+    return ignored
+
+
+def _iter_workspace_files(
+    root: str | Path,
+    *,
+    include_sensitive: bool = False,
+) -> List[Path]:
+    """List workspace files in deterministic order, honoring Git ignores."""
+    base = Path(root).expanduser().resolve()
+    if not base.is_dir():
+        return []
+
+    rel_paths: Optional[List[str]] = None
+    if (base / ".git").exists():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(base), "ls-files", "--cached",
+                 "--others", "--exclude-standard", "-z"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                rel_paths = [
+                    item for item in os.fsdecode(result.stdout).split("\0") if item
+                ]
+        except Exception:
+            rel_paths = None
+
+    files: List[Path] = []
+    if rel_paths is not None:
+        for rel in rel_paths:
+            rel_posix = rel.replace("\\", "/")
+            if not include_sensitive and _is_sensitive_path(rel_posix):
+                continue
+            candidate = (base / rel).resolve()
+            try:
+                candidate.relative_to(base)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                files.append(candidate)
+        return files
+
+    gitignore = base / ".gitignore"
+    try:
+        ignore_patterns = gitignore.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines() if gitignore.is_file() else []
+    except OSError:
+        ignore_patterns = []
+    for current_root, dirs, names in os.walk(base):
+        current = Path(current_root)
+        kept_dirs = []
+        for dirname in sorted(dirs):
+            if dirname in _WORKSPACE_IGNORED_DIRS:
+                continue
+            if dirname.startswith(".") and dirname != ".github":
+                continue
+            rel_dir = str((current / dirname).relative_to(base)).replace("\\", "/")
+            if _fallback_gitignore_match(rel_dir + "/", ignore_patterns):
+                continue
+            kept_dirs.append(dirname)
+        dirs[:] = kept_dirs
+        for name in sorted(names):
+            candidate = current / name
+            rel = str(candidate.relative_to(base)).replace("\\", "/")
+            if _fallback_gitignore_match(rel, ignore_patterns):
+                continue
+            if not include_sensitive and _is_sensitive_path(rel):
+                continue
+            if candidate.is_symlink():
+                try:
+                    if not candidate.resolve().is_relative_to(base):
+                        continue
+                except OSError:
+                    continue
+            if candidate.is_file():
+                files.append(candidate)
+    return files
+
+
+def _read_text_file(path: Path, max_bytes: int = 2_000_000) -> Optional[str]:
+    """Read a likely-text file with a bounded size; None for binary/large."""
+    if path.suffix.lower() in _BINARY_SUFFIXES:
+        return None
+    try:
+        if path.stat().st_size > max_bytes:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _matches_glob(relative_path: str, pattern: str) -> bool:
+    rel = relative_path.replace("\\", "/")
+    pat = pattern.replace("\\", "/")
+    try:
+        if Path(rel).match(pat):
+            return True
+    except ValueError:
+        pass
+    return fnmatch.fnmatch(rel, pat) or (
+        "/" not in pat and fnmatch.fnmatch(Path(rel).name, pat)
+    )
+
+
 def scan_directory_sources(
     directory: str | Path = ".",
     max_chars: int = 200_000,
@@ -459,29 +731,66 @@ def scan_directory_sources(
     return results
 
 
-def tool_read_file(path: str, max_lines: int = 300) -> str:
-    """Read the contents of a local file or directory with path jail verification."""
+def tool_read_file(
+    path: str,
+    max_lines: int = 300,
+    start_line: int = 1,
+    end_line: Optional[int] = None,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
+    """Read a numbered line range from a local file inside the workspace."""
     try:
-        p = check_workspace_jail(path)
+        p = check_workspace_jail(path, workspace_root=workspace_root)
     except PermissionError as pe:
         return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
 
     if not p.exists():
         return format_tool_error("E_NOT_FOUND", f"File '{path}' does not exist.", "Check file path spelling and location.")
     if p.is_dir():
-        return tool_list_directory(path)
+        return tool_list_directory(str(p), workspace_root=workspace_root)
     if not p.is_file():
         return format_tool_error("E_NOT_FILE", f"'{path}' is not a regular file.", "Specify a file path or directory.")
-    try:
+
+    def _coerce(value: Any, default: int) -> int:
         try:
-            max_lines = int(max_lines) if max_lines not in (None, "None", "") else 300
+            return int(value) if value not in (None, "None", "") else default
         except (ValueError, TypeError):
-            max_lines = 300
+            return default
+
+    start = max(1, _coerce(start_line, 1))
+    line_budget = max(1, min(_coerce(max_lines, 300), 2000))
+    end = _coerce(end_line, 0) if end_line is not None else None
+    if end is not None:
+        if end < start:
+            return format_tool_error(
+                "E_INVALID", "end_line must be greater than or equal to start_line."
+            )
+        line_budget = min(line_budget, end - start + 1)
+
+    try:
+        selected: List[Tuple[int, str]] = []
+        total_lines = 0
         with open(p, "r", encoding="utf-8", errors="replace") as f:
-            lines = [f.readline() for _ in range(max_lines)]
-        total_chars = sum(len(line) for line in lines)
-        header = f"--- {p} (showing first {len(lines)} lines, {total_chars} chars) ---\n"
-        return header + "".join(lines)
+            for number, raw_line in enumerate(f, start=1):
+                total_lines = number
+                if number < start or len(selected) >= line_budget:
+                    continue
+                if end is not None and number > end:
+                    continue
+                selected.append((number, raw_line.rstrip("\r\n")))
+        total_chars = sum(len(line) for _number, line in selected)
+        if selected:
+            shown_start, shown_end = selected[0][0], selected[-1][0]
+            header = (
+                f"--- {p} (lines {shown_start}-{shown_end} of "
+                f"{total_lines}, {total_chars} chars) ---\n"
+            )
+            body = "\n".join(
+                f"{number:05d} | {line}" for number, line in selected
+            )
+            return header + body + ("\n" if body else "")
+        header = f"--- {p} (lines {start}-{total_lines} of {total_lines}) ---\n"
+        return header + "(start_line is beyond the end of the file)\n"
     except Exception as e:
         return format_tool_error("E_IO", f"Error reading file: {e}")
 
@@ -520,10 +829,14 @@ def detect_truncated_rewrite(old_content: str, new_content: str) -> Optional[Dic
     }
 
 
-def tool_write_file(path: str, content: str) -> str:
+def tool_write_file(
+    path: str,
+    content: str,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
     """Write or overwrite a local file with truncation and jail protection."""
     try:
-        p = check_workspace_jail(path)
+        p = check_workspace_jail(path, workspace_root=workspace_root)
     except PermissionError as pe:
         return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
 
@@ -546,6 +859,221 @@ def tool_write_file(path: str, content: str) -> str:
         return f"Successfully wrote {len(content)} characters to {p}"
     except Exception as e:
         return format_tool_error("E_IO", f"Error writing file: {e}")
+
+
+def _coerce_bounded_int(value: Any, default: int, maximum: int) -> int:
+    try:
+        number = int(value) if value not in (None, "None", "") else default
+    except (ValueError, TypeError):
+        number = default
+    return max(1, min(number, maximum))
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def tool_find_files(
+    pattern: str = "**/*",
+    path: str = ".",
+    max_results: int = 200,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
+    """Find workspace files by glob and return workspace-relative paths."""
+    root = _coerce_workspace_root(workspace_root)
+    try:
+        # For discovery tools, the default scope is the whole project
+        # workspace rather than only the process's launch subdirectory.
+        base = root if str(path or ".") in ("", ".") else check_workspace_jail(
+            path, workspace_root=root
+        )
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+    if not base.exists():
+        return format_tool_error("E_NOT_FOUND", f"Path '{path}' does not exist.")
+    pattern = str(pattern or "**/*")
+    limit = _coerce_bounded_int(max_results, 200, 1000)
+    candidates = [base] if base.is_file() else _iter_workspace_files(root)
+    matches: List[str] = []
+    for candidate in candidates:
+        try:
+            rel_root = str(candidate.relative_to(root)).replace("\\", "/")
+            rel_base = (
+                candidate.name if base.is_file()
+                else str(candidate.relative_to(base)).replace("\\", "/")
+            )
+        except ValueError:
+            continue
+        if _matches_glob(rel_root, pattern) or _matches_glob(rel_base, pattern):
+            matches.append(rel_root)
+    header = f"--- Files matching {pattern!r}: {len(matches)} in {root} ---\n"
+    if not matches:
+        return header + "No files matched."
+    body = "\n".join(matches[:limit])
+    if len(matches) > limit:
+        body += f"\n... [truncated at {limit} of {len(matches)} files]"
+    return header + body
+
+
+def tool_search_code(
+    query: str,
+    path: str = ".",
+    file_glob: Optional[str] = None,
+    regex: bool = False,
+    case_sensitive: bool = False,
+    max_results: int = 50,
+    context_lines: int = 0,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
+    """Search local text files for a literal or regex pattern."""
+    query = "" if query is None else str(query)
+    if not query:
+        return format_tool_error("E_INVALID", "search_code requires a non-empty query.")
+    root = _coerce_workspace_root(workspace_root)
+    try:
+        base = root if str(path or ".") in ("", ".") else check_workspace_jail(
+            path, workspace_root=root
+        )
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+    if not base.exists():
+        return format_tool_error("E_NOT_FOUND", f"Path '{path}' does not exist.")
+
+    use_regex = _coerce_bool(regex)
+    sensitive = _coerce_bool(case_sensitive)
+    compiled = None
+    if use_regex:
+        try:
+            compiled = re.compile(query, 0 if sensitive else re.IGNORECASE)
+        except re.error as exc:
+            return format_tool_error("E_INVALID", f"Invalid regex: {exc}")
+    needle = query if sensitive else query.casefold()
+    limit = _coerce_bounded_int(max_results, 50, 500)
+    try:
+        context = int(context_lines) if context_lines not in (None, "None", "") else 0
+    except (ValueError, TypeError):
+        context = 0
+    context = max(0, min(context, 10))
+
+    if base.is_file():
+        rel_base = str(base.relative_to(root)).replace("\\", "/")
+        if _is_sensitive_path(rel_base):
+            return format_tool_error(
+                "E_PERMISSION", "Credential-like files are excluded from code search."
+            )
+        candidates = [base]
+    else:
+        candidates = []
+        for candidate in _iter_workspace_files(root):
+            try:
+                candidate.relative_to(base)
+            except ValueError:
+                continue
+            candidates.append(candidate)
+
+    rendered: List[str] = []
+    files_scanned = 0
+    match_count = 0
+    truncated = False
+    for candidate in candidates:
+        rel = str(candidate.relative_to(root)).replace("\\", "/")
+        if file_glob and not _matches_glob(rel, str(file_glob)):
+            continue
+        content = _read_text_file(candidate)
+        if content is None:
+            continue
+        files_scanned += 1
+        lines = content.splitlines()
+        shown: Set[int] = set()
+        for index, line in enumerate(lines, start=1):
+            matched = bool(compiled.search(line)) if compiled else (
+                needle in (line if sensitive else line.casefold())
+            )
+            if not matched:
+                continue
+            match_count += 1
+            if match_count > limit:
+                truncated = True
+                continue
+            start = max(1, index - context)
+            end = min(len(lines), index + context)
+            for number in range(start, end + 1):
+                if number in shown:
+                    continue
+                shown.add(number)
+                separator = ":" if number == index else "-"
+                text = lines[number - 1][:300]
+                rendered.append(f"{rel}:{number}{separator}{text}")
+
+    header = (
+        f"--- Code search: {match_count} matching line(s); "
+        f"{files_scanned} text file(s) scanned in {root} ---\n"
+    )
+    if match_count == 0:
+        return header + "No matches found."
+    body = "\n".join(rendered)
+    if truncated:
+        body += f"\n... [truncated at {limit} matching lines]"
+    return header + body
+
+
+def tool_edit_file(
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+    workspace_root: Optional[str | Path] = None,
+) -> str:
+    """Replace exact text in a workspace file; unique match by default."""
+    try:
+        p = check_workspace_jail(path, workspace_root=workspace_root)
+    except PermissionError as pe:
+        return format_tool_error("E_PERMISSION", str(pe), "Choose a path inside the project workspace.")
+    if not p.exists():
+        return format_tool_error("E_NOT_FOUND", f"File '{path}' does not exist.")
+    if not p.is_file():
+        return format_tool_error("E_NOT_FILE", f"'{path}' is not a regular file.")
+    old_text = "" if old_text is None else str(old_text)
+    new_text = "" if new_text is None else str(new_text)
+    if not old_text:
+        return format_tool_error("E_INVALID", "edit_file requires non-empty old_text.")
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return format_tool_error("E_IO", f"Error reading file: {e}")
+    occurrences = content.count(old_text)
+    if occurrences == 0:
+        return format_tool_error(
+            "E_NOT_FOUND", f"old_text was not found in '{path}'; no changes made."
+        )
+    if occurrences > 1 and not _coerce_bool(replace_all):
+        return format_tool_error(
+            "E_AMBIGUOUS",
+            f"old_text occurs {occurrences} times in '{path}'; "
+            "provide a larger exact snippet or set replace_all=true.",
+        )
+    updated = content.replace(
+        old_text, new_text, -1 if _coerce_bool(replace_all) else 1
+    )
+    trunc = detect_truncated_rewrite(content, updated)
+    if trunc:
+        return format_tool_error(
+            "E_TRUNCATED_REWRITE",
+            "Refused a likely truncated rewrite; no changes made.",
+            "Re-read the file and apply a smaller, complete edit.",
+        )
+    try:
+        p.write_text(updated, encoding="utf-8")
+    except Exception as e:
+        return format_tool_error("E_IO", f"Error writing file: {e}")
+    replacements = occurrences if _coerce_bool(replace_all) else 1
+    return (
+        f"Successfully edited {p} "
+        f"({replacements} replacement{'s' if replacements != 1 else ''})"
+    )
 
 
 def tool_registry_search(query: str, limit: int = 10) -> str:
@@ -622,13 +1150,50 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "find_files",
+            "description": "Find files in the local project workspace by glob pattern. Returns workspace-relative paths; default scope is the workspace root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob such as '*.py', '**/*.py', or 'src/**/*.ts' (default '**/*')", "default": "**/*"},
+                    "path": {"type": "string", "description": "Workspace-relative folder or file to scope the search (default workspace root)", "default": "."},
+                    "max_results": {"type": "integer", "description": "Max paths to return (default 200)", "default": 200},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": "Search local project text/code files for a literal or regex pattern. Returns workspace-relative path:line matches. Use this to locate symbols and behavior before reading or editing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Literal text or regex pattern to find"},
+                    "path": {"type": "string", "description": "Workspace-relative file/folder to scope the search (default workspace root)", "default": "."},
+                    "file_glob": {"type": "string", "description": "Optional filename/path glob filter such as '*.py'"},
+                    "regex": {"type": "boolean", "description": "Treat query as regex (default false)", "default": False},
+                    "case_sensitive": {"type": "boolean", "description": "Case-sensitive match (default false)", "default": False},
+                    "context_lines": {"type": "integer", "description": "Context lines around each match (default 0)", "default": 0},
+                    "max_results": {"type": "integer", "description": "Max matching lines (default 50)", "default": 50},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
-            "description": "Read contents of a local file.",
+            "description": "Read a numbered line range from a local workspace file. Line-number prefixes are display only; never include them when editing or writing.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative file path"},
-                    "max_lines": {"type": "integer", "description": "Max lines to return (default 300)"},
+                    "start_line": {"type": "integer", "description": "First 1-based line to return (default 1)", "default": 1},
+                    "end_line": {"type": "integer", "description": "Last 1-based line to return (optional)"},
+                    "max_lines": {"type": "integer", "description": "Max lines to return (default 300)", "default": 300},
                 },
                 "required": ["path"],
             },
@@ -646,6 +1211,23 @@ TOOL_DEFINITIONS = [
                     "content": {"type": "string", "description": "Full file content to write"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in an existing workspace file. Requires a unique exact match unless replace_all is true. Prefer this for targeted code changes; do not include read_file line-number prefixes in old_text or new_text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_text": {"type": "string", "description": "Exact existing text to replace"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)", "default": False},
+                },
+                "required": ["path", "old_text", "new_text"],
             },
         },
     },
@@ -795,16 +1377,63 @@ def execute_tool_call(
     allow_local: bool = False,
     allowed_hosts: Optional[List[str]] = None,
     allow_mutating_http: bool = False,
+    workspace_root: Optional[str | Path] = None,
 ) -> str:
     """Execute a function call by name and arguments."""
+    arguments = arguments if isinstance(arguments, dict) else {}
     if tool_name == "bash":
-        return tool_bash(command=arguments.get("command", ""), allow_shell=allow_shell)
+        return tool_bash(
+            command=arguments.get("command", ""),
+            timeout=arguments.get("timeout", 30),
+            allow_shell=allow_shell,
+            workspace_root=workspace_root,
+        )
     elif tool_name == "list_directory":
-        return tool_list_directory(path=arguments.get("path", "."), max_depth=arguments.get("max_depth", 2))
+        return tool_list_directory(
+            path=arguments.get("path", "."),
+            max_depth=arguments.get("max_depth", 2),
+            workspace_root=workspace_root,
+        )
+    elif tool_name == "find_files":
+        return tool_find_files(
+            pattern=arguments.get("pattern", "**/*"),
+            path=arguments.get("path", "."),
+            max_results=arguments.get("max_results", 200),
+            workspace_root=workspace_root,
+        )
+    elif tool_name == "search_code":
+        return tool_search_code(
+            query=arguments.get("query", ""),
+            path=arguments.get("path", "."),
+            file_glob=arguments.get("file_glob") or arguments.get("glob"),
+            regex=arguments.get("regex", False),
+            case_sensitive=arguments.get("case_sensitive", False),
+            max_results=arguments.get("max_results", 50),
+            context_lines=arguments.get("context_lines", 0),
+            workspace_root=workspace_root,
+        )
     elif tool_name == "read_file":
-        return tool_read_file(path=arguments.get("path", ""), max_lines=arguments.get("max_lines", 300))
+        return tool_read_file(
+            path=arguments.get("path", ""),
+            max_lines=arguments.get("max_lines", 300),
+            start_line=arguments.get("start_line", 1),
+            end_line=arguments.get("end_line"),
+            workspace_root=workspace_root,
+        )
     elif tool_name == "write_file":
-        return tool_write_file(path=arguments.get("path", ""), content=arguments.get("content", ""))
+        return tool_write_file(
+            path=arguments.get("path", ""),
+            content=arguments.get("content", ""),
+            workspace_root=workspace_root,
+        )
+    elif tool_name == "edit_file":
+        return tool_edit_file(
+            path=arguments.get("path", ""),
+            old_text=arguments.get("old_text", ""),
+            new_text=arguments.get("new_text", ""),
+            replace_all=arguments.get("replace_all", False),
+            workspace_root=workspace_root,
+        )
     elif tool_name == "registry_search":
         return tool_registry_search(query=arguments.get("query", ""), limit=arguments.get("limit", 10))
     elif tool_name == "verify_http":
@@ -825,11 +1454,13 @@ def execute_tool_call(
             must_not_contain=arguments.get("must_not_contain"),
             target_function=arguments.get("target_function"),
             check_type=arguments.get("check_type"),
+            workspace_root=workspace_root,
         )
     elif tool_name == "analyze_python_security":
         return tool_analyze_python_security(
             path=arguments.get("path", ""),
             target_function=arguments.get("target_function"),
+            workspace_root=workspace_root,
         )
     elif tool_name == "verify_consensus":
         return tool_verify_consensus(

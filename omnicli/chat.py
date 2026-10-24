@@ -128,6 +128,7 @@ class ChatSession:
         rotate_families: bool = False,
         mode: str = "collaborate",
         council_size: Optional[int] = None,
+        ground_local: bool = True,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -157,6 +158,8 @@ class ChatSession:
         self.base_system_prompt = self.system_prompt
         self.messages: List[Dict[str, str]] = []
         self.pending_files: Dict[str, str] = {}
+        self.ground_local = ground_local
+        self._grounding_signature: Optional[tuple] = None
         self.last_report_path: Optional[str] = None
         self.last_failed_prompt: Optional[str] = None
 
@@ -739,6 +742,39 @@ class ChatSession:
                 return m
         return None
 
+    def _local_grounding(self, user_prompt: str):
+        """Relevance-ranked cwd grounding for this turn, or None.
+
+        Discloses the attached set once per distinct attachment set so
+        multi-turn sessions do not repeat the same panel every turn.
+        """
+        try:
+            from omnicli.grounding import build_grounding
+            grounding = build_grounding(user_prompt)
+        except Exception:
+            return None
+        if not grounding.get("block"):
+            return None
+        signature = tuple(
+            (item["path"], item["chars"]) for item in grounding["attached"]
+        )
+        if signature != getattr(self, "_grounding_signature", None):
+            self._grounding_signature = signature
+            from rich.markup import escape
+            attached_lines = "\n".join(
+                f"- {escape(item['path'])} ({item['chars']:,} chars; "
+                f"{escape(item['reason'])})"
+                for item in grounding["attached"]
+            ) or "- (workspace map only; no file matched the prompt terms)"
+            self.console.print(Panel(
+                "Local Grounding: these workspace files ground this turn "
+                "and are sent to the configured model providers "
+                "(start chat with --no-ground to disable):\n" + attached_lines,
+                title="Local Grounding Disclosure",
+                border_style="yellow",
+            ))
+        return grounding
+
     def stream_turn(self, user_prompt: str) -> None:
         self._apply_memory()  # refresh memory for the active provider
         pending_files = dict(getattr(self, "pending_files", {}))
@@ -771,6 +807,18 @@ class ChatSession:
                 f"### Source file: {path}\n```text\n{content}\n```"
                 for path, content in pending_files.items()
             )
+        # Local grounding: work on the workspace's files instead of
+        # answering from general knowledge. Explicit /file & /folder
+        # attachments (pending_files) win; redteam keeps source_files.
+        turn_grounding = None
+        if (
+            self.mode != "redteam"
+            and not pending_files
+            and getattr(self, "ground_local", True)
+        ):
+            turn_grounding = self._local_grounding(user_prompt)
+        if turn_grounding and self.mode not in ("collaborate", "redteam"):
+            orchestration_prompt += "\n\n" + turn_grounding["block"]
         self.messages.append({"role": "user", "content": orchestration_prompt})
 
         if self.mode in ("collaborate", "redteam"):
@@ -812,6 +860,7 @@ class ChatSession:
                     source_files=source_files or pending_files,
                     report_path="reports",
                     system=council_system if self.mode == "collaborate" else None,
+                    grounding=turn_grounding if self.mode == "collaborate" else None,
                 )
             total_time = time.perf_counter() - t0
 

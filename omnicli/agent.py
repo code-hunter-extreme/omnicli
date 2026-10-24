@@ -12,6 +12,11 @@ Flags:
                          different architectures. Good for: avoiding single-model blind
                          spots, cross-family corroboration without a full consensus call.
 
+  ground_local=True    — (default) deterministically pre-grounds the goal in
+                         relevance-ranked local workspace files before the
+                         first model call (omnicli.grounding). CLI
+                         --no-ground disables.
+
 Auto-fallback: on API error / timeout the agent walks the roster regardless of flags.
 """
 
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -28,7 +34,7 @@ from rich.panel import Panel
 
 from omnicli.client import OmniClient
 from omnicli.config import ConfigManager
-from omnicli.tools import TOOL_DEFINITIONS, execute_tool_call
+from omnicli.tools import TOOL_DEFINITIONS, execute_tool_call, resolve_workspace_root
 
 
 # HTTP status codes that are permanent failures — no point retrying the same model.
@@ -58,7 +64,7 @@ Rules:
    - PROOF: the verify_http / analyze_python_security / verify_code / verify_consensus tool result and how it supports this exact claim; analyzer candidates support only a source-level lead, not exploitability.
    - IMPACT: what an attacker can do with this.
    - REPRO: the exact curl command to reproduce.
-4. Use bash, list_directory, and read_file to explore the project folder and gather evidence. Use consult_provider to get a second opinion.
+4. Use find_files, search_code, list_directory, and read_file to explore the local project and gather evidence. Use bash only when enabled. Use consult_provider to get a second opinion.
 5. Be thorough. Check auth, access control, information disclosure, and error handling.
 6. Use verify_http only for operator-authorized hosts configured for this run. GET, HEAD, and OPTIONS are permitted by default; never use state-changing methods unless the operator explicitly enabled them.
 """
@@ -70,7 +76,7 @@ from omnicli.tools import TOOL_DEFINITIONS as _ALL_TOOLS
 
 _REDTEAM_TOOLS = [t for t in _ALL_TOOLS if t["function"]["name"] in (
     "verify_http", "verify_code", "analyze_python_security", "verify_consensus",
-    "bash", "read_file", "consult_provider", "list_directory",
+    "bash", "find_files", "search_code", "read_file", "consult_provider", "list_directory",
 )]
 
 
@@ -142,6 +148,8 @@ class AgentRunner:
         allow_local: bool = False,
         allowed_hosts: Optional[List[str]] = None,
         allow_mutating_http: bool = False,
+        ground_local: bool = True,
+        workspace_root: Optional[Any] = None,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -155,6 +163,12 @@ class AgentRunner:
         self.allow_local = allow_local
         self.allowed_hosts = list(allowed_hosts or [])
         self.allow_mutating_http = allow_mutating_http
+        self.ground_local = ground_local
+        self.grounding: Optional[Dict[str, Any]] = None
+        self.workspace_root = (
+            Path(workspace_root).expanduser().resolve()
+            if workspace_root else resolve_workspace_root()
+        )
 
     def _model_roster(self) -> List[str]:
         """Return [primary] + fallback_models from config, deduped, primary first."""
@@ -231,6 +245,11 @@ class AgentRunner:
         On API error or stuck response, automatically tries the next model
         in the provider's fallback roster (built by `omni scan`).
         """
+        configured_root = getattr(self, "workspace_root", None)
+        self.workspace_root = (
+            Path(configured_root).expanduser().resolve()
+            if configured_root else resolve_workspace_root()
+        )
         if system_override:
             system_prompt = system_override
         elif getattr(self, "redteam", False):
@@ -242,14 +261,25 @@ class AgentRunner:
                 system_prompt += "\n\nNo HTTP hosts are authorized for this run; do not call verify_http."
             if getattr(self, "allow_mutating_http", False):
                 system_prompt += "\nOperator explicitly enabled state-changing HTTP methods, limited to the authorized hosts."
+            system_prompt += (
+                f"\n\nLocal workspace root: {self.workspace_root}. "
+                "Paths returned by local tools are workspace-relative."
+            )
         else:
             system_prompt = (
-                "You are an expert autonomous AI agent equipped with local tools: "
-                "'bash' (run commands), 'read_file', 'write_file', 'list_directory' "
-                "(explore folders), 'registry_search' (search ~6,400 local tools in Program "
-                "Registry), and 'consult_provider' (ask NVIDIA NIM, XKiro, OpenRouter, "
-                "Cloudflare, Bynara, or Apinex for specialized help). Always inspect and "
-                "verify before answering. Use tools actively to gather truth."
+                "You are an expert autonomous AI agent and local coding CLI "
+                f"operating inside the local workspace {self.workspace_root}. "
+                "Work on the actual local code, not from general knowledge. "
+                "Local tools: 'find_files' and 'search_code' to locate code, "
+                "'list_directory' and numbered 'read_file' ranges to inspect it, "
+                "'edit_file' for targeted changes, 'write_file' for new files or "
+                "complete rewrites, and 'bash' for commands/tests only when shell "
+                "access is enabled. Paths returned by tools are workspace-relative. "
+                "Inspect before editing, preserve unrelated changes, and verify with "
+                "tool evidence. Never claim a test ran if bash is disabled or a tool "
+                "result does not show it. Use 'registry_search' for the local Program "
+                "Registry and 'consult_provider' for a second model opinion when useful. "
+                "Cite local code as path:line and report files changed."
             )
 
         # Layer per-provider memory (context files) on top of the system prompt.
@@ -261,9 +291,32 @@ class AgentRunner:
         except Exception:
             pass
 
+        # Deterministic local pre-grounding: attach relevance-ranked
+        # workspace files BEFORE the first model call, so the agent starts
+        # from the operator's actual files (and cites path:line) instead
+        # of answering from general knowledge without touching a tool.
+        grounded_goal = goal
+        self.grounding = None
+        if getattr(self, "ground_local", True):
+            try:
+                from omnicli.grounding import build_grounding
+                grounding = build_grounding(goal, root=self.workspace_root)
+                if grounding.get("block"):
+                    self.grounding = grounding
+                    # Addendum rides in the user message: a caller's
+                    # system_override stays byte-for-byte verbatim.
+                    grounded_goal = (
+                        f"{goal}\n\nLocal sources are attached below with "
+                        "authoritative line numbers. Start from them, cite "
+                        "path:line, and use search_code/find_files/read_file "
+                        f"for anything beyond the attached lines.\n\n{grounding['block']}"
+                    )
+            except Exception:
+                pass
+
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": goal},
+            {"role": "user", "content": grounded_goal},
         ]
 
         roster = self._build_roster()                  # list of (provider, model)
@@ -276,8 +329,10 @@ class AgentRunner:
             Panel(
                 f"[bold cyan]OmniCLI Agent Goal:[/bold cyan] {goal}\n"
                 f"[bold green]Supervisor:[/bold green] {active_provider} ({active_model})  |  "
+                f"[bold green]Workspace:[/bold green] {escape(str(self.workspace_root))}\n"
                 f"[dim]Roster: {len(roster)} model(s) across {span}  |  "
-                f"Tools: bash, file_ops, list_directory, registry_search (6.4k tools), cross-provider[/dim]",
+                f"Tools: find_files, search_code, read_file, edit_file, write_file, bash, registry_search, cross-provider  |  "
+                f"Local grounding: {len(self.grounding['attached']) if self.grounding else 0} file(s) attached from workspace[/dim]",
                 title="Agent Active",
                 border_style="cyan",
             )
@@ -347,6 +402,7 @@ class AgentRunner:
                         allow_local=getattr(self, "allow_local", False),
                         allowed_hosts=getattr(self, "allowed_hosts", None),
                         allow_mutating_http=getattr(self, "allow_mutating_http", False),
+                        workspace_root=getattr(self, "workspace_root", None),
                     )
 
                     preview = escape(output.strip().split("\n")[0][:120])

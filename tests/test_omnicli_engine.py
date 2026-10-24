@@ -796,9 +796,11 @@ class TestAgentRedteam(unittest.TestCase):
         allnames = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         self.assertEqual(
             rt, {"verify_http", "verify_code", "verify_consensus",
-                 "analyze_python_security", "bash", "read_file", "consult_provider", "list_directory"}
+                 "analyze_python_security", "bash", "find_files", "search_code",
+                 "read_file", "consult_provider", "list_directory"}
         )
-        # write_file / registry_search must NOT be exposed in red-team mode
+        # Mutating tools and registry_search must NOT be exposed in red-team mode.
+        self.assertNotIn("edit_file", rt)
         self.assertNotIn("write_file", rt)
         self.assertNotIn("registry_search", rt)
         self.assertTrue(rt.issubset(allnames))
