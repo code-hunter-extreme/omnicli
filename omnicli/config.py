@@ -501,7 +501,7 @@ class ConfigManager:
         if key:
             return key
 
-        # 3. Check known .env files (e.g., ~/oracle/.env)
+        # 3. Check the canonical env files (see _keys_file_candidates)
         env_dict = self._read_env_files()
         if env_key and env_key in env_dict:
             return env_dict[env_key]
