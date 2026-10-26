@@ -110,7 +110,12 @@ def resolve_provider_and_model(model_id: str) -> tuple[str, str]:
 
 @app.get("/")
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
+    # Provider roster disclosure follows the same token contract as the
+    # forwarding endpoints whenever a token is configured; tokenless
+    # loopback launches keep the open health probe.
+    if os.environ.get("OMNICLI_PROXY_TOKEN"):
+        _require_proxy_auth(request)
     return {
         "status": "online",
         "service": "OmniCLI Local OpenAI Gateway",
@@ -122,6 +127,7 @@ async def health_check():
 @app.get("/v1/models")
 async def list_models(request: Request):
     """Aggregate or list models from all providers or default provider."""
+    _require_proxy_auth(request)
     # Check if user specified a provider in query param, e.g. /v1/models?provider=nvidia
     target_prov = request.query_params.get("provider")
     results = []

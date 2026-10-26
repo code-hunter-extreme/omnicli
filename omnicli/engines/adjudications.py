@@ -40,8 +40,10 @@ def pattern_signature(candidate: Mapping) -> str:
 
 
 def default_store_path() -> Path:
-    """Default on-disk location for adjudication records."""
-    return Path.home() / ".config" / "omnicli" / "adjudications.jsonl"
+    """Default on-disk location for adjudication records (config-rooted)."""
+    from omnicli.config import _default_config_dir
+
+    return _default_config_dir() / "adjudications.jsonl"
 
 
 class AdjudicationStore:

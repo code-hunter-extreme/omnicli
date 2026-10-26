@@ -548,3 +548,23 @@ class TestGroundingRankingAndHomeGuard(unittest.TestCase):
         )
         attached_chars = sum(item["chars"] for item in gr["attached"])
         self.assertLessEqual(attached_chars, DEFAULT_MAX_CHARS)
+
+
+class TestChatDeadFlagWarnings(_WorkspaceCase):
+    def test_collaborate_warns_temperature_and_rotate_ignored(self):
+        from unittest.mock import MagicMock as _MM
+
+        from click.testing import CliRunner
+
+        from omnicli.cli import main
+
+        session = _MM()
+        with patch("omnicli.cli.ChatSession", return_value=session):
+            result = CliRunner().invoke(
+                main,
+                ["chat", "--collaborate", "--temperature", "1.5",
+                 "--rotate-families"],
+                input="",
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("ignored in collaborate mode", result.output)

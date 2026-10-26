@@ -311,6 +311,19 @@ class ConfigManager:
                     os.chmod(self.config_file, 0o600)
             except OSError:
                 pass
+        def _localized(block_name: str) -> dict:
+            # Path-bearing defaults are rooted at THIS manager's config
+            # dir, never baked from import-time HOME (standalone law).
+            block = copy.deepcopy(
+                DEFAULT_MEMORY if block_name == "memory" else DEFAULT_HEARTBEAT
+            )
+            if block_name == "memory":
+                block["dir"] = str(self.config_dir / "memory")
+            else:
+                block["status_file"] = str(self.config_dir / "heartbeat.json")
+                block["tasks_file"] = str(self.config_dir / "heartbeat_tasks.json")
+            return block
+
         if not self.config_file.exists():
             initial_data = {
                 "default_provider": "groq",
@@ -320,8 +333,8 @@ class ConfigManager:
                 "system_prompt": "You are a helpful, brilliant, concise AI assistant.",
                 "temperature": 0.7,
                 "timeout": 60,
-                "memory": copy.deepcopy(DEFAULT_MEMORY),
-                "heartbeat": copy.deepcopy(DEFAULT_HEARTBEAT),
+                "memory": _localized("memory"),
+                "heartbeat": _localized("heartbeat"),
             }
             self._save(initial_data)
             return initial_data
@@ -340,10 +353,10 @@ class ConfigManager:
             # Migrate older configs: add memory/heartbeat blocks if absent.
             changed = False
             if "memory" not in data:
-                data["memory"] = copy.deepcopy(DEFAULT_MEMORY)
+                data["memory"] = _localized("memory")
                 changed = True
             if "heartbeat" not in data:
-                data["heartbeat"] = copy.deepcopy(DEFAULT_HEARTBEAT)
+                data["heartbeat"] = _localized("heartbeat")
                 changed = True
             if changed:
                 self._save(data)

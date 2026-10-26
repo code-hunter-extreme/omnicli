@@ -19,12 +19,19 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-_DEFAULT_DIR = Path.home() / ".config" / "omnicli" / "memory"
+def _default_dir(cfg: Any) -> Path:
+    """Memory lives under the manager's own config dir (standalone law)."""
+    config_dir = getattr(cfg, "config_dir", None)
+    if config_dir:
+        return Path(config_dir) / "memory"
+    from omnicli.config import _default_config_dir
+
+    return _default_config_dir() / "memory"
 
 
 def _base_dir(cfg: Any) -> Path:
     mem = cfg.get_memory_config()
-    return Path(str(mem.get("dir") or _DEFAULT_DIR)).expanduser()
+    return Path(str(mem.get("dir") or _default_dir(cfg))).expanduser()
 
 
 def _resolved_files(cfg: Any, provider: str) -> List[Path]:

@@ -70,3 +70,41 @@ def test_first_run_does_not_import_aider_keys(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(fake_home))
     mgr = ConfigManager(config_dir=tmp_path / "fresh-cfg")
     assert "openrouter" not in (mgr.data.get("keys") or {})
+
+
+def test_memory_dir_follows_config_dir(tmp_path, monkeypatch):
+    from omnicli import memory as mem
+
+    mgr = _mgr(tmp_path, monkeypatch)
+    base = mem._base_dir(mgr)
+    assert base == tmp_path / "cfg" / "memory"
+
+
+def test_adjudications_path_follows_config_resolution(tmp_path, monkeypatch):
+    from omnicli.engines.adjudications import default_store_path
+
+    monkeypatch.setenv("OMNICLI_CONFIG_DIR", str(tmp_path / "mine"))
+    assert default_store_path() == tmp_path / "mine" / "adjudications.jsonl"
+
+
+def test_swarm_timeout_flag_reaches_orchestration(tmp_path, monkeypatch):
+    # Flag-matrix tail: orchestrate deadline existed but no CLI flag
+    # could reach it. --timeout must land in run_orchestration kwargs.
+    from unittest.mock import patch
+
+    from click.testing import CliRunner
+
+    from omnicli.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    fake_out = {"members": [], "final": "ok", "synthesis": None}
+    with patch("omnicli.orchestrate.build_swarm", return_value=[("p", "m")]), patch(
+        "omnicli.orchestrate.run_orchestration", return_value=fake_out
+    ) as run, patch("omnicli.cli.client"):
+        result = CliRunner().invoke(
+            main,
+            ["swarm", "--raw", "--allow-general", "--timeout", "42", "hello task"],
+        )
+    assert result.exit_code == 0, result.output
+    assert run.call_args.kwargs.get("timeout") == 42.0

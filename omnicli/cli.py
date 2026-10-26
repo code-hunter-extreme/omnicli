@@ -359,6 +359,16 @@ def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str
             "single": flag_single,
         },
     )
+    if active_mode == "collaborate" and (temperature != 0.7 or rotate_families):
+        # Flag-matrix tail: council members run at provider defaults and
+        # family rotation is a single-model behavior — say so, never
+        # accept the flags silently.
+        click.echo(
+            "[omnicli] --temperature/--rotate-families are ignored in "
+            "collaborate mode (single-model settings); use --single to "
+            "apply them.",
+            err=True,
+        )
 
     session = ChatSession(
         provider=provider,
@@ -1219,6 +1229,9 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--allow-general", is_flag=True, default=False,
               help="Consent to general-knowledge answers when no local "
               "file matches (without it, swarm stops and asks first)")
+@click.option("--timeout", "timeout_s", type=click.FloatRange(min=0.0), default=None,
+              help="Total wall-clock budget in seconds for the whole "
+              "orchestration (default: unbounded)")
 @click.option("--report-path", type=click.Path(), default=None,
               help="Red-team report destination: file path or directory "
                    "(default: ./reports; redteam only)")
@@ -1229,6 +1242,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               source_dir: Optional[str], scan_cwd: bool, ground: bool,
               ground_max_chars: int, allow_general: bool,
+              timeout_s: Optional[float],
               report_path: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
@@ -1439,7 +1453,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
                 provider=provider, swarm=swarm, source_files=source_files,
                 enrich_files=enrich_files, report_path=report_destination,
                 member_tools=member_tool_defs, tool_kwargs=member_tool_kwargs,
-                grounding=prebuilt_grounding,
+                grounding=prebuilt_grounding, timeout=timeout_s,
             )
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise click.ClickException(str(exc)) from exc
