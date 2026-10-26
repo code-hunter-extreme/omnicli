@@ -15,9 +15,29 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-CONFIG_DIR = Path.home() / ".config" / "omnicli"
+def _default_config_dir() -> Path:
+    """OmniCLI's own config root — standalone, no suite layout assumed.
+
+    OMNICLI_CONFIG_DIR wins, then XDG_CONFIG_HOME/omnicli, then the
+    conventional ~/.config/omnicli. Resolved at construction time so
+    hosts/tests can redirect via environment.
+    """
+    explicit = os.environ.get("OMNICLI_CONFIG_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "omnicli"
+    return Path.home() / ".config" / "omnicli"
+
+
+CONFIG_DIR = _default_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history"
+# Documented shared-suite store (Oracle/Scan4Me/OmniCLI trio). OmniCLI
+# reads it as ONE named source; OMNICLI_KEYS_FILE / TRIO_KEYS_FILE env
+# vars and OmniCLI's own keys.env take precedence. No other file is
+# scavenged — integration is explicit, never layout guessing.
 TRIO_KEYS_FILE = Path.home() / ".config" / "trio" / "keys.env"
 
 # Model family keywords used by `omni scan` to classify discovered models.
@@ -256,13 +276,14 @@ DEFAULT_HEARTBEAT = {
 class ConfigManager:
     """Provider/key settings rooted at a caller-chosen directory.
 
-    config_dir defaults to ~/.config/omnicli (standalone CLI use). Library
-    consumers pass their own root (e.g. a tmp dir or the host app's config
-    dir) so importing and driving OmniCLI never touches the user's home.
+    config_dir defaults via _default_config_dir() (standalone CLI use).
+    Library consumers pass their own root (e.g. a tmp dir or the host
+    app's config dir) so importing and driving OmniCLI never touches
+    the user's home.
     """
 
     def __init__(self, config_dir: Optional[Any] = None) -> None:
-        self.config_dir = Path(config_dir) if config_dir else CONFIG_DIR
+        self.config_dir = Path(config_dir) if config_dir else _default_config_dir()
         self.config_file = self.config_dir / "config.json"
         self.history_file = self.config_dir / "history"
         self._ensure_dir()
@@ -302,19 +323,6 @@ class ConfigManager:
                 "memory": copy.deepcopy(DEFAULT_MEMORY),
                 "heartbeat": copy.deepcopy(DEFAULT_HEARTBEAT),
             }
-            # Auto-check aider oauth-keys if available
-            aider_env = Path.home() / ".aider" / "oauth-keys.env"
-            if aider_env.exists():
-                try:
-                    with open(aider_env, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if "OPENROUTER_API_KEY=" in line:
-                                k = line.split("=", 1)[1].strip().strip("\"'")
-                                if k:
-                                    initial_data["keys"]["openrouter"] = k
-                except Exception:
-                    pass
-
             self._save(initial_data)
             return initial_data
 
@@ -415,16 +423,36 @@ class ConfigManager:
             raise KeyError(f"Unknown provider '{provider_id}'. Available: {list(self.data['providers'].keys())}")
         return self.data["providers"][provider_id]
 
+    def _keys_file_candidates(self) -> list:
+        """The only env files OmniCLI reads, in precedence order.
+
+        1. OMNICLI_KEYS_FILE — operator-chosen file (explicit integration)
+        2. <config_dir>/keys.env — OmniCLI's own standalone store
+        3. Trio shared store — TRIO_KEYS_FILE env, else the documented
+           ~/.config/trio/keys.env suite convention
+        Nothing else. Sibling checkouts are never scavenged: moving a
+        repo must not silently change which credentials OmniCLI uses.
+        """
+        candidates = []
+        explicit = os.environ.get("OMNICLI_KEYS_FILE", "").strip()
+        if explicit:
+            candidates.append(Path(explicit).expanduser())
+        candidates.append(self.config_dir / "keys.env")
+        trio_env = os.environ.get("TRIO_KEYS_FILE", "").strip()
+        candidates.append(
+            Path(trio_env).expanduser() if trio_env else TRIO_KEYS_FILE
+        )
+        seen, out = set(), []
+        for p in candidates:
+            key = str(p)
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+        return out
+
     def _read_env_files(self) -> Dict[str, str]:
         env_dict: Dict[str, str] = {}
-        home = Path.home()
-        candidate_paths = [
-            TRIO_KEYS_FILE,
-            home / "oracle" / ".env",
-            home / "oracle-fresh" / ".env",
-            home / ".aider" / "oauth-keys.env",
-            home / ".config" / "smallcode" / ".env",
-        ]
+        candidate_paths = self._keys_file_candidates()
         for path in candidate_paths:
             if path.exists():
                 try:
