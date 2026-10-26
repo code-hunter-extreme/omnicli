@@ -23,7 +23,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from omnicli.tools import _iter_workspace_files, _read_text_file, resolve_workspace_root
 
-DEFAULT_MAX_CHARS = 60_000
+# Shared default must fit small-provider request limits out of the box
+# (live failure: 60k chars -> Groq 413 at 8k TPM, ask dead on arrival).
+# Swarm opts up explicitly via --ground-max-chars (default 60000 there).
+DEFAULT_MAX_CHARS = 20_000
 DEFAULT_MAX_FILES = 10
 _PER_FILE_WHOLE_CAP = 20_000
 _PER_FILE_EXCERPT_CAP = 16_000
@@ -411,6 +414,20 @@ def build_grounding(
         "block": block,
         "chars": len(block),
     }
+
+
+_SOURCE_REASONS = {"named in prompt", "prompt-term match", "named by caller"}
+
+
+def grounding_has_sources(grounding: Optional[Dict[str, Any]]) -> bool:
+    """True when prompt-relevant local sources were actually attached.
+
+    Overview-doc fallback attachments do not count: the model would be
+    answering around the question, not from matched local evidence.
+    Entry points use this to ask before any general-knowledge fallback.
+    """
+    attached = (grounding or {}).get("attached") or []
+    return any(item.get("reason") in _SOURCE_REASONS for item in attached)
 
 
 def public_grounding(grounding: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

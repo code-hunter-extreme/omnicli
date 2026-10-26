@@ -99,6 +99,39 @@ def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
     )
 
 
+def _gate_general_fallback(grounding, *, allow_general: bool) -> None:
+    """Owner law: local folder first — ask before general knowledge.
+
+    When grounding attached no prompt-relevant local source, a bare
+    model answer would be general knowledge wearing a local costume.
+    Interactive runs ask; non-interactive runs stop and name the
+    explicit opt-in. --no-ground never reaches here (already consent).
+    """
+    from omnicli.grounding import grounding_has_sources
+
+    if allow_general or grounding_has_sources(grounding):
+        return
+    workspace = (grounding or {}).get("workspace", "the current workspace")
+    indexed = (grounding or {}).get("files_indexed", 0)
+    question = (
+        f"No local file matched this prompt in {workspace} "
+        f"({indexed} files indexed). Answer from general knowledge instead?"
+    )
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        try:
+            if click.confirm(question, default=False, err=True):
+                return
+        except click.Abort:
+            pass
+    raise click.ClickException(
+        "No local file matched this prompt "
+        f"(workspace: {workspace}, {indexed} files indexed) — refusing "
+        "to answer from general knowledge silently. Name the file, run "
+        "from inside the project (or set OMNICLI_WORKSPACE), attach it "
+        "with --file, or consent explicitly with --allow-general."
+    )
+
+
 @main.command("ask")
 @click.option("-p", "--provider", help="Provider ID (groq, openrouter, nvidia, cloudflare, bynara, apinex, xkiro)")
 @click.option("-m", "--model", help="Model identifier")
@@ -115,6 +148,9 @@ def cmd_prepare_security_review(dataset_path: str, output: str) -> None:
               "the current workspace (default on; skipped when --file or "
               "piped input already supplies context). Attached files are "
               "sent to the provider; use --no-ground to disable.")
+@click.option("--allow-general", is_flag=True, default=False,
+              help="Consent to a general-knowledge answer when no local "
+              "file matches (without it, ask stops and asks first)")
 @click.argument("prompt_words", nargs=-1, required=False)
 def cmd_ask(
     provider: Optional[str],
@@ -126,6 +162,7 @@ def cmd_ask(
     no_stream: bool,
     raw: bool,
     ground: bool,
+    allow_general: bool,
     prompt_words: tuple,
 ) -> None:
     """Execute a prompt or query models directly."""
@@ -165,6 +202,7 @@ def cmd_ask(
     if ground and prompt and not input_file and not piped_input:
         from omnicli.grounding import build_grounding
         grounding = build_grounding(prompt)
+        _gate_general_fallback(grounding, allow_general=allow_general)
         if grounding.get("block"):
             attached_names = ", ".join(
                 item["path"] for item in grounding["attached"]
@@ -185,6 +223,8 @@ def cmd_ask(
             model=model,
             system_prompt=system,
             temperature=temperature,
+            ground_local=ground,
+            allow_general=allow_general,
         )
         session.run()
         return
@@ -303,10 +343,13 @@ def _resolve_mode_flags(
               "the current workspace (default on; skipped when /file or "
               "/folder attachments are pending; redteam keeps its explicit "
               "source handling). Use --no-ground to disable.")
+@click.option("--allow-general", is_flag=True, default=False,
+              help="Consent to general-knowledge answers when no local "
+              "file matches (without it, each such turn asks first)")
 def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str],
              temperature: float, mode: Optional[str], flag_collaborate: bool,
              redteam: bool, flag_single: bool, size: Optional[int], rotate_families: bool,
-             ground: bool) -> None:
+             ground: bool, allow_general: bool = False) -> None:
     """Start an interactive chat session with multi-model orchestration."""
     active_mode = _resolve_mode_flags(
         mode,
@@ -327,6 +370,7 @@ def cmd_chat(provider: Optional[str], model: Optional[str], system: Optional[str
         mode=active_mode,
         council_size=size,
         ground_local=ground,
+        allow_general=allow_general,
     )
     session.run()
 
@@ -1172,6 +1216,9 @@ def cmd_agent(provider: Optional[str], model: Optional[str], max_turns: int,
 @click.option("--ground-max-chars", type=click.IntRange(min=1000), default=60000,
               show_default=True,
               help="Character budget for attached local grounding sources")
+@click.option("--allow-general", is_flag=True, default=False,
+              help="Consent to general-knowledge answers when no local "
+              "file matches (without it, swarm stops and asks first)")
 @click.option("--report-path", type=click.Path(), default=None,
               help="Red-team report destination: file path or directory "
                    "(default: ./reports; redteam only)")
@@ -1181,7 +1228,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
               allowed_hosts: tuple, provider: Optional[str],
               checkpoint: Optional[str], resume: bool, source_paths: tuple,
               source_dir: Optional[str], scan_cwd: bool, ground: bool,
-              ground_max_chars: int,
+              ground_max_chars: int, allow_general: bool,
               report_path: Optional[str], prompt: tuple) -> None:
     """Run MANY models (different families, across all providers) together on one task."""
     from rich.panel import Panel
@@ -1291,6 +1338,7 @@ def cmd_swarm(size: Optional[int], mode: Optional[str], flag_collaborate: bool,
         prebuilt_grounding = build_grounding(
             task, max_chars=ground_max_chars
         )
+        _gate_general_fallback(prebuilt_grounding, allow_general=allow_general)
         if prebuilt_grounding.get("block"):
             attached_lines = "\n".join(
                 f"- {escape(item['path'])} ({item['chars']:,} chars"

@@ -129,6 +129,7 @@ class ChatSession:
         mode: str = "collaborate",
         council_size: Optional[int] = None,
         ground_local: bool = True,
+        allow_general: bool = False,
     ) -> None:
         self.cfg = ConfigManager()
         self.client = OmniClient(self.cfg)
@@ -159,6 +160,7 @@ class ChatSession:
         self.messages: List[Dict[str, str]] = []
         self.pending_files: Dict[str, str] = {}
         self.ground_local = ground_local
+        self.allow_general = allow_general
         self._grounding_signature: Optional[tuple] = None
         self.last_report_path: Optional[str] = None
         self.last_failed_prompt: Optional[str] = None
@@ -742,6 +744,31 @@ class ChatSession:
                 return m
         return None
 
+    def _confirm_general_fallback(self, grounding) -> bool:
+        """Ask before answering from general knowledge (owner law).
+
+        Local folder first: when grounding attached no prompt-relevant
+        source, the operator decides — never a silent bare answer.
+        """
+        if getattr(self, "allow_general", False):
+            return True
+        workspace = (grounding or {}).get("workspace", "the current workspace")
+        indexed = (grounding or {}).get("files_indexed", 0)
+        try:
+            from rich.prompt import Confirm
+
+            return bool(
+                Confirm.ask(
+                    f"No local file matched in {workspace} "
+                    f"({indexed} files indexed). Answer from general "
+                    "knowledge instead?",
+                    console=self.console,
+                    default=False,
+                )
+            )
+        except Exception:
+            return False
+
     def _local_grounding(self, user_prompt: str):
         """Relevance-ranked cwd grounding for this turn, or None.
 
@@ -817,6 +844,25 @@ class ChatSession:
             and getattr(self, "ground_local", True)
         ):
             turn_grounding = self._local_grounding(user_prompt)
+        if (
+            self.mode != "redteam"
+            and not pending_files
+            and getattr(self, "ground_local", True)
+            and not getattr(self, "allow_general", False)
+        ):
+            from omnicli.grounding import grounding_has_sources
+
+            if not grounding_has_sources(turn_grounding):
+                if not self._confirm_general_fallback(turn_grounding):
+                    self.console.print(Panel(
+                        "Turn stopped: no local file matched, and general-\n"
+                        "knowledge fallback was not consented. Name the "
+                        "file (or attach it with /file), run from inside "
+                        "the project, or start chat with --allow-general.",
+                        title="Local-First Gate",
+                        border_style="yellow",
+                    ))
+                    return
         if turn_grounding and self.mode not in ("collaborate", "redteam"):
             orchestration_prompt += "\n\n" + turn_grounding["block"]
         self.messages.append({"role": "user", "content": orchestration_prompt})

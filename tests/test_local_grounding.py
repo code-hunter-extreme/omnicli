@@ -248,6 +248,25 @@ class TestCliAskGrounding(_WorkspaceCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn(SENTINEL, client.all_text())
 
+    def test_ask_unmatched_prompt_asks_before_general_fallback(self):
+        # Owner law: local folder first. No local match -> never silently
+        # answer from general knowledge; non-interactive runs must stop
+        # and name the explicit opt-in.
+        result, client = self._invoke(
+            ["ask", "--no-stream", "--raw", "zqxjkvb nonexistenttopic quuxly"]
+        )
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertEqual(client.calls, [])
+        self.assertIn("--allow-general", result.output)
+
+    def test_ask_unmatched_with_allow_general_proceeds(self):
+        result, client = self._invoke(
+            ["ask", "--allow-general", "--no-stream", "--raw",
+             "zqxjkvb nonexistenttopic quuxly"]
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(client.calls)
+
     def test_ask_no_ground_stays_bare(self):
         result, client = self._invoke(
             ["ask", "--no-ground", "--no-stream", "--raw",
@@ -298,6 +317,53 @@ class TestAgentGrounding(_WorkspaceCase):
 
     def test_agent_no_ground_stays_bare(self):
         self.assertNotIn(SENTINEL, self._run_agent(False))
+
+
+class TestChatConsentGate(_WorkspaceCase):
+    def _session(self, allow):
+        from omnicli.chat import ChatSession
+
+        session = ChatSession.__new__(ChatSession)
+        session.console = MagicMock()
+        session.cfg = _Cfg()
+        session.client = MagicMock()
+        session.provider = "p"
+        session.model = "openai/test"
+        session.mode = "collaborate"
+        session.council_size = 1
+        session.messages = [{"role": "system", "content": "sys"}]
+        session.pending_files = {}
+        session.last_report_path = None
+        session.last_failed_prompt = None
+        session.ground_local = True
+        session.allow_general = allow
+        return session
+
+    def test_chat_unmatched_turn_aborts_without_consent(self):
+        from omnicli.chat import ChatSession
+
+        session = self._session(allow=False)
+        with patch.object(ChatSession, "_apply_memory"), patch.object(
+            ChatSession, "_confirm_general_fallback", return_value=False
+        ), patch(
+            "omnicli.orchestrate.run_orchestration",
+            return_value={"members": [], "final": "ok"},
+        ) as run:
+            session.stream_turn("zqxjkvb nonexistenttopic quuxly")
+        run.assert_not_called()
+
+    def test_chat_unmatched_turn_proceeds_with_consent(self):
+        from omnicli.chat import ChatSession
+
+        session = self._session(allow=False)
+        with patch.object(ChatSession, "_apply_memory"), patch.object(
+            ChatSession, "_confirm_general_fallback", return_value=True
+        ), patch(
+            "omnicli.orchestrate.run_orchestration",
+            return_value={"members": [], "final": "ok"},
+        ) as run:
+            session.stream_turn("zqxjkvb nonexistenttopic quuxly")
+        run.assert_called_once()
 
 
 class TestChatGrounding(_WorkspaceCase):
@@ -441,7 +507,8 @@ class TestGroundingRankingAndHomeGuard(unittest.TestCase):
         body = "class ScopeGate:\n    pass  # scope gate\n" + ("x = scope_gate_url  # scope gate url\n" * 900)
         index = {f"mod{i}.py": body for i in range(8)}
         gr = build_grounding(
-            "how does the scope gate decide", root="/nonexistent-ws", index=index
+            "how does the scope gate decide", root="/nonexistent-ws",
+            index=index, max_chars=60_000,
         )
         self.assertGreaterEqual(len(gr["attached"]), 6)
 
@@ -466,3 +533,18 @@ class TestGroundingRankingAndHomeGuard(unittest.TestCase):
             self.assertIn("big_engine.py", idx)
             gr = build_grounding("how does the scope gate decide", root=td)
             self.assertEqual(gr["attached"][0]["path"], "big_engine.py")
+
+    def test_default_grounding_budget_fits_small_provider_limits(self):
+        # Live failure 2026-10-26: default 60k grounding chars made the
+        # default provider reject the ask outright (Groq 413 TPM 8000).
+        # The shared default must stay small; swarm opts up explicitly.
+        from omnicli.grounding import DEFAULT_MAX_CHARS, build_grounding
+
+        self.assertLessEqual(DEFAULT_MAX_CHARS, 24_000)
+        body = "class ScopeGate:\n    pass\n" + ("x = scope_gate_url\n" * 2000)
+        index = {f"mod{i}.py": body for i in range(6)}
+        gr = build_grounding(
+            "how does the scope gate decide", root="/nonexistent-ws", index=index
+        )
+        attached_chars = sum(item["chars"] for item in gr["attached"])
+        self.assertLessEqual(attached_chars, DEFAULT_MAX_CHARS)
