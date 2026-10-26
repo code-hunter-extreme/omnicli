@@ -27,8 +27,11 @@ DEFAULT_MAX_CHARS = 60_000
 DEFAULT_MAX_FILES = 10
 _PER_FILE_WHOLE_CAP = 20_000
 _PER_FILE_EXCERPT_CAP = 16_000
-_INDEX_FILE_CAP = 200_000
-_INDEX_TOTAL_CAP = 4_000_000
+# Must cover real product files (oracle_hunter.py ~402KB, scan4me.py
+# ~209KB): at 200KB the largest defining files were silently invisible
+# to grounding and models answered from doc echoes instead of source.
+_INDEX_FILE_CAP = 600_000
+_INDEX_TOTAL_CAP = 8_000_000
 _INDEX_COUNT_CAP = 2_000
 _MAP_ENTRY_CAP = 200
 _MIN_SCORE = 3.0
@@ -127,6 +130,7 @@ def _score_file(
     for identifier in identifiers:
         if identifier in content:
             score += 10.0 + min(content.count(identifier), 5)
+    lowered_lines = lowered.splitlines()
     for term in terms:
         if (
             term == stem
@@ -140,6 +144,22 @@ def _score_file(
         count = lowered.count(term)
         if count:
             score += min(count, 5) * 1.0
+    # Definition boost: the file that *defines* the asked concept
+    # (a class/def line naming its terms, e.g. "class ScopeGate" for
+    # scope+gate) outranks prose that merely mentions it often —
+    # otherwise docs about code beat the code itself and models answer
+    # from summaries instead of source.
+    best_def_terms = 0
+    for line in lowered_lines:
+        stripped = line.strip()
+        if stripped.startswith(("class ", "def ", "async def ")):
+            best_def_terms = max(
+                best_def_terms, sum(1 for term in terms if term in line)
+            )
+    if best_def_terms >= 2:
+        score += 40.0
+    elif best_def_terms == 1:
+        score += 10.0
     if stem in ("readme", "architecture") and "/" not in rel:
         score += 2.0
 
@@ -249,6 +269,36 @@ def build_grounding(
         Path(root).expanduser().resolve()
         if root else resolve_workspace_root()
     )
+    # $HOME is not a project: indexing it walks every checkout on the
+    # machine, grounds on noise, and the model answers from general
+    # knowledge anyway. Refuse fast and loud instead (explicit caller
+    # indexes still work — the caller chose its sources).
+    try:
+        _home = Path.home().resolve()
+    except Exception:
+        _home = None
+    if index is None and _home is not None and base == _home and not (base / ".git").exists():
+        block = "\n".join(
+            [
+                "### LOCAL WORKSPACE GROUNDING",
+                f"Workspace: {base}",
+                _GROUNDING_RULES,
+                "",
+                "This workspace is the user's home directory, not a project. "
+                "No local files were attached. Tell the user to run from "
+                "inside the project directory or set OMNICLI_WORKSPACE to "
+                "the project root; do not answer project questions from "
+                "general knowledge.",
+            ]
+        )
+        return {
+            "workspace": str(base),
+            "files_indexed": 0,
+            "attached": [],
+            "workspace_map": "",
+            "block": block,
+            "chars": len(block),
+        }
     sources = index if index is not None else index_workspace(base)
     empty: Dict[str, Any] = {
         "workspace": str(base),
@@ -307,11 +357,17 @@ def build_grounding(
     attached: List[Dict[str, Any]] = []
     sections: List[str] = []
     budget = max_chars
+    # Share the budget across the ranked set: without a per-file share,
+    # the first dense files eat 16k excerpts each and the defining file
+    # ranked just below them never attaches (observed on large repos).
+    per_file_share = max(4_000, max_chars // max(max_files, 1))
     for rel in ranked[:max_files]:
         if budget <= 0:
             break
         _score, matched = scored[rel]
-        rendered, meta = _render_file(rel, sources[rel], matched, budget)
+        rendered, meta = _render_file(
+            rel, sources[rel], matched, min(budget, per_file_share)
+        )
         if not rendered:
             continue
         sections.append(rendered)

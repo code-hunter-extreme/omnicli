@@ -399,3 +399,70 @@ class TestWorkflowGrounding(_WorkspaceCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGroundingRankingAndHomeGuard(unittest.TestCase):
+    def test_definition_file_outranks_prose_mentions(self):
+        # Owner report: asked about local code, got general-knowledge
+        # answers. Cause: filename/prose density outranked the defining
+        # code file. A class/def definition of the asked terms must win.
+        from omnicli.grounding import build_grounding
+
+        index = {
+            "docs/SCOPE_NOTES.md": ("scope gate scope gate scope\n" * 6),
+            "engine.py": (
+                "class ScopeGate:\n"
+                "    def is_in_scope(self, url):\n"
+                "        return True\n"
+            ),
+        }
+        gr = build_grounding(
+            "how does the scope gate decide", root="/nonexistent-ws", index=index
+        )
+        self.assertTrue(gr["attached"])
+        self.assertEqual(gr["attached"][0]["path"], "engine.py")
+
+    def test_home_directory_is_not_a_workspace(self):
+        # Launched from $HOME, grounding must say so fast and loud
+        # instead of walking the whole home and grounding on noise.
+        from omnicli.grounding import build_grounding
+
+        gr = build_grounding("how does auth work", root=str(Path.home()))
+        self.assertEqual(gr["files_indexed"], 0)
+        self.assertEqual(gr["attached"], [])
+        self.assertIn("not a project", gr["block"])
+        self.assertIn("OMNICLI_WORKSPACE", gr["block"])
+
+    def test_excerpt_budget_shared_across_files(self):
+        # Big repos: first files must not eat the whole budget as 16k
+        # excerpts while the defining file ranks just below them.
+        from omnicli.grounding import build_grounding
+
+        body = "class ScopeGate:\n    pass  # scope gate\n" + ("x = scope_gate_url  # scope gate url\n" * 900)
+        index = {f"mod{i}.py": body for i in range(8)}
+        gr = build_grounding(
+            "how does the scope gate decide", root="/nonexistent-ws", index=index
+        )
+        self.assertGreaterEqual(len(gr["attached"]), 6)
+
+    def test_oversized_defining_file_is_indexed(self):
+        # The trio's largest product files (hunter ~400KB, scan4me
+        # ~209KB) exceeded the old 200KB index cap and were invisible
+        # to grounding — questions about their own code got doc echoes.
+        import tempfile
+        from pathlib import Path as _P
+
+        from omnicli.grounding import build_grounding, index_workspace
+
+        with tempfile.TemporaryDirectory() as td:
+            big = _P(td) / "big_engine.py"
+            big.write_text(
+                "class ScopeGate:\n    pass  # scope gate\n"
+                + ("# filler line to exceed the old cap\n" * 9000),
+                encoding="utf-8",
+            )
+            self.assertGreater(big.stat().st_size, 200_000)
+            idx = index_workspace(td)
+            self.assertIn("big_engine.py", idx)
+            gr = build_grounding("how does the scope gate decide", root=td)
+            self.assertEqual(gr["attached"][0]["path"], "big_engine.py")
