@@ -269,7 +269,14 @@ class ConfigManager:
         self.data: Dict[str, Any] = self._load()
 
     def _ensure_dir(self) -> None:
-        self.config_dir.mkdir(parents=True, exist_ok=True)
+        # S9: the dir holds key material — create/heal it private (0700),
+        # never umask-default traversable.
+        self.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            if os.stat(self.config_dir).st_mode & 0o077:
+                os.chmod(self.config_dir, 0o700)
+        except OSError:
+            pass
         if not self.history_file.exists():
             self.history_file.touch(mode=0o600, exist_ok=True)
 
@@ -340,11 +347,13 @@ class ConfigManager:
                 f"config.json.corrupt-{int(time.time())}"
             )
             try:
-                shutil.copyfile(self.config_file, backup)
-                try:
-                    os.chmod(backup, 0o600)
-                except OSError:
-                    pass
+                # S9: create the backup private from birth (0600 exclusive);
+                # copyfile-then-chmod leaves keys world-readable in between.
+                fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "wb") as dst, open(
+                    self.config_file, "rb"
+                ) as src:
+                    shutil.copyfileobj(src, dst)
                 where = f" Original preserved at {backup}."
             except OSError:
                 where = " Backup copy FAILED; the corrupt file is untouched."
@@ -372,7 +381,7 @@ class ConfigManager:
         # Write to a private temp file (mkstemp creates it 0600) and atomically
         # replace, so the keys never land in a readable file and there is no
         # permissive window. os.replace is atomic within the same directory.
-        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
             dir=str(self.config_dir), prefix=".config-", suffix=".tmp"
         )
@@ -434,23 +443,24 @@ class ConfigManager:
 
     def get_api_key(self, provider_id: str) -> str:
         provider_id = provider_id.lower()
-        # 1. Check direct config keys
-        key = self.data.get("keys", {}).get(provider_id, "")
-        if key:
-            return key
-
-        # 2. Check environment variables
         prov = self.data["providers"].get(provider_id, {})
         env_key = prov.get("env_key")
+        # 1. Explicit runtime environment wins (S9): a host process that
+        # merged its resolved keys into os.environ (Oracle hunt lane) must
+        # not be silently overridden by a stale config.json key. Direct
+        # config still beats env *files* below (pinned contract).
         if env_key and os.getenv(env_key):
             return os.getenv(env_key, "").strip()
-
-        # 3. Check alt env keys
         for alt in prov.get("alt_env_keys", []):
             if os.getenv(alt):
                 return os.getenv(alt, "").strip()
 
-        # 4. Check known .env files (e.g., ~/oracle/.env)
+        # 2. Direct config keys
+        key = self.data.get("keys", {}).get(provider_id, "")
+        if key:
+            return key
+
+        # 3. Check known .env files (e.g., ~/oracle/.env)
         env_dict = self._read_env_files()
         if env_key and env_key in env_dict:
             return env_dict[env_key]
@@ -469,11 +479,12 @@ class ConfigManager:
         self.save()
 
     def get_cloudflare_account_id(self) -> str:
+        # S9 parity with get_api_key: explicit runtime env wins over config.
+        if os.getenv("CLOUDFLARE_ACCOUNT_ID"):
+            return os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
         acc = self.data.get("cloudflare_account_id", "")
         if acc:
             return acc.strip()
-        if os.getenv("CLOUDFLARE_ACCOUNT_ID"):
-            return os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
         env_dict = self._read_env_files()
         if "CLOUDFLARE_ACCOUNT_ID" in env_dict:

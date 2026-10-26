@@ -198,6 +198,52 @@ def test_fetch_quota_malformed_schema_raises_quota_error(monkeypatch):
         quota.fetch_quota("apinex", cfg)
 
 
+def test_http_get_json_never_forwards_bearer_on_redirect():
+    # S5: quota lookups carry the provider Bearer key; a 3xx must become
+    # QuotaError, never a forwarded key at the redirect target.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    sink = HTTPServer(("127.0.0.1", 0), Sink)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{sink.server_port}/sink"
+            )
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    src = HTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=src.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(quota.QuotaError):
+            quota._http_get_json(
+                f"http://127.0.0.1:{src.server_port}/credits", "dummy-key"
+            )
+        assert received == [], "Bearer key reached the redirect target"
+    finally:
+        src.shutdown()
+        sink.shutdown()
+
+
 def test_require_http_url_blocks_remote_http_allows_loopback():
     quota._require_http_url("https://openrouter.ai/api/v1/credits")
     quota._require_http_url("http://127.0.0.1:3271/v1")

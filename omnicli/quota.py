@@ -192,6 +192,18 @@ RATE_HEADER_PROVIDERS = {"groq"}
 # --- network glue (thin; parsers above hold all the logic) ------------------
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib would otherwise re-send the provider
+    Bearer key to the redirect target, any origin or scheme (S5)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoRedirectHandler)
+
+
 def _require_http_url(url: str) -> None:
     """Require https:// for remote quota URLs; allow http:// only on loopback."""
     parsed = urllib.parse.urlsplit(url or "")
@@ -216,7 +228,7 @@ def _http_get_json(url: str, api_key: str) -> Dict[str, Any]:
         },
     )
     try:
-        with urllib.request.urlopen(
+        with _no_redirect_opener().open(
             req, timeout=_TIMEOUT
         ) as resp:  # nosec B310 - scheme checked above
             return json.loads(resp.read().decode("utf-8", "replace"))
@@ -247,7 +259,7 @@ def _fetch_rate_headers(base_url: str, api_key: str, model: str) -> QuotaInfo:
         },
     )
     try:
-        with urllib.request.urlopen(
+        with _no_redirect_opener().open(
             req, timeout=_TIMEOUT
         ) as resp:  # nosec B310 - scheme checked above
             return parse_rate_headers(dict(resp.headers.items()))
