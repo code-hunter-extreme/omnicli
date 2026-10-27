@@ -33,6 +33,21 @@ class OmniClient:
     def __init__(self, config_manager: Optional[ConfigManager] = None) -> None:
         self.cfg = config_manager or ConfigManager()
 
+    def _require_api_key(self, provider_id: str) -> None:
+        """Fail loud before any HTTP when the provider has no key (G8).
+
+        An empty config dir must never degrade to an unauthenticated
+        request and a bare provider 401: name the env var, the
+        configured count, and the config dir that was actually used.
+        """
+        provider_id = provider_id.lower()
+        if self.cfg.provider_requires_key(provider_id) and not (
+            self.cfg.has_credential(provider_id)
+        ):
+            raise ProviderError(
+                provider_id, None, self.cfg.missing_key_message(provider_id)
+            )
+
     def get_headers(self, provider_id: str) -> Dict[str, str]:
         provider_id = provider_id.lower()
         key = self.cfg.get_api_key(provider_id)
@@ -399,6 +414,7 @@ class OmniClient:
     ) -> Dict[str, Any]:
         """Perform a non-streaming chat completion."""
         provider_id = provider_id.lower()
+        self._require_api_key(provider_id)
         model_name = model or self.cfg.get_default_model(provider_id)
         url = self.get_endpoint_url(provider_id, "chat/completions")
         headers = self.get_headers(provider_id)
@@ -451,6 +467,11 @@ class OmniClient:
         Yields dict with {"type": "content"|"usage"|"error", "delta": "...", "raw": ...}
         """
         provider_id = provider_id.lower()
+        try:
+            self._require_api_key(provider_id)
+        except ProviderError as exc:
+            yield {"type": "error", "status_code": None, "content": str(exc)}
+            return
         model_name = model or self.cfg.get_default_model(provider_id)
         url = self.get_endpoint_url(provider_id, "chat/completions")
         headers = self.get_headers(provider_id)

@@ -108,3 +108,69 @@ def test_swarm_timeout_flag_reaches_orchestration(tmp_path, monkeypatch):
         )
     assert result.exit_code == 0, result.output
     assert run.call_args.kwargs.get("timeout") == 42.0
+
+
+# ── G8: loud empty-key preflight ─────────────────────────────────────────────
+
+_EMPTY_PROVIDERS = {
+    "triotest": {
+        "env_key": "TRIO_TEST_ONLY_KEY",
+        "base_url": "http://127.0.0.1:9/v1",
+        "default_model": "m",
+    },
+    "other": {
+        "env_key": "OTHER_TEST_ONLY_KEY",
+        "base_url": "http://127.0.0.1:9/v1",
+        "default_model": "m",
+    },
+}
+
+
+def test_key_preflight_reports_zero_configured(tmp_path, monkeypatch):
+    mgr = _mgr(tmp_path, monkeypatch, providers=dict(_EMPTY_PROVIDERS))
+    monkeypatch.delenv("TRIO_TEST_ONLY_KEY", raising=False)
+    monkeypatch.delenv("OTHER_TEST_ONLY_KEY", raising=False)
+
+    report = mgr.key_preflight()
+
+    assert report["configured"] == []
+    assert sorted(report["missing"]) == ["other", "triotest"]
+    assert report["config_dir"] == str(tmp_path / "cfg")
+    assert any("keys.env" in p for p in report["keys_files_checked"])
+
+
+def test_chat_complete_fails_loud_before_http_when_no_keys(tmp_path, monkeypatch):
+    import pytest
+
+    from omnicli.client import OmniClient, ProviderError
+
+    mgr = _mgr(tmp_path, monkeypatch, providers=dict(_EMPTY_PROVIDERS))
+    monkeypatch.delenv("TRIO_TEST_ONLY_KEY", raising=False)
+    monkeypatch.delenv("OTHER_TEST_ONLY_KEY", raising=False)
+    client = OmniClient(mgr)
+
+    def _no_http(*a, **k):
+        raise AssertionError("must not hit the network without a key")
+
+    monkeypatch.setattr(client, "post_chat_completion", _no_http)
+    with pytest.raises(ProviderError) as excinfo:
+        client.chat_complete("triotest", [{"role": "user", "content": "hi"}])
+    message = str(excinfo.value)
+    assert "TRIO_TEST_ONLY_KEY" in message
+    assert "0/2" in message
+    assert str(tmp_path / "cfg") in message
+
+
+def test_chat_stream_yields_loud_error_when_no_keys(tmp_path, monkeypatch):
+    from omnicli.client import OmniClient
+
+    mgr = _mgr(tmp_path, monkeypatch, providers=dict(_EMPTY_PROVIDERS))
+    monkeypatch.delenv("TRIO_TEST_ONLY_KEY", raising=False)
+    monkeypatch.delenv("OTHER_TEST_ONLY_KEY", raising=False)
+    client = OmniClient(mgr)
+
+    chunks = list(
+        client.chat_stream("triotest", [{"role": "user", "content": "hi"}])
+    )
+    assert chunks and chunks[0]["type"] == "error"
+    assert "TRIO_TEST_ONLY_KEY" in chunks[0]["content"]

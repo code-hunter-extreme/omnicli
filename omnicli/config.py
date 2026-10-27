@@ -512,6 +512,63 @@ class ConfigManager:
 
         return ""
 
+    def provider_requires_key(self, provider_id: str) -> bool:
+        """True when the provider declares an env_key credential."""
+        prov = self.data.get("providers", {}).get(provider_id.lower(), {})
+        return bool(prov.get("env_key"))
+
+    def has_credential(self, provider_id: str) -> bool:
+        """True when any usable credential resolves for the provider."""
+        provider_id = provider_id.lower()
+        if self.get_api_key(provider_id):
+            return True
+        if provider_id == "monkeycode" and self.get_monkeycode_session_cookie():
+            return True
+        return False
+
+    def configured_provider_ids(self) -> list:
+        """Providers (of the configured set) with a resolvable credential."""
+        return [
+            pid
+            for pid in self.data.get("providers", {})
+            if self.has_credential(pid)
+        ]
+
+    def key_preflight(self) -> Dict[str, Any]:
+        """Loud empty-key preflight report (G8) — counts only, no secrets."""
+        providers = self.data.get("providers", {})
+        configured = self.configured_provider_ids()
+        missing = [
+            pid
+            for pid in providers
+            if self.provider_requires_key(pid) and pid not in configured
+        ]
+        return {
+            "config_dir": str(self.config_dir),
+            "configured": configured,
+            "missing": missing,
+            "total_providers": len(providers),
+            "keys_files_checked": [
+                str(p) for p in self._keys_file_candidates()
+            ],
+        }
+
+    def missing_key_message(self, provider_id: str) -> str:
+        """Actionable no-key error naming the fix, never a bare 401."""
+        provider_id = provider_id.lower()
+        prov = self.data.get("providers", {}).get(provider_id, {})
+        env_key = prov.get("env_key") or "(no env_key declared)"
+        report = self.key_preflight()
+        return (
+            f"no API key for '{provider_id}' (env {env_key}); "
+            f"{len(report['configured'])}/{report['total_providers']} "
+            f"providers configured in {report['config_dir']}; checked "
+            f"process env, config keys, and "
+            f"{', '.join(report['keys_files_checked']) or 'no keys files'}; "
+            f"add a key (omni config) or point OMNICLI_CONFIG_DIR at the "
+            f"config that has keys"
+        )
+
     def set_api_key(self, provider_id: str, key: str) -> None:
         provider_id = provider_id.lower()
         if "keys" not in self.data:
