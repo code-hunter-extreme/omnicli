@@ -4,6 +4,7 @@ Command-line interface entry point for OmniCLI.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -773,6 +774,83 @@ def cmd_scan(provider: Optional[str], panel_size: int, max_per_family: int) -> N
             f"\n[bold green]✓[/bold green] Scanned {len(results)} providers, "
             f"{total_ok} OK — rosters written to config."
         )
+
+
+@main.command("oracle-pipeline")
+@click.option(
+    "--oracle-root",
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    default=lambda: os.environ.get(
+        "ORACLE_ROOT", str(Path.home() / "oracle")
+    ),
+    show_default=True,
+    help="Path to the Oracle checkout (contains oracle_hunter.py)",
+)
+@click.option(
+    "--limit", type=click.IntRange(min=1), default=50, show_default=True,
+    help="Prescan sweep size passed to `prescan --limit`",
+)
+@click.option(
+    "--count", type=click.IntRange(min=1), default=1, show_default=True,
+    help="Verified programs to deep-dive (`scan -N`)",
+)
+@click.option(
+    "--timeout", type=click.IntRange(min=1), default=3600, show_default=True,
+    help="Per-stage timeout in seconds",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the conductor result as JSON")
+def cmd_oracle_pipeline(
+    oracle_root: str,
+    limit: int,
+    count: int,
+    timeout: int,
+    as_json: bool,
+) -> None:
+    """Run prescan -> scan -> queue --execute -> verify product bundles.
+
+    This is a conductor, not a second pipeline: it invokes Oracle's canonical
+    commands and refuses to call the run complete unless at least one product
+    bundle is integrity-clean and submission-ready.
+    """
+    import json
+
+    from omnicli.conduct import ConductorError, run_pipeline
+
+    try:
+        result = run_pipeline(
+            Path(oracle_root), limit=limit, count=count, timeout=timeout
+        )
+    except ConductorError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        table = Table(title="Oracle Pipeline", title_style="bold cyan")
+        table.add_column("Stage", style="bold")
+        table.add_column("Status")
+        table.add_column("Exit", justify="right")
+        table.add_column("Seconds", justify="right")
+        for stage in result["stages"]:
+            table.add_row(
+                stage["name"],
+                stage["status"],
+                str(stage.get("exit_code", "-")),
+                str(stage.get("duration_s", "-")),
+            )
+        console.print(table)
+        for bundle in result["verified_bundles"]:
+            console.print(
+                f"[bold]{bundle['status']}[/bold] "
+                f"ready={bundle['ready_for_submission']} {bundle['bundle']}"
+            )
+            for reason in bundle.get("reasons", []):
+                console.print(f"  [yellow]not ready:[/yellow] {reason}")
+            for error in bundle.get("errors", []):
+                console.print(f"  [red]integrity:[/red] {error}")
+        if result.get("error"):
+            console.print(f"[red]✗[/red] {result['error']}")
+    if result["status"] != "complete":
+        raise click.exceptions.Exit(1)
 
 
 @main.command("evaluate-security")

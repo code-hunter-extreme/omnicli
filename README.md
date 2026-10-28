@@ -36,6 +36,7 @@ Installed on `$PATH` as `omni` (aliases: `omnicli`, `nexus`).
 | `omni verify consensus "<claim>"` | Blind vote across models/providers | **multi** |
 | `omni verify http\|code` | Deterministic HTTP / code verification | single |
 | `omni scan` | Discover `/models` per provider, build rosters | **multi** |
+| `omni oracle-pipeline` | Conductor: Oracle prescan → scan → queue → verify product bundles | **multi** (Oracle lanes) |
 | `omni heartbeat` | Health/latency/model-count per API (+ tasks) | **multi** |
 | `omni ping` | Quick connectivity + latency | **multi** |
 | `omni models [provider]` | List/search a provider's live catalog | single |
